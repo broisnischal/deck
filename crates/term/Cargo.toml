@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 alacritty_terminal = "0.26"
+# The same poller alacritty registers the PTY with (see tap.rs).
+polling = "3"
+memchr = "2"
 anyhow.workspace = true
 futures.workspace = true
 tracing.workspace = true

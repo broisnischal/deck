@@ -1,6 +1,6 @@
-//! The new tab page (⌘T): pick what the tab becomes. A terminal, a web page,
+//! The new tab page (⌘N): pick what the tab becomes. A terminal, a web page,
 //! or any coding agent deck knows, as a chat or in its own terminal. Enter
-//! takes the highlighted card, so ⌘T ⏎ is still a shell.
+//! takes the highlighted card, so ⌘N ⏎ is a shell too.
 
 use crate::icon::{icon, Icon};
 use crate::theme::{self, u};
@@ -114,7 +114,11 @@ impl LauncherPane {
     fn card(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let c = &self.choices[ix];
         let selected = ix == self.selected && c.enabled;
-        let tone = if c.enabled { theme::TEXT } else { theme::DIM };
+        let tone = if c.enabled {
+            theme::text()
+        } else {
+            theme::dim()
+        };
         let tui = c.tui;
         div()
             .id(ElementId::NamedInteger("choice".into(), ix as u64))
@@ -129,18 +133,18 @@ impl LauncherPane {
             .rounded(u(12.))
             .border_1()
             .border_color(rgba(if selected {
-                theme::FOCUS_EDGE
+                theme::focus_edge()
             } else {
-                theme::HAIRLINE
+                theme::hairline()
             }))
             .bg(rgb(if selected {
-                theme::SURFACE
+                theme::surface()
             } else {
-                theme::RAISED
+                theme::raised()
             }))
             .when(c.enabled, |d| {
                 d.cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::SURFACE)))
+                    .hover(|s| s.bg(rgb(theme::surface())))
                     .on_click(cx.listener(move |l, _, _, cx| l.pick(ix, false, cx)))
             })
             .child(
@@ -152,7 +156,7 @@ impl LauncherPane {
                     .child(
                         div()
                             .text_size(u(11.))
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .when(ix < 9 && c.enabled, |d| d.child(format!("{}", ix + 1))),
                     ),
             )
@@ -173,7 +177,7 @@ impl LauncherPane {
                         div()
                             .truncate()
                             .text_size(u(11.))
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .child(c.detail.clone()),
                     ),
             )
@@ -194,8 +198,8 @@ impl LauncherPane {
                         .group_hover(SharedString::from(format!("choice-{ix}")), |s| {
                             s.opacity(1.)
                         })
-                        .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
-                        .child(icon(Icon::Terminal, 13., theme::TEXT_2))
+                        .hover(|s| s.bg(rgb(theme::surface_hover())))
+                        .child(icon(Icon::Terminal, 13., theme::text_2()))
                         .on_click(cx.listener(move |l, _, _, cx| {
                             cx.stop_propagation();
                             l.pick(ix, true, cx);
@@ -214,7 +218,7 @@ impl Render for LauncherPane {
                 .pb(u(10.))
                 .text_size(u(11.))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::DIM))
+                .text_color(rgb(theme::dim()))
                 .child(text)
         };
         let base: Vec<usize> = (0..self.choices.len())
@@ -240,7 +244,7 @@ impl Render for LauncherPane {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(theme::PANE))
+            .bg(rgb(theme::pane()))
             .child(
                 div()
                     .flex()
@@ -257,7 +261,7 @@ impl Render for LauncherPane {
                                 div()
                                     .text_size(u(20.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(rgb(theme::text()))
                                     .child("New tab"),
                             )
                             .children(self.place.as_ref().map(|p| {
@@ -266,8 +270,8 @@ impl Render for LauncherPane {
                                     .items_center()
                                     .gap(u(6.))
                                     .text_size(u(12.))
-                                    .text_color(rgb(theme::DIM))
-                                    .child(icon(Icon::Folder, 12., theme::DIM))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(icon(Icon::Folder, 12., theme::dim()))
                                     .child(p.clone())
                             })),
                     )
@@ -278,7 +282,7 @@ impl Render for LauncherPane {
                     .child(
                         div()
                             .text_size(u(11.))
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .child("↵ open · 1–9 pick · ⌥↵ agent in a terminal · esc close"),
                     ),
             )

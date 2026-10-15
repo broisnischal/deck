@@ -658,8 +658,8 @@ impl Render for Field {
 
         let body = if text.is_empty() || (!focused && self.display.is_some()) {
             let (shown, color) = match (&self.display, text.is_empty()) {
-                (Some(d), false) => (d.clone(), theme::TEXT_2),
-                _ => (self.placeholder.clone(), theme::DIM),
+                (Some(d), false) => (d.clone(), theme::text_2()),
+                _ => (self.placeholder.clone(), theme::dim()),
             };
             div()
                 .relative()
@@ -679,7 +679,7 @@ impl Render for Field {
                             .left_0()
                             .w(u(1.5))
                             .h(line_px)
-                            .bg(rgb(theme::ACCENT)),
+                            .bg(rgb(theme::accent())),
                     )
                 })
                 .child(
@@ -703,7 +703,7 @@ impl Render for Field {
                 highlights.push((
                     s..e,
                     HighlightStyle {
-                        background_color: Some(rgba(0xffffff38).into()),
+                        background_color: Some(rgba(theme::alpha(theme::text(), 0x38)).into()),
                         ..Default::default()
                     },
                 ));
@@ -714,7 +714,7 @@ impl Render for Field {
                     HighlightStyle {
                         underline: Some(UnderlineStyle {
                             thickness: px(1.),
-                            color: Some(rgb(theme::TEXT).into()),
+                            color: Some(rgb(theme::text()).into()),
                             wavy: false,
                         }),
                         ..Default::default()
@@ -794,7 +794,7 @@ impl Render for Field {
                                         point(p.x, p.y),
                                         size(px(1.5), window.line_height()),
                                     ),
-                                    rgb(theme::ACCENT),
+                                    rgb(theme::accent()),
                                 ));
                             }
                         },
@@ -827,20 +827,20 @@ impl Render for Field {
             .when(!self.bare, |d| {
                 d.rounded(u(8.))
                     .bg(rgb(if focused {
-                        theme::SURFACE_HOVER
+                        theme::surface_hover()
                     } else {
-                        theme::SURFACE
+                        theme::surface()
                     }))
                     .border_1()
                     .border_color(rgba(if focused {
-                        theme::INPUT_EDGE
+                        theme::input_edge()
                     } else {
                         0xffffff00
                     }))
             })
             .text_size(u(13.))
             .line_height(line_px)
-            .text_color(rgb(theme::TEXT))
+            .text_color(rgb(theme::text()))
             .cursor_text()
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))

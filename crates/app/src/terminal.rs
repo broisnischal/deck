@@ -36,8 +36,11 @@ use std::time::Instant;
 
 pub enum TerminalEvent {
     Focused,
-    /// The title or the bell changed: things the sidebar shows.
+    /// The title, the bell or the progress changed: things the sidebar shows.
     Retitled,
+    /// The program wants you: a notification it posted (OSC 9 / 777), or
+    /// `None` for a plain bell.
+    Alert(Option<String>),
     Exited,
     /// ⌘-click on a URL in the output.
     OpenUrl(String),
@@ -49,8 +52,14 @@ pub struct TerminalPane {
     pub title: SharedString,
     /// When output last arrived; agents are "working" while this is recent.
     pub last_output: Instant,
-    /// Set by BEL, cleared when the pane is focused: "this one wants you".
+    /// Set by BEL or a notification, cleared when the pane is looked at:
+    /// "this one wants you".
     pub bell: bool,
+    /// What the program said when it asked for you, if it said anything.
+    pub alert: Option<String>,
+    /// OSC 9;4 progress, once the program has reported any: `Some` while it
+    /// works.
+    progress: Option<Option<u8>>,
     exited: bool,
     look: Look,
     cell_w: f32,
@@ -158,6 +167,21 @@ impl TerminalPane {
                             }
                             term::TermEvent::Bell => {
                                 p.bell = true;
+                                cx.emit(TerminalEvent::Alert(None));
+                                cx.emit(TerminalEvent::Retitled);
+                            }
+                            term::TermEvent::Notify { title, body } => {
+                                let said = match title {
+                                    Some(t) => format!("{t}: {body}"),
+                                    None => body,
+                                };
+                                p.bell = true;
+                                p.alert = Some(said.clone());
+                                cx.emit(TerminalEvent::Alert(Some(said)));
+                                cx.emit(TerminalEvent::Retitled);
+                            }
+                            term::TermEvent::Progress(state) if p.progress != Some(state) => {
+                                p.progress = Some(state);
                                 cx.emit(TerminalEvent::Retitled);
                             }
                             term::TermEvent::Exited(_) => {
@@ -183,6 +207,8 @@ impl TerminalPane {
             title: title.into(),
             last_output: Instant::now(),
             bell: false,
+            alert: None,
+            progress: None,
             exited: false,
             cell_w: cell_width(window, &look.family, look.font_px),
             look,
@@ -330,9 +356,9 @@ impl TerminalPane {
             .gap(theme::u(2.))
             .p(theme::u(4.))
             .rounded(theme::u(theme::CARD_RADIUS))
-            .bg(rgb(theme::SIDEBAR))
+            .bg(rgb(theme::sidebar()))
             .border_1()
-            .border_color(rgba(theme::HAIRLINE))
+            .border_color(rgba(theme::hairline()))
             .cursor_default()
             // Clicks here are not grid clicks: no selection, and the field
             // keeps the focus it just took.
@@ -350,7 +376,7 @@ impl TerminalPane {
                         .flex_none()
                         .px(theme::u(6.))
                         .text_size(theme::u(12.))
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child("No matches"),
                 )
             })
@@ -433,8 +459,32 @@ impl TerminalPane {
     fn focus_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus);
         crate::browser::reclaim_keyboard(window);
-        self.bell = false;
+        self.seen(cx);
         cx.emit(TerminalEvent::Focused);
+    }
+
+    /// The pane has been looked at: whatever it wanted you for is answered
+    /// or at least known.
+    pub fn seen(&mut self, cx: &mut Context<Self>) {
+        if self.bell || self.alert.is_some() {
+            self.bell = false;
+            self.alert = None;
+            cx.emit(TerminalEvent::Retitled);
+        }
+    }
+
+    /// Whether the program says it is working, when it says: OSC 9;4
+    /// progress if it reports any, else Claude Code's title, which turns
+    /// `◐`/`◑` while it works and rests on `✳`. `None` when it does neither.
+    pub fn activity(&self) -> Option<bool> {
+        if let Some(state) = self.progress {
+            return Some(state.is_some());
+        }
+        match self.title.chars().next() {
+            Some('◐' | '◑') => Some(true),
+            Some('✳') => Some(false),
+            _ => None,
+        }
     }
 
     /// Send a mouse event to the program if it asked for mouse input. Shift
@@ -623,6 +673,19 @@ impl TerminalPane {
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let (row, col, right) = self.cell_at(ev.position);
+        // A button let go where this pane never heard it (over the sidebar,
+        // another pane, the menu bar) left a press open. The program would
+        // take every later move for a drag, and Claude Code then selects as
+        // you scroll until the whole screen is grey. Close it now.
+        if let (Some(button), None) = (self.reporting, ev.pressed_button) {
+            self.reporting = None;
+            self.report(
+                Some(button),
+                term::MouseAction::Release,
+                ev.position,
+                &ev.modifiers,
+            );
+        }
         if self.reporting.is_some()
             || (ev.pressed_button.is_none() && self.term.mouse_modes().motion)
         {
@@ -881,6 +944,11 @@ impl Render for TerminalPane {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            // Released outside the pane: still a release, for the program
+            // and for a selection being dragged.
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             // Files dropped from Finder type their paths, as in Terminal; an
@@ -890,7 +958,7 @@ impl Render for TerminalPane {
                 window.focus(&p.focus);
                 cx.notify();
             }))
-            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme::RAISED)))
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme::raised())))
             .child(Grid {
                 pane: cx.entity(),
                 focus: self.focus.clone(),
@@ -1218,9 +1286,11 @@ impl Element for Grid {
                     (term::CursorShape::Underline, _) => {
                         window.paint_quad(fill(bar(0., 2., true), rgb(prep.cursor_color)))
                     }
-                    (term::CursorShape::Block, false) => {
-                        window.paint_quad(outline(c, rgba(0xffffff80), BorderStyle::Solid))
-                    }
+                    (term::CursorShape::Block, false) => window.paint_quad(outline(
+                        c,
+                        rgba(theme::alpha(theme::text(), 0x80)),
+                        BorderStyle::Solid,
+                    )),
                 }
             }
             if let Some((origin, glyph)) = &prep.marked {

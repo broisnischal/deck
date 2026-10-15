@@ -192,6 +192,9 @@ pub struct BrowserPane {
     revealed: bool,
     shown: bool,
     dimmed: bool,
+    /// Something floats over the window (the command palette) that a
+    /// native view would cover.
+    covered: bool,
     favicon: Option<Arc<Image>>,
     /// What was typed in the address bar, without the inline completion.
     typed: String,
@@ -332,6 +335,7 @@ impl BrowserPane {
             revealed: false,
             shown: false,
             dimmed: false,
+            covered: false,
             favicon: None,
             typed: String::new(),
             editing: false,
@@ -922,10 +926,21 @@ impl BrowserPane {
     }
 
     fn sync_visibility(&mut self) {
-        let show = self.tab_visible && self.revealed && !self.is_blank() && self.suggest.is_none();
+        let show = self.tab_visible
+            && self.revealed
+            && !self.is_blank()
+            && self.suggest.is_none()
+            && !self.covered;
         if show != self.shown {
             self.shown = show;
             let _ = self.webview.set_visible(show);
+        }
+    }
+
+    pub fn set_covered(&mut self, covered: bool) {
+        if covered != self.covered {
+            self.covered = covered;
+            self.sync_visibility();
         }
     }
 
@@ -1023,7 +1038,7 @@ impl BrowserPane {
         };
         let leading: AnyElement = match (&self.favicon, editing || self.is_blank()) {
             (Some(img_), false) => site_image(img_.clone(), 14.),
-            _ => icon(Icon::Search, 14., theme::DIM),
+            _ => icon(Icon::Search, 14., theme::dim()),
         };
         let pill = div()
             .id("address")
@@ -1035,13 +1050,13 @@ impl BrowserPane {
             .pl(u(10.))
             .rounded(u(8.))
             .bg(rgb(if editing {
-                theme::SURFACE_HOVER
+                theme::surface_hover()
             } else {
-                theme::SURFACE
+                theme::surface()
             }))
             .border_1()
             .border_color(rgba(if editing {
-                theme::INPUT_EDGE
+                theme::input_edge()
             } else {
                 0xffffff00
             }))
@@ -1076,13 +1091,13 @@ impl BrowserPane {
                 .px(u(8.))
                 .rounded(u(6.))
                 .text_size(u(12.))
-                .text_color(rgb(theme::TEXT_2))
+                .text_color(rgb(theme::text_2()))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+                .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
                 .child(match d.state {
-                    DownloadState::Running => spinner("download-spin", 12., theme::TEXT_2),
-                    DownloadState::Done => icon(Icon::Download, 13., theme::TEXT),
-                    DownloadState::Failed => icon(Icon::Close, 13., theme::DIM),
+                    DownloadState::Running => spinner("download-spin", 12., theme::text_2()),
+                    DownloadState::Done => icon(Icon::Download, 13., theme::text()),
+                    DownloadState::Failed => icon(Icon::Close, 13., theme::dim()),
                 })
                 .child(div().max_w(u(150.)).truncate().child(d.name.clone()))
                 .on_click(move |_, _, _| {
@@ -1104,7 +1119,7 @@ impl BrowserPane {
             .gap(u(2.))
             .h(u(theme::TOOLBAR_PX))
             .px(u(6.))
-            .bg(rgb(theme::PANE))
+            .bg(rgb(theme::pane()))
             .child(
                 nav("back", Icon::ArrowLeft, self.can_back)
                     .on_click(cx.listener(|p, _, _, _| p.back())),
@@ -1145,7 +1160,7 @@ impl BrowserPane {
                         .h(u(2.))
                         .w(relative(self.progress.clamp(0.08, 1.)))
                         .rounded(u(1.))
-                        .bg(rgba(0xffffffcc)),
+                        .bg(rgba(theme::alpha(theme::text(), 0xcc))),
                 )
             })
     }
@@ -1167,16 +1182,16 @@ impl BrowserPane {
                 .gap(u(2.))
                 .h(u(40.))
                 .px(u(6.))
-                .bg(rgb(theme::PANE))
+                .bg(rgb(theme::pane()))
                 .border_t_1()
-                .border_color(rgba(theme::HAIRLINE))
+                .border_color(rgba(theme::hairline()))
                 .child(
                     div()
                         .w(u(PILL_LEFT - 6.))
                         .flex()
                         .justify_end()
                         .pr(u(8.))
-                        .child(icon(Icon::Search, 14., theme::DIM)),
+                        .child(icon(Icon::Search, 14., theme::dim())),
                 )
                 .child(f.field.clone())
                 .child(
@@ -1185,7 +1200,7 @@ impl BrowserPane {
                         .min_w(u(78.))
                         .px(u(8.))
                         .text_size(u(12.))
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child(count),
                 )
                 .child(
@@ -1217,7 +1232,7 @@ impl BrowserPane {
                 let (lead, primary, secondary): (AnyElement, String, Option<String>) = match row {
                     Row::Go { url, label } => (site_icon(url, Icon::Globe), label.clone(), None),
                     Row::Search(q) => (
-                        icon(Icon::Search, 14., theme::TEXT_2),
+                        icon(Icon::Search, 14., theme::text_2()),
                         q.clone(),
                         Some(format!("Search {}", search_engine().name())),
                     ),
@@ -1230,7 +1245,7 @@ impl BrowserPane {
                         }
                     }
                     Row::Server(port, process) => (
-                        icon(Icon::Terminal, 14., theme::TEXT_2),
+                        icon(Icon::Terminal, 14., theme::text_2()),
                         format!("localhost:{port}"),
                         Some(process.clone()),
                     ),
@@ -1246,8 +1261,8 @@ impl BrowserPane {
                         .rounded(u(8.))
                         .text_size(u(13.))
                         .cursor_pointer()
-                        .when(selected, |d| d.bg(rgb(theme::SURFACE)))
-                        .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::ROW_HOVER))))
+                        .when(selected, |d| d.bg(rgb(theme::surface())))
+                        .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
                         .child(
                             div()
                                 .flex_none()
@@ -1268,7 +1283,7 @@ impl BrowserPane {
                                         .flex_shrink()
                                         .min_w_0()
                                         .truncate()
-                                        .text_color(rgb(theme::TEXT))
+                                        .text_color(rgb(theme::text()))
                                         .child(primary),
                                 )
                                 .children(secondary.map(|s| {
@@ -1277,7 +1292,7 @@ impl BrowserPane {
                                         .min_w_0()
                                         .truncate()
                                         .text_size(u(12.))
-                                        .text_color(rgb(theme::DIM))
+                                        .text_color(rgb(theme::dim()))
                                         .child(s)
                                 })),
                         )
@@ -1286,7 +1301,7 @@ impl BrowserPane {
                                 div()
                                     .flex_none()
                                     .text_size(u(12.))
-                                    .text_color(rgb(theme::DIM))
+                                    .text_color(rgb(theme::dim()))
                                     .child("↵"),
                             )
                         })
@@ -1294,7 +1309,7 @@ impl BrowserPane {
                 );
             }
         }
-        div().size_full().bg(rgb(theme::PANE)).child(list)
+        div().size_full().bg(rgb(theme::pane())).child(list)
     }
 
     /// The new tab page: the sites you go back to, and the dev servers your
@@ -1306,7 +1321,7 @@ impl BrowserPane {
                 .pb(u(8.))
                 .text_size(u(11.))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(rgb(theme::DIM))
+                .text_color(rgb(theme::dim()))
                 .child(text)
         };
         let mut col = div()
@@ -1326,7 +1341,7 @@ impl BrowserPane {
                     None => div()
                         .text_size(u(17.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(theme::TEXT_2))
+                        .text_color(rgb(theme::text_2()))
                         .child(
                             host.chars()
                                 .find(|c| c.is_alphanumeric())
@@ -1347,7 +1362,7 @@ impl BrowserPane {
                         .py(u(12.))
                         .rounded(u(10.))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::ROW_HOVER)))
+                        .hover(|s| s.bg(rgb(theme::row_hover())))
                         .child(
                             div()
                                 .flex()
@@ -1355,9 +1370,9 @@ impl BrowserPane {
                                 .justify_center()
                                 .size(u(44.))
                                 .rounded(u(12.))
-                                .bg(rgb(theme::SURFACE))
+                                .bg(rgb(theme::surface()))
                                 .border_1()
-                                .border_color(rgba(theme::HAIRLINE))
+                                .border_color(rgba(theme::hairline()))
                                 .child(mark),
                         )
                         .child(
@@ -1366,7 +1381,7 @@ impl BrowserPane {
                                 .truncate()
                                 .text_center()
                                 .text_size(u(12.))
-                                .text_color(rgb(theme::TEXT_2))
+                                .text_color(rgb(theme::text_2()))
                                 .child(host),
                         )
                         .on_click(cx.listener(move |p, _, _, cx| p.open(&url, cx))),
@@ -1390,21 +1405,21 @@ impl BrowserPane {
                         .rounded(u(8.))
                         .text_size(u(13.))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::ROW_HOVER)))
-                        .child(icon(Icon::Terminal, 14., theme::TEXT_2))
+                        .hover(|s| s.bg(rgb(theme::row_hover())))
+                        .child(icon(Icon::Terminal, 14., theme::text_2()))
                         .child(
                             div()
-                                .text_color(rgb(theme::TEXT))
+                                .text_color(rgb(theme::text()))
                                 .child(format!("localhost:{port}")),
                         )
                         .child(
                             div()
                                 .text_size(u(12.))
-                                .text_color(rgb(theme::DIM))
+                                .text_color(rgb(theme::dim()))
                                 .child(process.clone()),
                         )
                         .child(div().flex_1())
-                        .child(icon(Icon::ArrowUpRight, 13., theme::DIM))
+                        .child(icon(Icon::ArrowUpRight, 13., theme::dim()))
                         .on_click(cx.listener(move |p, _, _, cx| p.open(&url, cx))),
                 );
             }
@@ -1425,13 +1440,13 @@ impl BrowserPane {
                             .justify_center()
                             .size(u(48.))
                             .rounded(u(24.))
-                            .bg(rgb(theme::SURFACE))
-                            .child(icon(Icon::Search, 20., theme::TEXT_2)),
+                            .bg(rgb(theme::surface()))
+                            .child(icon(Icon::Search, 20., theme::text_2())),
                     )
                     .child(
                         div()
                             .text_size(u(14.))
-                            .text_color(rgb(theme::TEXT_2))
+                            .text_color(rgb(theme::text_2()))
                             .child(format!(
                                 "Search {} or enter an address",
                                 search_engine().name()
@@ -1440,7 +1455,7 @@ impl BrowserPane {
                     .child(
                         div()
                             .text_size(u(12.))
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .child("Dev servers you start in a terminal show up here"),
                     ),
             );
@@ -1451,7 +1466,7 @@ impl BrowserPane {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgb(theme::PANE))
+            .bg(rgb(theme::pane()))
             .child(col)
     }
 }
@@ -1468,7 +1483,7 @@ impl Render for BrowserPane {
         } else {
             div()
                 .size_full()
-                .bg(rgb(theme::PANE))
+                .bg(rgb(theme::pane()))
                 .child(
                     canvas(
                         move |bounds, _, cx| entity.update(cx, |p, _| p.sync_bounds(bounds)),
@@ -1485,7 +1500,7 @@ impl Render for BrowserPane {
             .size_full()
             .child(toolbar)
             .children(find)
-            .child(div().flex_none().h(u(1.)).bg(rgba(theme::HAIRLINE)))
+            .child(div().flex_none().h(u(1.)).bg(rgba(theme::hairline())))
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -1494,7 +1509,7 @@ impl Render for BrowserPane {
 fn site_icon(url: &str, fallback: Icon) -> AnyElement {
     match favicon::get(history::host(url)) {
         Some(img_) => site_image(img_, 14.),
-        None => icon(fallback, 14., theme::TEXT_2),
+        None => icon(fallback, 14., theme::text_2()),
     }
 }
 
@@ -1507,18 +1522,14 @@ pub fn site_image(image: Arc<Image>, size: f32) -> AnyElement {
 }
 
 /// The webview sits inside the card: round its bottom corners (the card's
-/// own clipping does not reach a native view) and keep it in dark
-/// appearance whatever the system is set to, so pages that follow
-/// `prefers-color-scheme`, their scrollbars and form controls match deck.
+/// own clipping does not reach a native view). Its appearance comes from the
+/// app, which wears the theme's, so pages that follow `prefers-color-scheme`,
+/// their scrollbars and form controls match deck.
 fn style_native(webview: &wry::WebView, radius: f32) {
-    use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua};
     use objc2_quartz_core::CACornerMask;
     use wry::WebViewExtMacOS;
     let wk = webview.webview();
     let view: &objc2_app_kit::NSView = &wk;
-    // SAFETY: an AppKit constant.
-    let dark = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua });
-    view.setAppearance(dark.as_deref());
     view.setWantsLayer(true);
     if let Some(layer) = view.layer() {
         layer.setCornerRadius(radius as f64);

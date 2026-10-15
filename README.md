@@ -1,0 +1,133 @@
+<p align="center">
+  <img src="packaging/icon-1024.png" width="128" height="128" alt="Deck">
+</p>
+
+<h1 align="center">Deck</h1>
+
+<p align="center">
+  <strong>A workspace for coding with agents.</strong><br>
+  Your terminals, a browser and your coding agents in one native Mac window.
+</p>
+
+<p align="center">
+  <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-000000?logo=apple&logoColor=white">
+  <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-000000">
+  <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-000000">
+</p>
+
+---
+
+Deck puts the things you use all day while working with AI agents side by side. Talk to Claude Code, Codex, Gemini, Grok or OpenCode in a chat. Run any agent's own interface in a real terminal, including Cursor Agent, Amp and Aider. Preview your app in a browser right next to them. Hand an agent a task on its own branch, and review and merge its work when it's done, without leaving the window.
+
+Agents can drive Deck too. From any chat or terminal they can open terminals, start your dev server, open pages and read what's on screen, so "start the app and check the page" just works.
+
+## Features
+
+### Chat with any agent
+
+- **One window, every agent.** Chat with Claude Code, Codex, Gemini CLI, Grok and OpenCode, whichever you have installed, and switch agents in the middle of a thread. Cursor Agent, Amp and Aider run in their own terminals.
+- **A control chat** pinned at the top, always there. It can run Deck for you: open tabs, split panes, start servers, open pages.
+- **Threads you can read at a glance.** Work folds into a short summary ("Worked for 4s · Ran 2 commands") that opens into every step: the commands run and their output, the files read and edited, with diffs.
+- **Approvals where you are typing.** When an agent asks to run a command or edit a file, the request appears above the composer. Answer with a click or ↑↓⏎, or just type what it should do instead. Questions from the agent show their options the same way.
+- **Choose how much it may do:** Ask first, Accept edits, or Full access, per thread.
+- **Talk while it works.** Messages you send mid-turn reach the agent as soon as its current step finishes. ⌘⏎ sends one right away. Esc stops the turn.
+- **Attach anything.** Paste a screenshot, drop files in, or `@` a file from the project.
+- **Threads last.** Transcripts, drafts and attachments survive a restart, and Claude resumes its own session.
+
+### Tasks: agents on their own branch
+
+- **Start a task from ⌘K.** Describe what you want ("add dark mode to settings") and pick *Start a task*. Deck makes a fresh branch and a separate checkout for it, then starts an agent working on it there.
+- **Run several at once.** Each task has its own folder and branch, so agents never step on each other or on the checkout you're working in.
+- **Watch them in the sidebar.** Each task shows what its agent is doing right now, or how many files and lines it has changed.
+- **Review, then decide.** The review shows every change file by file. Then:
+  - **Merge** squashes it into your branch as one commit.
+  - **Open PR** pushes the branch and opens a pull request.
+  - **Discard** throws it away.
+  - A terminal opens in the task's folder whenever you want to run the tests yourself.
+
+### Terminals
+
+- **Fast and faithful.** True colour, wide characters and emoji, mouse support for TUIs, IME input, smooth scrolling, find in scrollback.
+- **Made for agent CLIs.** Paste a screenshot or drop files and their paths go in, so Claude Code and Codex attach them. ⌘-click a link to open it beside the terminal.
+- **Knows what's running.** Tabs are named after the program's own title (Claude Code's current task, `vim file.rs`) and the project folder they're in.
+- **Your choice of look.** Font, size, line height, cursor, and six colour schemes, or one that matches the window.
+
+### Browser
+
+- **A real browser beside your code.** Search or type an address, with suggestions from your history and your search engine (Google by default).
+- **A new tab page** with the sites you visit most and the dev servers running in your terminals.
+- **Find in page, downloads, Web Inspector,** two-finger swipe back and forward, ⌘-click to open in a new tab.
+- **Pages follow your theme,** in dark or light.
+
+### Knows when an agent needs you
+
+- **A "Needs you" badge** on the agent's tab and a count on the Dock icon when it asks for permission or a question.
+- **macOS notifications** when you're looking elsewhere, for questions and for long jobs that finish. Click one to jump straight to that agent.
+- **Live status.** Each agent's icon turns while it works, and its row says what it's doing ("Running cargo test", "Editing src/main.rs").
+
+### A workspace that stays out of the way
+
+- **⌘K command palette:** jump to any tab, action, file or recent page from one box.
+- **⌘N new tab page:** a terminal, a browser, or any agent, as a chat or in its own terminal.
+- **Splits** you can drag to resize, with the focused pane clearly marked.
+- **An inspector** for the focused pane: its processes, listening ports, project files and git status.
+- **Comes back as you left it.** Tabs, splits and focus are restored after a restart, and agents in terminals resume their conversation.
+- **Themes for the whole window:** System, Black, Graphite, Midnight and Light.
+- **Settings** laid out like System Settings, applied as you change them.
+- **Right-click menus** everywhere, and one zoom (⌘+ / ⌘−) for everything.
+
+## Getting started
+
+Deck runs on macOS 13 or later.
+
+```sh
+git clone https://github.com/broisnischal/deck.git
+cd deck
+scripts/install.sh
+```
+
+This installs **Deck.app** into `/Applications` and the `deck` command into `~/.local/bin`. Open Deck from Launchpad or Spotlight.
+
+Deck works with whichever agent CLIs you already have on your `PATH`: `claude`, `codex`, `gemini`, `grok`, `opencode`, `cursor-agent`, `amp`, `aider`. Run `deck doctor` to see which ones it found.
+
+> For notifications from Claude Code running in a terminal, set `"preferredNotifChannel": "iterm2"` in `~/.claude/settings.json`. Deck understands that notification style.
+
+## Keyboard shortcuts
+
+| Shortcut | Does |
+| --- | --- |
+| ⌘K | Command palette |
+| ⌘N | New tab page |
+| ⌘T | New terminal |
+| ⇧⌘N | New chat |
+| ⌘L | Browser address bar |
+| ⇧⌘T | New browser tab |
+| ⌘D / ⇧⌘D | Split right / down |
+| ⌘W | Close pane |
+| ⌘1 … ⌘9 | Go to tab (⌘9 is the last) |
+| ⇧⌘] / ⇧⌘[ | Next / previous tab |
+| ⌘] / ⌘[ | Next / previous pane |
+| ⌘F, ⌘G / ⇧⌘G | Find, next / previous |
+| ⇧⌘K | Clear terminal |
+| ⌘B / ⌘I | Sidebar / inspector |
+| ⌘+ / ⌘− / ⌘0 | Zoom in / out / actual size |
+| ⌘, | Settings |
+
+## Let agents drive Deck
+
+Every terminal and chat in Deck can use the `deck` command, so an agent (or you) can work the window from a shell:
+
+```sh
+deck pane list                          # what's open right now
+deck pane split --cmd 'npm run dev'     # a server in a new terminal beside this one
+deck open http://localhost:3000         # the page, in Deck's browser, beside you
+deck pane read --pane 3                 # read a terminal's screen
+deck pane send --pane 5 'run the tests' # message another agent's chat
+deck browser eval --pane 4 'document.title'
+```
+
+Output is JSON. Run `deck` with no arguments for everything it can do.
+
+## License
+
+MIT

@@ -27,17 +27,23 @@ Each item says how it was verified.
 - [x] Vertical tabs grouped Agents / Terminals / Browser; new, close, switch (⌘T, ⌘N, ⌘W, ⌘1–9, ⌃Tab)
 - [~] Splits right / down, focus cycling (⌘[ ⌘])
 - [ ] Drag a split divider to resize
-- [ ] Restore tabs and splits after a relaunch
+- [~] Restore tabs and splits after a relaunch: `session.json` (saved within a second of any change) keeps every tab, its split tree, which pane had focus, the active tab, and whether the sidebar and inspector were open. Shells come back in their folder without replaying the command. An agent CLI in front comes back with its flags (never its prompt) and resumes: Claude Code by its conversation's id (matched per folder by recency, leaving out deck's own chats), Codex `resume --last`, OpenCode `--continue`. Pages reopen at their address, Settings reopens, chat threads take their saved place (flag filtering, resume lines, Claude's folder naming and the file format unit-tested)
 - [~] Find in scrollback: ⌘F bar, Enter / ⌘G up to older output, ⇧Enter / ⇧⌘G down, wraps, smart case, query taken literally; matches in view highlighted, the current one in white (engine test: order, wrap, case, `1+1`, focus follows output into history, viewport-only highlight). Not yet tried in the window.
 - [x] Sidebar (⌘B) and inspector (⌘I); the inspector folds itself away when the window is too narrow (screenshot at 690 px)
 - [x] Inspector: processes, project dir, ports, files, git, all native except `git status` (timings: tree 0.04 ms, ports 0.01 ms)
 - [x] Black monochrome design, real SVG icons throughout (screenshots)
-- [~] ⌘T opens a new tab page: Terminal (preselected, so ⌘T ⏎ is still a shell), Browser, and every agent deck knows with its mark, as a chat or in its own terminal (⌥⏎ or the card's terminal button); 1–9 pick, esc closes. ⌥⌘T is a plain terminal.
+- [~] ⌘N opens a new tab page: Terminal (preselected, so ⌘N ⏎ is a shell), Browser, and every agent deck knows with its mark, as a chat or in its own terminal (⌥⏎ or the card's terminal button); 1–9 pick, esc closes. ⌘T is a plain terminal, ⌘L the browser, ⇧⌘N a new chat. Only ⌘: ⌃L, ⌃N and ⌃T stay with the terminal.
+- [~] Sidebar rows share one grid: the mark in a 16 pt slot at the row inset, every title on the column after it, two-line rows 44 tall, trailing buttons on one edge with the headers'; activity always shows in the mark's place (a terminal running an agent shows that agent's mark, turning while it works). Inspector: sentence-case section labels like the sidebar's, a 28 pt section switch matching the title bar buttons, the project as `~/path` with small reveal and copy actions, processes as an indented tree
 - [~] Splits draw a card per pane, a gutter apart; the focused card has the brighter edge and the others dim (a page dims itself, since gpui cannot paint over it)
 - [~] Tab titles: a program's own title (Claude Code's task, `vim file`), else the command in front; a second line says which project (git root) and folder the pane is in, or which site a page is on; threads say "Claude · project"
+- [~] Agents that need you: a "Needs you" pill with a bell on the tab, a count on the Dock icon, and a macOS notification when you are looking elsewhere (clicking it opens that pane). Deck chats say what they wait on (the command to run, the question asked). Terminals: deck reads the notification escapes alacritty drops, OSC 9 (iTerm2) and OSC 777 (Ghostty), through a tap on the PTY reader that costs no throughput (bench: 146–160 MB/s), and Claude Code posts them once `preferredNotifChannel` is `iterm2`. A shell's own bell marks the tab without a banner. Looking at the pane clears it (escape parsing unit-tested; banners not yet seen)
+- [~] Busy is what the program says: OSC 9;4 progress when it reports it, else Claude Code's title (`◐`/`◑` while working, `✳` at rest); only programs that say neither fall back to "printing in the last 1.5 s". Fixes the spinner on an idle Claude Code, whose status line keeps redrawing
 - [~] Spinners: a comet for a busy terminal or a loading page, the agent's own mark turning while it works, and a light sweep across "Working…"
 - [~] Right-click menus in deck's own look: terminal (links, copy, paste, select all, find, clear, splits, close), text fields, chat messages, sidebar rows
 - [~] Terminal ⌘V pastes copied Finder files as paths and a copied image as a saved file's path, and files dropped on a terminal type their paths, so Claude Code and Codex attach them (path escaping unit-tested)
+- [~] Window themes: System (follows macOS), Black, Graphite, Midnight and Light, chosen in Settings and applied at once to every surface, the menus, the terminal palette ("Match window") and the appearance native views take (traffic lights, scrollbars, web pages). Colours are read from the theme as the UI draws (409 reads converted), and every theme keeps text 12:1, secondary 4.5:1 and labels 3.9:1 or better on its surfaces (contrast unit-tested)
+- [~] Settings laid out as System Settings: a sidebar of pages (General, Appearance, Terminal, Browser, Agents), one page at a time with a title, inset groups with a name on the leading edge and the control on the trailing one, hairlines that start where the text does, notes under groups, lists of choices with a check, the theme as preview tiles drawn in each theme's colours
+- [~] Composer: the access chip is quiet in every mode with its own mark (shield, pencil, bolt); Full access is outlined rather than filled; stop is a solid square
 - [~] Settings tab (⌘,, Deck › Settings…, or the gear at the foot of the sidebar), one per window, applied live and saved to settings.json: zoom; terminal colour scheme (Deck, Tomorrow Night, Catppuccin Mocha, Tokyo Night, Gruvbox Dark, Solarized Dark, One Dark); font family (installed monospace faces only), size, line height; default cursor (block / bar / underline), blink, Option as Meta; search engine (Google by default); the agent and access new chats start with. An old settings.json still loads, and a bad value resets only itself (serde round-trip, legacy file, cursor default and Meta keys unit-tested). Not yet seen in the window.
 
 ## Browser
@@ -64,7 +70,7 @@ Each item says how it was verified.
 
 ## Agents and control plane
 
-- [x] Master chat with Claude / OpenCode / Codex / Gemini / Grok: streaming text, tool cards, thinking, interrupt, agent switch mid-thread, Edits only / Full access
+- [x] Master chat with Claude / OpenCode / Codex / Gemini / Grok: streaming text, tool cards, thinking, interrupt, agent switch mid-thread, Ask first / Accept edits / Full access
 - [x] Agents drive deck through the `deck` CLI (Claude ran `deck pane list` from a chat and answered correctly)
 - [x] Chat threads in the sidebar with live status
 - [x] `deck pane send` / `pane read` work on chats, so one agent can message another
@@ -88,9 +94,13 @@ Each item says how it was verified.
 - [x] Steer a running turn instead of queueing (T3): see above
 - [ ] deck as an MCP server injected into every agent session (T3), alongside the CLI
 - [ ] Per-turn git checkpoints with "Edit from here", worktree per thread, diff panel (T3)
-- [ ] Command palette ⌘K (T3)
+- [~] Command palette ⌘K: open tabs, actions (with their shortcuts), the project's files (git's list) and visited pages in one box, fuzzy-matched with the matched letters lit, word starts and runs ranked first (matcher unit-tested); ↑↓ ⏎ esc; pages step aside while it is open. Typing a brief offers "Start a task". Clear terminal moved to ⇧⌘K
+- [~] Tasks: "Start a task" makes a branch `deck/<slug>` and a git worktree under deck's data folder from what is checked out, and starts a chat with the default agent in it with the brief as its first message (Claude Code in a terminal if no chat agent is ready). The sidebar lists open tasks above threads: what the agent is doing or waiting on, else files and +/− changed (counted every 3 s through a scratch index, so new and deleted files count and the worktree's index is untouched). Review opens beside the work: the diff file by file, collapsible, Merge into the base branch (commits what is left, squashes into one commit named for the task, then removes the worktree and branch; refuses if the main checkout is on another branch), Open PR (push + `gh pr create`, the PR opens beside), Discard (asks twice), a terminal in the worktree. Kept in tasks.json (create → change → count → merge tested against a real repository)
 
 ## Terminal fixes
+
+- [~] A click whose release happened outside the pane (over the sidebar, another pane, the menu bar) stayed "held" for the program, so every later move was reported as a drag and Claude Code's fullscreen mode selected as you scrolled, until the whole screen was grey. Releases outside the pane now reach it, and a move with no button down closes any press still open
+- [~] Tab titles and agent detection use the terminal's foreground process group (and the CLI under `sh -c` for agent tabs), not the last process in the tree, which for Claude Code was one of its MCP helpers; a binary named after its version (`2.1.300`) is shown by the name it was started as (argv parsing unit-tested)
 
 - [x] Selection no longer stretches over the screen when a full-screen app scrolls its own region (engine test reproduces the stretch)
 

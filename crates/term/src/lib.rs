@@ -27,6 +27,8 @@
 //! caller supplies the palette, which is what lets the terminal follow the app's
 //! own theme instead of shipping a second one.
 
+mod tap;
+
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
@@ -233,6 +235,13 @@ pub struct Snapshot {
 pub enum TermEvent {
     Title(String),
     Bell,
+    /// A desktop notification the program asked for (OSC 9 / OSC 777).
+    Notify {
+        title: Option<String>,
+        body: String,
+    },
+    /// OSC 9;4 progress: `Some(state)` while working, `None` when cleared.
+    Progress(Option<u8>),
     Exited(Option<i32>),
 }
 
@@ -834,6 +843,7 @@ impl Terminal {
 
         let pty = tty::new(&options, window, 0)?;
         let pid = pty.child().id();
+        let pty = tap::Tapped::new(pty, shared.clone())?;
         let config = Config {
             scrolling_history: SCROLLBACK,
             ..Default::default()

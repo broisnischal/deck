@@ -9,7 +9,9 @@ use crate::inspect::{self, Entry, GitInfo, Port, Proc};
 use crate::theme::{self, u};
 use crate::workspace::Workspace;
 use gpui::prelude::*;
-use gpui::{div, px, rgb, AnyElement, ClipboardItem, Context, ElementId, FontWeight, SharedString};
+use gpui::{
+    div, px, rgb, rgba, AnyElement, ClipboardItem, Context, ElementId, FontWeight, SharedString,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -88,57 +90,70 @@ pub fn collect(
     }
 }
 
-fn header(label: &str, count: Option<usize>) -> gpui::Div {
-    let mut d = div()
+/// A section label, as the sidebar draws its own: sentence case, quiet.
+fn header(label: &'static str, count: Option<usize>) -> gpui::Div {
+    div()
         .flex()
         .items_center()
         .gap(u(6.))
-        .pt(u(14.))
+        .pt(u(20.))
         .pb(u(6.))
         .text_size(u(11.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(theme::DIM))
-        .child(SharedString::from(label.to_uppercase()));
-    if let Some(n) = count {
-        d = d.child(div().flex_1()).child(
-            div()
-                .px(u(7.))
-                .rounded(u(9.))
-                .bg(rgb(theme::SURFACE))
-                .text_color(rgb(theme::TEXT_2))
-                .child(n.to_string()),
-        );
-    }
-    d
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(theme::dim()))
+        .child(div().flex_1().child(label))
+        .children(count.map(|n| n.to_string()))
 }
 
-fn button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+/// A small action beside a value: the icon says what it does.
+fn action(id: &'static str, glyph: Icon) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
-        .flex_1()
+        .flex_none()
         .items_center()
         .justify_center()
-        .h(u(30.))
-        .rounded(u(7.))
-        .bg(rgb(theme::SURFACE))
-        .text_size(u(12.))
-        .text_color(rgb(theme::TEXT))
+        .size(u(24.))
+        .rounded(u(6.))
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
-        .child(label)
+        .hover(|s| s.bg(rgb(theme::surface())))
+        .child(icon(glyph, 13., theme::text_2()))
+}
+
+/// What a section shows when it has nothing.
+fn empty(text: &'static str) -> gpui::Div {
+    div()
+        .text_size(u(12.))
+        .text_color(rgb(theme::dim()))
+        .child(text)
+}
+
+/// `/Users/me/deck` → `~/deck`.
+fn tilde(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if shown == home => "~".into(),
+        Ok(home) => shown
+            .strip_prefix(&format!("{home}/"))
+            .map_or(shown.clone(), |rest| format!("~/{rest}")),
+        Err(_) => shown,
+    }
 }
 
 pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> AnyElement {
     let ins = &ws.inspector;
-    // Concentric: 7px segments inside 3px of padding make a 10px track.
+    // Concentric: 6px segments inside 2px of padding make an 8px track, 28
+    // tall like the title bar's buttons beside it.
     let mut tabs = div()
         .flex()
         .flex_1()
         .gap(u(2.))
-        .p(u(3.))
-        .rounded(u(10.))
-        .bg(rgb(theme::PANE));
+        .h(u(28.))
+        .p(u(2.))
+        .rounded(u(8.))
+        .bg(rgb(theme::pane()))
+        .border_1()
+        .border_color(rgba(theme::hairline()));
     for (s, label, glyph) in [
         (Section::Info, "Info", Icon::Info),
         (Section::Files, "Files", Icon::Files),
@@ -153,21 +168,20 @@ pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) 
                 .items_center()
                 .justify_center()
                 .gap(u(6.))
-                .h(u(26.))
-                .rounded(u(7.))
+                .rounded(u(6.))
                 .text_size(u(12.))
                 .when(on, |d| {
-                    d.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+                    d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
                 })
                 .when(!on, |d| {
-                    d.text_color(rgb(theme::TEXT_2))
-                        .hover(|s| s.text_color(rgb(theme::TEXT)))
+                    d.text_color(rgb(theme::text_2()))
+                        .hover(|s| s.text_color(rgb(theme::text())))
                 })
                 .cursor_pointer()
                 .child(icon(
                     glyph,
-                    13.,
-                    if on { theme::TEXT } else { theme::TEXT_2 },
+                    12.,
+                    if on { theme::text() } else { theme::text_2() },
                 ))
                 .child(label)
                 .on_click(cx.listener(move |ws, _, _, cx| {
@@ -195,8 +209,8 @@ pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) 
         .h_full()
         .pl(u(theme::GUTTER + 4.))
         .pr(u(theme::GUTTER + 4.))
-        .bg(rgb(theme::SIDEBAR))
-        .text_color(rgb(theme::TEXT))
+        .bg(rgb(theme::sidebar()))
+        .text_color(rgb(theme::text()))
         // Same strip height as the title bar, so the two tops line up.
         .child(
             div()
@@ -224,28 +238,31 @@ fn browser_info(title: SharedString, url: SharedString) -> AnyElement {
         .flex_col()
         .child(
             div()
-                .pt(u(14.))
-                .text_size(u(15.))
+                .pt(u(16.))
+                .text_size(u(14.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(div().w_full().truncate().child(title)),
         )
         .child(header("Address", None))
         .child(
             div()
-                .text_size(u(13.))
-                .text_color(rgb(theme::TEXT_2))
-                .pb(u(8.))
-                .child(url),
-        )
-        .child(
-            div()
                 .flex()
-                .gap(u(8.))
-                .child(button("copy-url", "Copy").on_click(move |_, _, cx| {
+                .items_start()
+                .gap(u(4.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pt(u(3.))
+                        .text_size(u(12.))
+                        .text_color(rgb(theme::text_2()))
+                        .child(url),
+                )
+                .child(action("copy-url", Icon::Copy).on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(u1.clone()))
                 }))
                 .child(
-                    button("open-default", "Open in Browser")
+                    action("open-default", Icon::ArrowUpRight)
                         .on_click(move |_, _, cx| cx.open_url(&u2)),
                 ),
         )
@@ -259,11 +276,12 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
         div()
             .flex()
             .flex_col()
-            .pt(u(14.))
+            .gap(u(2.))
+            .pt(u(16.))
             .child(
                 div()
                     .w_full()
-                    .text_size(u(15.))
+                    .text_size(u(14.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .truncate()
                     .child(title),
@@ -272,46 +290,82 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
                 c.child(
                     div()
                         .text_size(u(12.))
-                        .text_color(rgb(theme::TEXT_2))
+                        .text_color(rgb(theme::dim()))
                         .child(format!("pid {pid}")),
                 )
             }),
     );
 
     if let Some(root) = d.root.clone() {
-        let shown = root.display().to_string();
-        let (r1, r2) = (root.clone(), shown.clone());
-        col = col
-            .child(header("Project directory (auto)", None))
-            .child(div().text_size(u(13.)).pb(u(8.)).truncate().child(shown))
-            .child(
-                div()
-                    .flex()
-                    .gap(u(8.))
-                    .child(button("finder", "Finder").on_click(move |_, _, cx| cx.reveal_path(&r1)))
-                    .child(button("copy", "Copy").on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(r2.clone()))
-                    })),
-            );
+        let (r1, r2) = (root.clone(), root.display().to_string());
+        col = col.child(header("Project", None)).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(u(4.))
+                .child(icon(Icon::Folder, 13., theme::text_2()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pl(u(4.))
+                        .text_size(u(13.))
+                        .truncate()
+                        .child(tilde(&root)),
+                )
+                .child(
+                    action("finder", Icon::ArrowUpRight)
+                        .on_click(move |_, _, cx| cx.reveal_path(&r1)),
+                )
+                .child(action("copy", Icon::Copy).on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(r2.clone()))
+                })),
+        );
     }
 
     col = col.child(header("Processes", Some(d.procs.len())));
+    // The tree reads by indent: the shell, what it started, and theirs.
+    let mut depth: std::collections::HashMap<u32, usize> = Default::default();
     for p in &d.procs {
+        let level = depth.get(&p.ppid).map_or(0, |d| d + 1);
+        depth.insert(p.pid, level);
+        let busy = p.cpu >= 1.;
         col = col.child(
             div()
                 .flex()
                 .items_center()
-                .gap(u(8.))
-                .h(u(26.))
+                .gap(u(6.))
+                .h(u(24.))
+                .pl(u(level.min(4) as f32 * 12.))
                 .text_size(u(13.))
-                .child(div().size(u(6.)).rounded(u(3.)).bg(rgb(theme::TEXT_2)))
-                .child(div().truncate().child(p.name.clone()))
-                .child(div().text_color(rgb(theme::DIM)).child(p.pid.to_string()))
+                .when(level > 0, |d| {
+                    d.child(div().w(u(6.)).h(u(1.)).bg(rgba(theme::input_edge())))
+                })
+                .child(
+                    div()
+                        .flex_shrink()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(rgb(if level == 0 {
+                            theme::text_2()
+                        } else {
+                            theme::text()
+                        }))
+                        .child(p.name.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(u(11.))
+                        .text_color(rgb(theme::dim()))
+                        .child(p.pid.to_string()),
+                )
                 .child(div().flex_1())
                 .child(
                     div()
-                        .text_size(u(12.))
-                        .text_color(rgb(theme::DIM))
+                        .flex_none()
+                        .text_size(u(11.))
+                        .text_color(rgb(if busy { theme::text_2() } else { theme::dim() }))
                         .child(format!("{:.0}% · {}", p.cpu, inspect::human_bytes(p.rss))),
                 ),
         );
@@ -319,12 +373,7 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
 
     col = col.child(header("Ports", None));
     if d.ports.is_empty() {
-        col = col.child(
-            div()
-                .text_size(u(13.))
-                .text_color(rgb(theme::TEXT_2))
-                .child("No listening ports"),
-        );
+        col = col.child(empty("None listening"));
     }
     for port in &d.ports {
         let url = format!("http://localhost:{}", port.port);
@@ -339,21 +388,21 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
                 .rounded(u(6.))
                 .text_size(u(13.))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::SURFACE)))
+                .hover(|s| s.bg(rgb(theme::surface())))
                 .child(
                     div()
-                        .text_color(rgb(theme::TEXT))
+                        .text_color(rgb(theme::text()))
                         .font_weight(FontWeight::MEDIUM)
                         .child(format!(":{}", port.port)),
                 )
                 .child(
                     div()
-                        .text_color(rgb(theme::TEXT_2))
+                        .text_color(rgb(theme::text_2()))
                         .truncate()
                         .child(port.process.clone()),
                 )
                 .child(div().flex_1())
-                .child(icon(Icon::ArrowUpRight, 13., theme::DIM))
+                .child(icon(Icon::ArrowUpRight, 13., theme::dim()))
                 .on_click(
                     cx.listener(move |ws, _, window, cx| ws.open_url_beside(&url, window, cx)),
                 ),
@@ -365,11 +414,7 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
 fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let d = &ws.inspector.data;
     let Some(root) = &d.root else {
-        return div()
-            .pt(u(14.))
-            .text_color(rgb(theme::TEXT_2))
-            .child("No project")
-            .into_any_element();
+        return empty("No project").pt(u(16.)).into_any_element();
     };
     let mut col = div().flex().flex_col().pt(u(10.));
     let mut stack: Vec<(&Entry, usize)> = d
@@ -396,9 +441,13 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                 .pl(u(6. + depth as f32 * 14.))
                 .rounded(u(5.))
                 .text_size(u(13.))
-                .text_color(rgb(if is_dir { theme::TEXT } else { theme::TEXT_2 }))
+                .text_color(rgb(if is_dir {
+                    theme::text()
+                } else {
+                    theme::text_2()
+                }))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::SURFACE)))
+                .hover(|s| s.bg(rgb(theme::surface())))
                 .child(div().w(u(12.)).flex_none().when(is_dir, |d| {
                     d.child(icon(
                         if open {
@@ -407,13 +456,17 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                             Icon::ChevronRight
                         },
                         12.,
-                        theme::DIM,
+                        theme::dim(),
                     ))
                 }))
                 .child(icon(
                     if is_dir { Icon::Folder } else { Icon::File },
                     14.,
-                    if is_dir { theme::TEXT_2 } else { theme::DIM },
+                    if is_dir {
+                        theme::text_2()
+                    } else {
+                        theme::dim()
+                    },
                 ))
                 .child(
                     div()
@@ -443,12 +496,7 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
 
 fn git(ws: &Workspace) -> AnyElement {
     let Some(g) = &ws.inspector.data.git else {
-        return div()
-            .pt(u(14.))
-            .text_size(u(13.))
-            .text_color(rgb(theme::TEXT_2))
-            .child("Not a git repository")
-            .into_any_element();
+        return empty("Not a git repository").pt(u(16.)).into_any_element();
     };
     let mut col = div().flex().flex_col().child(
         div()
@@ -465,14 +513,14 @@ fn git(ws: &Workspace) -> AnyElement {
             .when(g.ahead > 0, |d| {
                 d.child(
                     div()
-                        .text_color(rgb(theme::TEXT_2))
+                        .text_color(rgb(theme::text_2()))
                         .child(format!("↑{}", g.ahead)),
                 )
             })
             .when(g.behind > 0, |d| {
                 d.child(
                     div()
-                        .text_color(rgb(theme::TEXT_2))
+                        .text_color(rgb(theme::text_2()))
                         .child(format!("↓{}", g.behind)),
                 )
             }),
@@ -482,16 +530,16 @@ fn git(ws: &Workspace) -> AnyElement {
         col = col.child(
             div()
                 .text_size(u(13.))
-                .text_color(rgb(theme::TEXT_2))
+                .text_color(rgb(theme::text_2()))
                 .child("Working tree clean"),
         );
     }
     for f in &g.files {
         let color = match f.status.as_str() {
             // The letter carries the meaning; weight of grey ranks it.
-            "U" | "D" => theme::TEXT,
-            "??" => theme::DIM,
-            _ => theme::TEXT_2,
+            "U" | "D" => theme::text(),
+            "??" => theme::dim(),
+            _ => theme::text_2(),
         };
         col = col.child(
             div()
@@ -511,7 +559,7 @@ fn git(ws: &Workspace) -> AnyElement {
                 .child(
                     div()
                         .truncate()
-                        .text_color(rgb(theme::TEXT_2))
+                        .text_color(rgb(theme::text_2()))
                         .child(f.path.clone()),
                 ),
         );

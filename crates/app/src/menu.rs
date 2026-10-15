@@ -241,9 +241,9 @@ impl Render for ContextMenu {
             .min_w(u(MIN_W))
             .p(u(4.))
             .rounded(u(10.))
-            .bg(rgb(0x161616))
+            .bg(rgb(theme::menu()))
             .border_1()
-            .border_color(rgba(0xffffff14))
+            .border_color(rgba(theme::alpha(theme::text(), 0x14)))
             .shadow(vec![
                 BoxShadow {
                     color: hsla(0., 0., 0., 0.5),
@@ -270,19 +270,19 @@ impl Render for ContextMenu {
                     .h(u(1.))
                     .my(u(4.))
                     .mx(u(4.))
-                    .bg(rgba(theme::HAIRLINE))
+                    .bg(rgba(theme::hairline()))
                     .into_any_element(),
                 Entry::Item(item) => {
                     let lit = self.highlight == Some(ix) && !item.disabled;
                     let fg = if item.disabled {
-                        theme::DIM
+                        theme::dim()
                     } else {
-                        theme::TEXT
+                        theme::text()
                     };
                     let glyph = if item.disabled {
-                        theme::DIM
+                        theme::dim()
                     } else {
-                        theme::TEXT_2
+                        theme::text_2()
                     };
                     div()
                         .id(ElementId::NamedInteger("menu-item".into(), ix as u64))
@@ -293,7 +293,7 @@ impl Render for ContextMenu {
                         .px(u(8.))
                         .rounded(u(6.))
                         .text_color(rgb(fg))
-                        .when(lit, |d| d.bg(rgb(theme::SURFACE_HOVER)))
+                        .when(lit, |d| d.bg(rgb(theme::surface_hover())))
                         .when(gutter, |d| match item.icon {
                             Some(i) => d.child(icon(i, 14., glyph)),
                             None => d.child(div().flex_none().size(u(14.))),
@@ -304,7 +304,7 @@ impl Render for ContextMenu {
                                 div()
                                     .pl(u(20.))
                                     .text_size(u(12.))
-                                    .text_color(rgb(theme::DIM))
+                                    .text_color(rgb(theme::dim()))
                                     .child(keys),
                             )
                         })

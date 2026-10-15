@@ -535,6 +535,86 @@ impl ChatPane {
         self.turn_started.map(|t| t.elapsed())
     }
 
+    /// What the agent is doing this moment, in a line ("Running cargo
+    /// test", "Editing src/main.rs", "Thinking"), while a turn runs.
+    pub fn activity(&self) -> Option<String> {
+        if self.status != ChatStatus::Working {
+            return None;
+        }
+        let last = self
+            .transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant);
+        let line = last
+            .and_then(|m| {
+                m.blocks.iter().rev().find_map(|b| match b {
+                    Block::Tool(t) if t.result.is_none() => {
+                        let (verb, what) = step_phrase(t, true, &self.cwd);
+                        let what = what.lines().next().unwrap_or_default().to_string();
+                        Some(if what.is_empty() {
+                            verb.to_string()
+                        } else {
+                            format!("{verb} {what}")
+                        })
+                    }
+                    Block::Text { open: true, .. } => Some("Writing a reply".into()),
+                    Block::Reasoning { open: true, .. } => Some("Thinking".into()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| "Thinking".into());
+        Some(line.chars().take(120).collect())
+    }
+
+    /// The opening line of the last reply, for a "finished" notification.
+    pub fn last_reply(&self) -> Option<String> {
+        let m = self
+            .transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)?;
+        m.blocks.iter().rev().find_map(|b| match b {
+            Block::Text { text, .. } => text
+                .lines()
+                .map(|l| l.trim().trim_start_matches(['#', '*', '-', '>', ' ']))
+                .find(|l| !l.is_empty())
+                .map(|l| l.chars().take(160).collect()),
+            _ => None,
+        })
+    }
+
+    /// What the agent is waiting on you for, in a line: the command or tool
+    /// it wants to run, or the question it asked.
+    pub fn waiting_for(&self) -> Option<String> {
+        let line = match self.asks.first()? {
+            Ask::Permission { tool, input, .. } => {
+                match input.get("command").and_then(|c| c.as_str()) {
+                    Some(cmd) => format!("Wants to run {}", cmd.lines().next().unwrap_or(cmd)),
+                    None => format!("Wants to use {tool}"),
+                }
+            }
+            Ask::Question { questions, .. } => questions.first()?.question.clone(),
+        };
+        let mut line: String = line.chars().take(180).collect();
+        if line.len() < 4 {
+            line = "Waiting for you".into();
+        }
+        Some(line)
+    }
+
+    /// The agent's own session id (Claude Code's, for `--resume`).
+    pub fn native_id(&self) -> Option<&str> {
+        self.native_id.as_deref()
+    }
+
+    /// The id its saved file goes by, which a restored layout refers to.
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
     }
@@ -1126,9 +1206,9 @@ impl ChatPane {
             .gap(u(8.))
             .p(u(12.))
             .rounded(u(14.))
-            .bg(rgb(theme::RAISED))
+            .bg(rgb(theme::raised()))
             .border_1()
-            .border_color(rgba(0xffffff30))
+            .border_color(rgba(theme::strong_edge()))
             .text_size(u(12.5));
         let option = |i: usize,
                       selected: bool,
@@ -1146,17 +1226,17 @@ impl ChatPane {
                 .rounded(u(8.))
                 .cursor_pointer()
                 .when(selected, |d| {
-                    d.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+                    d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
                 })
-                .when(!selected, |d| d.text_color(rgb(theme::TEXT_2)))
-                .hover(|s| s.bg(rgb(theme::SURFACE)))
+                .when(!selected, |d| d.text_color(rgb(theme::text_2())))
+                .hover(|s| s.bg(rgb(theme::surface())))
                 .child(
                     div()
                         .flex_none()
                         .w(u(14.))
                         .font_family(theme::MONO)
                         .text_size(u(11.))
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child(format!("{}", i + 1)),
                 )
                 .child(
@@ -1170,7 +1250,7 @@ impl ChatPane {
                             d.child(
                                 div()
                                     .text_size(u(11.5))
-                                    .text_color(rgb(theme::DIM))
+                                    .text_color(rgb(theme::dim()))
                                     .child(t),
                             )
                         }),
@@ -1180,7 +1260,7 @@ impl ChatPane {
                         div()
                             .flex_none()
                             .text_size(u(11.))
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .child(k),
                     )
                 })
@@ -1201,21 +1281,21 @@ impl ChatPane {
                             .flex()
                             .items_center()
                             .gap(u(8.))
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(rgb(theme::text()))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(icon(Icon::Info, 14., theme::TEXT))
+                            .child(icon(Icon::Info, 14., theme::text()))
                             .child(div().flex_1().child(format!("{agent} wants to {title}")))
                             .when(more > 0, |d| {
                                 d.child(
                                     div()
                                         .text_size(u(11.))
-                                        .text_color(rgb(theme::DIM))
+                                        .text_color(rgb(theme::dim()))
                                         .child(format!("+{more} more")),
                                 )
                             }),
                     )
                     .when_some(reason.clone(), |d, r| {
-                        d.child(div().text_color(rgb(theme::TEXT_2)).child(r))
+                        d.child(div().text_color(rgb(theme::text_2())).child(r))
                     })
                     .when_some(preview, |d, p| d.child(p));
                 for (i, (_, label, key)) in PERMISSION_CHOICES.iter().enumerate() {
@@ -1230,7 +1310,7 @@ impl ChatPane {
                 card.child(
                     div()
                         .text_size(u(11.))
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child("Or type what to do instead and press ⏎"),
                 )
             }
@@ -1247,15 +1327,15 @@ impl ChatPane {
                         .flex()
                         .items_center()
                         .gap(u(8.))
-                        .text_color(rgb(theme::TEXT))
+                        .text_color(rgb(theme::text()))
                         .font_weight(FontWeight::MEDIUM)
-                        .child(icon(Icon::Info, 14., theme::TEXT))
+                        .child(icon(Icon::Info, 14., theme::text()))
                         .child(div().flex_1().child(q.question.clone()))
                         .when(!q.header.is_empty(), |d| {
                             d.child(
                                 div()
                                     .text_size(u(11.))
-                                    .text_color(rgb(theme::DIM))
+                                    .text_color(rgb(theme::dim()))
                                     .child(q.header.clone()),
                             )
                         })
@@ -1263,7 +1343,7 @@ impl ChatPane {
                             d.child(
                                 div()
                                     .text_size(u(11.))
-                                    .text_color(rgb(theme::DIM))
+                                    .text_color(rgb(theme::dim()))
                                     .child(format!("{} of {}", qi + 1, questions.len())),
                             )
                         }),
@@ -1294,7 +1374,7 @@ impl ChatPane {
                 card.child(
                     div()
                         .text_size(u(11.))
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child("↑↓ choose · ⏎ answer · or type your own answer · esc skip"),
                 )
             }
@@ -1673,8 +1753,8 @@ impl ChatPane {
                             .px(u(14.))
                             .py(u(9.))
                             .rounded(u(18.))
-                            .bg(rgb(theme::SURFACE))
-                            .text_color(rgb(theme::TEXT))
+                            .bg(rgb(theme::surface()))
+                            .text_color(rgb(theme::text()))
                             .on_mouse_down(
                                 gpui::MouseButton::Right,
                                 cx.listener(move |c, ev: &gpui::MouseDownEvent, window, cx| {
@@ -1695,11 +1775,11 @@ impl ChatPane {
                             .pt(u(18.))
                             .h(u(44.))
                             .text_size(u(12.))
-                            .text_color(rgb(theme::TEXT_2))
+                            .text_color(rgb(theme::text_2()))
                             .child(spinner(
                                 ElementId::Name(format!("wait-spin-{ix}").into()),
                                 12.,
-                                theme::TEXT_2,
+                                theme::text_2(),
                             ))
                             .child(working_label(format!("wait-{ix}"), "Working…".into())),
                     );
@@ -1757,11 +1837,11 @@ impl ChatPane {
                             .gap(u(6.))
                             .h(u(26.))
                             .text_size(u(12.))
-                            .text_color(rgb(theme::TEXT_2))
+                            .text_color(rgb(theme::text_2()))
                             .child(spinner(
                                 ElementId::Name(format!("pending-spin-{ix}").into()),
                                 12.,
-                                theme::TEXT_2,
+                                theme::text_2(),
                             ))
                             .child(working_label(format!("pending-{ix}"), "Working…".into())),
                     );
@@ -1786,15 +1866,17 @@ impl ChatPane {
                                 .px(u(6.))
                                 .rounded(u(6.))
                                 .text_size(u(11.))
-                                .text_color(rgb(theme::DIM))
+                                .text_color(rgb(theme::dim()))
                                 .opacity(if copied { 1. } else { 0. })
                                 .group_hover(group.clone(), |s| s.opacity(1.))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+                                .hover(|s| {
+                                    s.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
+                                })
                                 .child(icon(
                                     if copied { Icon::Check } else { Icon::Copy },
                                     12.,
-                                    theme::DIM,
+                                    theme::dim(),
                                 ))
                                 .child(if copied { "Copied" } else { "Copy" })
                                 .on_click(cx.listener(move |c, _, _, cx| {
@@ -1826,7 +1908,7 @@ impl ChatPane {
             }
             Block::Handoff { to, mode, .. } => div()
                 .text_size(u(12.))
-                .text_color(rgb(theme::DIM))
+                .text_color(rgb(theme::dim()))
                 .child(format!(
                     "Continued with {} ({})",
                     to.as_str(),
@@ -1835,7 +1917,7 @@ impl ChatPane {
                 .into_any_element(),
             Block::Attachment { path, .. } => div()
                 .text_size(u(12.))
-                .text_color(rgb(theme::TEXT_2))
+                .text_color(rgb(theme::text_2()))
                 .child(path.clone())
                 .into_any_element(),
             // Tools and thinking are drawn by the work log.
@@ -1889,64 +1971,63 @@ impl ChatPane {
             format!(" · {summary}")
         };
 
-        let mut log =
-            div().flex().flex_col().child(
-                div()
-                    .id(ElementId::Name(format!("log-{ix}-{pi}").into()))
-                    .flex()
-                    .items_center()
-                    .gap(u(6.))
-                    .h(u(26.))
-                    .text_size(u(12.))
-                    .text_color(rgb(theme::TEXT_2))
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(rgb(theme::TEXT)))
-                    .child(if running {
-                        spinner(
-                            ElementId::Name(format!("log-spin-{ix}-{pi}").into()),
-                            12.,
-                            theme::TEXT_2,
-                        )
-                    } else {
-                        icon(
-                            if open {
-                                Icon::ChevronDown
-                            } else {
-                                Icon::ChevronRight
-                            },
-                            12.,
-                            theme::DIM,
-                        )
-                    })
-                    .child(if running {
-                        working_label(format!("log-label-{ix}-{pi}"), label)
-                    } else {
-                        div().flex_none().child(label).into_any_element()
-                    })
-                    .child(
-                        div().flex_1().min_w_0().child(
-                            div()
-                                .w_full()
-                                .truncate()
-                                .text_color(rgb(theme::DIM))
-                                .child(meta),
-                        ),
+        let mut log = div().flex().flex_col().child(
+            div()
+                .id(ElementId::Name(format!("log-{ix}-{pi}").into()))
+                .flex()
+                .items_center()
+                .gap(u(6.))
+                .h(u(26.))
+                .text_size(u(12.))
+                .text_color(rgb(theme::text_2()))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(theme::text())))
+                .child(if running {
+                    spinner(
+                        ElementId::Name(format!("log-spin-{ix}-{pi}").into()),
+                        12.,
+                        theme::text_2(),
                     )
-                    .when(added + removed > 0, |d| d.child(diff_stat(added, removed)))
-                    .when(failed > 0, |d| {
-                        d.child(div().flex_none().text_color(rgb(theme::TEXT)).child(
-                            if failed == 1 {
-                                "· a step failed".to_string()
-                            } else {
-                                format!("· {failed} steps failed")
-                            },
-                        ))
-                    })
-                    .on_click(cx.listener(move |c, _, _, cx| {
-                        c.log_open.insert(key, !open);
-                        cx.notify();
-                    })),
-            );
+                } else {
+                    icon(
+                        if open {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        },
+                        12.,
+                        theme::dim(),
+                    )
+                })
+                .child(if running {
+                    working_label(format!("log-label-{ix}-{pi}"), label)
+                } else {
+                    div().flex_none().child(label).into_any_element()
+                })
+                .child(
+                    div().flex_1().min_w_0().child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_color(rgb(theme::dim()))
+                            .child(meta),
+                    ),
+                )
+                .when(added + removed > 0, |d| d.child(diff_stat(added, removed)))
+                .when(failed > 0, |d| {
+                    d.child(div().flex_none().text_color(rgb(theme::text())).child(
+                        if failed == 1 {
+                            "· a step failed".to_string()
+                        } else {
+                            format!("· {failed} steps failed")
+                        },
+                    ))
+                })
+                .on_click(cx.listener(move |c, _, _, cx| {
+                    c.log_open.insert(key, !open);
+                    cx.notify();
+                })),
+        );
         if open {
             let mut list = div()
                 .flex()
@@ -1955,7 +2036,7 @@ impl ChatPane {
                 .ml(u(5.5))
                 .pl(u(12.))
                 .border_l_1()
-                .border_color(rgba(theme::HAIRLINE));
+                .border_color(rgba(theme::hairline()));
             // Only the newest plan in the reply opens by itself.
             let last_plan = blocks
                 .iter()
@@ -1999,9 +2080,9 @@ impl ChatPane {
                     .gap(u(8.))
                     .h(u(26.))
                     .text_size(u(12.))
-                    .text_color(rgb(theme::DIM))
+                    .text_color(rgb(theme::dim()))
                     .cursor_pointer()
-                    .hover(|s| s.text_color(rgb(theme::TEXT_2)))
+                    .hover(|s| s.text_color(rgb(theme::text_2())))
                     .child(if streaming {
                         working_label(format!("think-{key}"), "Thinking…".into())
                     } else {
@@ -2019,7 +2100,7 @@ impl ChatPane {
                     div()
                         .pb(u(6.))
                         .text_size(u(12.))
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child(text.to_string()),
                 )
             })
@@ -2091,28 +2172,36 @@ impl ChatPane {
             .px(u(4.))
             .text_size(u(12.))
             .when(has_body, |d| {
-                d.cursor_pointer().hover(|s| s.bg(rgb(theme::ROW_HOVER)))
+                d.cursor_pointer().hover(|s| s.bg(rgb(theme::row_hover())))
             })
             .rounded(u(6.))
             .child(if held {
-                icon(Icon::Info, 13., theme::TEXT)
+                icon(Icon::Info, 13., theme::text())
             } else if running {
                 spinner(
                     ElementId::Name(format!("spin-{key}").into()),
                     12.,
-                    theme::TEXT_2,
+                    theme::text_2(),
                 )
             } else {
                 icon(
                     tool_icon(&t.name),
                     13.,
-                    if t.is_error { theme::TEXT } else { theme::DIM },
+                    if t.is_error {
+                        theme::text()
+                    } else {
+                        theme::dim()
+                    },
                 )
             })
             .child(
                 div()
                     .flex_none()
-                    .text_color(rgb(if running { theme::TEXT } else { theme::TEXT_2 }))
+                    .text_color(rgb(if running {
+                        theme::text()
+                    } else {
+                        theme::text_2()
+                    }))
                     .child(verb),
             )
             .child(
@@ -2122,7 +2211,11 @@ impl ChatPane {
                         .truncate()
                         .font_family(theme::MONO)
                         .text_size(u(11.5))
-                        .text_color(rgb(if running { theme::TEXT_2 } else { theme::DIM }))
+                        .text_color(rgb(if running {
+                            theme::text_2()
+                        } else {
+                            theme::dim()
+                        }))
                         .child(target),
                 ),
             )
@@ -2133,7 +2226,7 @@ impl ChatPane {
                 d.child(
                     div()
                         .flex_none()
-                        .text_color(rgb(theme::TEXT))
+                        .text_color(rgb(theme::text()))
                         .child("failed"),
                 )
             })
@@ -2143,7 +2236,7 @@ impl ChatPane {
                 d.child(
                     div()
                         .flex_none()
-                        .text_color(rgb(theme::TEXT))
+                        .text_color(rgb(theme::text()))
                         .child("waiting for you"),
                 )
             })
@@ -2155,7 +2248,7 @@ impl ChatPane {
                             .flex_none()
                             .font_family(theme::MONO)
                             .text_size(u(11.))
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .child(step_duration(took)),
                     )
                 },
@@ -2168,7 +2261,7 @@ impl ChatPane {
                         Icon::ChevronRight
                     },
                     11.,
-                    theme::DIM,
+                    theme::dim(),
                 ))
             })
             .on_click(cx.listener(move |c, _, _, cx| {
@@ -2236,7 +2329,7 @@ impl ChatPane {
             .flex_col()
             .rounded(u(10.))
             .border_1()
-            .border_color(rgba(theme::INPUT_EDGE))
+            .border_color(rgba(theme::input_edge()))
             .overflow_hidden()
             .child(
                 div()
@@ -2245,10 +2338,10 @@ impl ChatPane {
                     .gap(u(8.))
                     .h(u(32.))
                     .px(u(10.))
-                    .bg(rgb(theme::RAISED))
+                    .bg(rgb(theme::raised()))
                     .text_size(u(12.))
-                    .text_color(rgb(theme::TEXT_2))
-                    .child(icon(Icon::Files, 13., theme::DIM))
+                    .text_color(rgb(theme::text_2()))
+                    .child(icon(Icon::Files, 13., theme::dim()))
                     .child(div().flex_1().child(if files.len() == 1 {
                         "1 file changed".to_string()
                     } else {
@@ -2273,11 +2366,11 @@ impl ChatPane {
                     .h(u(30.))
                     .px(u(10.))
                     .border_t_1()
-                    .border_color(rgba(theme::HAIRLINE))
+                    .border_color(rgba(theme::hairline()))
                     .text_size(u(12.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::ROW_HOVER)))
-                    .child(icon(Icon::Pencil, 12., theme::DIM))
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
+                    .child(icon(Icon::Pencil, 12., theme::dim()))
                     .child(
                         div()
                             .flex()
@@ -2285,13 +2378,13 @@ impl ChatPane {
                             .min_w_0()
                             .font_family(theme::MONO)
                             .text_size(u(11.5))
-                            .child(div().flex_none().text_color(rgb(theme::TEXT)).child(name))
+                            .child(div().flex_none().text_color(rgb(theme::text())).child(name))
                             .child(
                                 div()
                                     .min_w_0()
                                     .truncate()
                                     .pl(u(8.))
-                                    .text_color(rgb(theme::DIM))
+                                    .text_color(rgb(theme::dim()))
                                     .child(dir),
                             ),
                     )
@@ -2303,7 +2396,7 @@ impl ChatPane {
                             Icon::ChevronRight
                         },
                         11.,
-                        theme::DIM,
+                        theme::dim(),
                     ))
                     .on_click(cx.listener(move |c, _, _, cx| {
                         if !c.expanded.remove(&k) {
@@ -2363,11 +2456,11 @@ impl ChatPane {
                     .pr(u(if removable { 26. } else { 11. }))
                     .max_w(u(260.))
                     .text_size(u(12.))
-                    .text_color(rgb(theme::TEXT_2))
+                    .text_color(rgb(theme::text_2()))
                     .child(icon(
                         if dir { Icon::Folder } else { Icon::File },
                         13.,
-                        theme::DIM,
+                        theme::dim(),
                     ))
                     .child(div().min_w_0().truncate().child(file_name(path)))
             };
@@ -2376,12 +2469,12 @@ impl ChatPane {
                 .relative()
                 .group(group.clone())
                 .rounded(u(10.))
-                .bg(rgb(theme::SURFACE))
+                .bg(rgb(theme::surface()))
                 .border_1()
-                .border_color(rgba(theme::INPUT_EDGE))
+                .border_color(rgba(theme::input_edge()))
                 .when(!removable, |d| {
                     d.cursor_pointer()
-                        .hover(|s| s.border_color(rgba(0xffffff40)))
+                        .hover(|s| s.border_color(rgba(theme::alpha(theme::text(), 0x40))))
                         .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&p)))
                 });
             let tile = if removable {
@@ -2399,10 +2492,10 @@ impl ChatPane {
                         .rounded_full()
                         .bg(rgba(0x000000c0))
                         .border_1()
-                        .border_color(rgba(theme::INPUT_EDGE))
+                        .border_color(rgba(theme::input_edge()))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
-                        .child(icon(Icon::Close, 10., theme::TEXT))
+                        .hover(|s| s.bg(rgb(theme::surface_hover())))
+                        .child(icon(Icon::Close, 10., theme::text()))
                         .on_click(cx.listener(move |c, _, _, cx| c.detach(&p, cx))),
                 )
             } else {
@@ -2428,9 +2521,9 @@ impl ChatPane {
             .flex()
             .flex_col()
             .rounded(u(12.))
-            .bg(rgb(theme::RAISED))
+            .bg(rgb(theme::raised()))
             .border_1()
-            .border_color(rgba(theme::INPUT_EDGE))
+            .border_color(rgba(theme::input_edge()))
             .shadow_lg()
             .occlude();
         for (i, path) in m.matches.iter().enumerate() {
@@ -2454,17 +2547,17 @@ impl ChatPane {
                     .rounded(u(8.))
                     .text_size(u(12.5))
                     .cursor_pointer()
-                    .when(selected, |d| d.bg(rgb(theme::SURFACE)))
-                    .hover(|s| s.bg(rgb(theme::SURFACE)))
+                    .when(selected, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::surface())))
                     .child(icon(
                         if dir { Icon::Folder } else { Icon::File },
                         13.,
-                        theme::DIM,
+                        theme::dim(),
                     ))
                     .child(
                         div()
                             .flex_none()
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(rgb(theme::text()))
                             .child(format!("{name}{}", if dir { "/" } else { "" })),
                     )
                     .child(
@@ -2472,7 +2565,7 @@ impl ChatPane {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .child(parent.to_string()),
                     )
                     .on_click(cx.listener(move |c, _, window, cx| {
@@ -2520,36 +2613,45 @@ impl ChatPane {
                     .px(u(0.))
                     .w(u(28.))
                     .justify_center()
-                    .hover(|s| s.bg(rgb(theme::SURFACE)))
-                    .child(icon(Icon::Plus, 14., theme::TEXT_2))
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .child(icon(Icon::Plus, 14., theme::text_2()))
                     .on_click(cx.listener(|c, _, _, cx| c.pick_files(cx))),
             )
             .child(
                 chip("agent")
-                    .text_color(rgb(theme::TEXT_2))
-                    .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
-                    .child(icon(Icon::agent(self.agent.as_str()), 13., theme::TEXT_2))
+                    .text_color(rgb(theme::text_2()))
+                    .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                    .child(icon(Icon::agent(self.agent.as_str()), 13., theme::text_2()))
                     .child(self.agent_name())
-                    .child(icon(Icon::ChevronDown, 11., theme::DIM))
+                    .child(icon(Icon::ChevronDown, 11., theme::dim()))
                     .on_click(cx.listener(|c, _, _, cx| {
                         c.switching = !c.switching;
                         cx.notify();
                     })),
             )
             .child({
-                let (label, loud) = match self.mode {
-                    PermissionMode::Yolo => ("Full access", true),
-                    PermissionMode::Edit => ("Auto-accept edits", false),
-                    _ => ("Ask before edits", false),
+                // Every mode a quiet chip with its own mark; Full access is
+                // told apart by an outline and full-strength text, not by a
+                // fill that would outshout the message being written.
+                let (label, glyph, loud) = match self.mode {
+                    PermissionMode::Yolo => ("Full access", Icon::Bolt, true),
+                    PermissionMode::Edit => ("Accept edits", Icon::Pencil, false),
+                    _ => ("Ask first", Icon::Shield, false),
                 };
                 chip("mode")
-                    .when(loud, |d| {
-                        d.bg(rgb(theme::TEXT)).text_color(rgb(theme::PANE))
-                    })
-                    .when(!loud, |d| {
-                        d.text_color(rgb(theme::TEXT_2))
-                            .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
-                    })
+                    .border_1()
+                    .border_color(rgba(if loud {
+                        theme::strong_edge()
+                    } else {
+                        0x00000000
+                    }))
+                    .text_color(rgb(if loud { theme::text() } else { theme::text_2() }))
+                    .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                    .child(icon(
+                        glyph,
+                        13.,
+                        if loud { theme::text() } else { theme::text_2() },
+                    ))
                     .child(label)
                     .on_click(cx.listener(|c, _, _, cx| c.toggle_mode(cx)))
             })
@@ -2566,7 +2668,7 @@ impl ChatPane {
                         div()
                             .mr(u(6.))
                             .text_size(u(11.))
-                            .text_color(rgb(theme::DIM))
+                            .text_color(rgb(theme::dim()))
                             .child(format!(
                                 "{} tokens{cost}",
                                 compact_count(u_.input + u_.output + u_.cache_read)
@@ -2584,16 +2686,30 @@ impl ChatPane {
                     .size(u(30.))
                     .rounded(u(15.))
                     .when(can_send, |d| {
-                        d.bg(rgb(theme::TEXT))
+                        d.bg(rgb(theme::text()))
                             .cursor_pointer()
                             .hover(|s| s.opacity(0.85))
                     })
-                    .when(!can_send, |d| d.bg(rgb(theme::SURFACE)))
-                    .child(icon(
-                        if stop { Icon::Stop } else { Icon::ArrowUp },
-                        15.,
-                        if can_send { theme::PANE } else { theme::DIM },
-                    ))
+                    .when(!can_send, |d| d.bg(rgb(theme::surface())))
+                    // Stop is a solid square, as everywhere else: an outline
+                    // that small reads as a dot.
+                    .child(if stop {
+                        div()
+                            .size(u(10.))
+                            .rounded(u(2.5))
+                            .bg(rgb(theme::pane()))
+                            .into_any_element()
+                    } else {
+                        icon(
+                            Icon::ArrowUp,
+                            15.,
+                            if can_send {
+                                theme::pane()
+                            } else {
+                                theme::dim()
+                            },
+                        )
+                    })
                     .on_click(cx.listener(move |c, _, _, cx| {
                         let empty = c.composer.read(cx).text().trim().is_empty()
                             && c.attachments.is_empty();
@@ -2640,11 +2756,11 @@ impl ChatPane {
                     .h(u(30.))
                     .rounded(u(10.))
                     .border_1()
-                    .border_color(rgba(theme::HAIRLINE))
+                    .border_color(rgba(theme::hairline()))
                     .text_size(u(12.))
-                    .text_color(rgb(theme::TEXT_2))
-                    .child(icon(Icon::ArrowUp, 12., theme::DIM))
-                    .child(div().text_color(rgb(theme::DIM)).child(if q.now {
+                    .text_color(rgb(theme::text_2()))
+                    .child(icon(Icon::ArrowUp, 12., theme::dim()))
+                    .child(div().text_color(rgb(theme::dim())).child(if q.now {
                         "Sending now"
                     } else {
                         "Queued"
@@ -2662,7 +2778,7 @@ impl ChatPane {
                             div()
                                 .flex_none()
                                 .text_size(u(11.))
-                                .text_color(rgb(theme::DIM))
+                                .text_color(rgb(theme::dim()))
                                 .child("after this step"),
                         )
                     })
@@ -2692,9 +2808,9 @@ impl ChatPane {
                     .py(u(8.))
                     .rounded(u(10.))
                     .border_1()
-                    .border_color(rgba(0xffffff30))
+                    .border_color(rgba(theme::strong_edge()))
                     .text_size(u(12.))
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(theme::text()))
                     .child(e),
             );
         }
@@ -2725,12 +2841,12 @@ impl ChatPane {
                     .gap(u(4.))
                     .p(u(8.))
                     .rounded(u(16.))
-                    .bg(rgb(theme::RAISED))
+                    .bg(rgb(theme::raised()))
                     .border_1()
                     .border_color(rgba(if focused {
-                        theme::INPUT_EDGE
+                        theme::input_edge()
                     } else {
-                        theme::HAIRLINE
+                        theme::hairline()
                     }))
                     .cursor_text()
                     // A click anywhere on the card, not just on the text, types.
@@ -2754,7 +2870,7 @@ impl ChatPane {
                     .flex()
                     .justify_center()
                     .text_size(u(11.))
-                    .text_color(rgb(theme::DIM))
+                    .text_color(rgb(theme::dim()))
                     .child(hint),
             )
             .into_any_element()
@@ -2779,28 +2895,28 @@ impl ChatPane {
                     .text_size(u(12.))
                     .border_1()
                     .when(current, |d| {
-                        d.bg(rgb(theme::SURFACE))
-                            .border_color(rgba(0xffffff30))
-                            .text_color(rgb(theme::TEXT))
+                        d.bg(rgb(theme::surface()))
+                            .border_color(rgba(theme::strong_edge()))
+                            .text_color(rgb(theme::text()))
                     })
-                    .when(!current, |d| d.border_color(rgba(theme::HAIRLINE)))
+                    .when(!current, |d| d.border_color(rgba(theme::hairline())))
                     .when(!current && ready, |d| {
-                        d.text_color(rgb(theme::TEXT_2))
+                        d.text_color(rgb(theme::text_2()))
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::SURFACE)))
+                            .hover(|s| s.bg(rgb(theme::surface())))
                             .on_click(
                                 cx.listener(move |c, _, _, cx| c.switch_agent(to.clone(), cx)),
                             )
                     })
-                    .when(!ready, |d| d.text_color(rgb(theme::DIM)))
+                    .when(!ready, |d| d.text_color(rgb(theme::dim())))
                     .child(icon(
                         Icon::agent(id.as_str()),
                         13.,
-                        if ready { theme::TEXT_2 } else { theme::DIM },
+                        if ready { theme::text_2() } else { theme::dim() },
                     ))
                     .child(entry.display_name().to_string())
                     .when(!ready, |d| {
-                        d.child(div().text_color(rgb(theme::DIM)).child("not set up"))
+                        d.child(div().text_color(rgb(theme::dim())).child("not set up"))
                     }),
             );
         }
@@ -2832,15 +2948,15 @@ impl ChatPane {
                     .h(u(38.))
                     .rounded(u(10.))
                     .border_1()
-                    .border_color(rgba(theme::HAIRLINE))
+                    .border_color(rgba(theme::hairline()))
                     .text_size(u(13.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(theme::RAISED)))
+                    .hover(|s| s.bg(rgb(theme::raised())))
                     .child(
                         div()
                             .w(u(72.))
                             .flex_none()
-                            .text_color(rgb(theme::TEXT))
+                            .text_color(rgb(theme::text()))
                             .child(title),
                     )
                     .child(
@@ -2848,7 +2964,7 @@ impl ChatPane {
                             div()
                                 .w_full()
                                 .truncate()
-                                .text_color(rgb(theme::DIM))
+                                .text_color(rgb(theme::dim()))
                                 .child(prompt),
                         ),
                     )
@@ -2874,13 +2990,13 @@ impl ChatPane {
                                 div()
                                     .text_size(u(22.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(rgb(theme::text()))
                                     .child("What should we work on?"),
                             )
                             .child(
                                 div()
                                     .text_size(u(13.))
-                                    .text_color(rgb(theme::TEXT_2))
+                                    .text_color(rgb(theme::text_2()))
                                     .child(format!(
                                 "{} works in {} and can open terminals and pages in this window.",
                                 self.agent_name(),
@@ -2927,12 +3043,12 @@ impl ChatPane {
             .flex()
             .flex_col()
             .gap(u(10.))
-            .text_color(rgb(theme::TEXT));
+            .text_color(rgb(theme::text()));
         for (bi, block) in doc.blocks.iter().enumerate() {
             let id = format!("md-{key}-{bi}");
             col = col.child(match block {
                 MdBlock::Paragraph(s) => div()
-                    .child(self.rich_text(id, s, theme::TEXT, FontWeight::NORMAL, cx))
+                    .child(self.rich_text(id, s, theme::text(), FontWeight::NORMAL, cx))
                     .into_any_element(),
                 MdBlock::Heading { level, spans } => div()
                     .pt(u(if *level <= 2 { 8. } else { 4. }))
@@ -2946,7 +3062,7 @@ impl ChatPane {
                         2 => 23.,
                         _ => 21.,
                     }))
-                    .child(self.rich_text(id, spans, theme::TEXT, FontWeight::SEMIBOLD, cx))
+                    .child(self.rich_text(id, spans, theme::text(), FontWeight::SEMIBOLD, cx))
                     .into_any_element(),
                 MdBlock::Code { lang, code, open } => self.render_code(&id, lang, code, *open, cx),
                 MdBlock::List { items } => {
@@ -2965,9 +3081,9 @@ impl ChatPane {
                                         .min_w(u(if ordered { 18. } else { 12. }))
                                         .when(ordered, |d| d.flex().justify_end())
                                         .text_color(rgb(if task {
-                                            theme::TEXT_2
+                                            theme::text_2()
                                         } else {
-                                            theme::DIM
+                                            theme::dim()
                                         }))
                                         .child(item.marker.clone()),
                                 )
@@ -2975,9 +3091,9 @@ impl ChatPane {
                                     format!("{id}-{ii}"),
                                     &item.spans,
                                     if item.marker == "☑" {
-                                        theme::TEXT_2
+                                        theme::text_2()
                                     } else {
-                                        theme::TEXT
+                                        theme::text()
                                     },
                                     FontWeight::NORMAL,
                                     cx,
@@ -2989,13 +3105,13 @@ impl ChatPane {
                 MdBlock::Quote(s) => div()
                     .pl(u(12.))
                     .border_l_2()
-                    .border_color(rgb(theme::SURFACE_HOVER))
-                    .child(self.rich_text(id, s, theme::TEXT_2, FontWeight::NORMAL, cx))
+                    .border_color(rgb(theme::surface_hover()))
+                    .child(self.rich_text(id, s, theme::text_2(), FontWeight::NORMAL, cx))
                     .into_any_element(),
                 MdBlock::Rule => div()
                     .my(u(4.))
                     .h(px(1.))
-                    .bg(rgba(theme::INPUT_EDGE))
+                    .bg(rgba(theme::input_edge()))
                     .into_any_element(),
                 MdBlock::Table { head, rows } => {
                     let mut t = div()
@@ -3003,7 +3119,7 @@ impl ChatPane {
                         .flex_col()
                         .rounded(u(8.))
                         .border_1()
-                        .border_color(rgba(theme::INPUT_EDGE))
+                        .border_color(rgba(theme::input_edge()))
                         .overflow_hidden()
                         .text_size(u(12.5))
                         .line_height(u(19.));
@@ -3013,9 +3129,9 @@ impl ChatPane {
                             .gap(u(12.))
                             .px(u(10.))
                             .py(u(6.))
-                            .when(ri == 0, |d| d.bg(rgb(theme::RAISED)))
+                            .when(ri == 0, |d| d.bg(rgb(theme::raised())))
                             .when(ri > 0, |d| {
-                                d.border_t_1().border_color(rgba(theme::HAIRLINE))
+                                d.border_t_1().border_color(rgba(theme::hairline()))
                             });
                         for (ci, c) in cells.iter().enumerate() {
                             let weight = if ri == 0 {
@@ -3026,7 +3142,7 @@ impl ChatPane {
                             r = r.child(div().flex_1().min_w_0().child(self.rich_text(
                                 format!("{id}-{ri}-{ci}"),
                                 c,
-                                theme::TEXT,
+                                theme::text(),
                                 weight,
                                 cx,
                             )));
@@ -3059,9 +3175,9 @@ impl ChatPane {
             .flex()
             .flex_col()
             .rounded(u(10.))
-            .bg(rgb(theme::RAISED))
+            .bg(rgb(theme::raised()))
             .border_1()
-            .border_color(rgba(theme::HAIRLINE))
+            .border_color(rgba(theme::hairline()))
             .child(
                 div()
                     .flex()
@@ -3070,7 +3186,7 @@ impl ChatPane {
                     .pl(u(12.))
                     .pr(u(4.))
                     .text_size(u(11.))
-                    .text_color(rgb(theme::DIM))
+                    .text_color(rgb(theme::dim()))
                     .child(div().flex_1().child(if lang.is_empty() {
                         "code".to_string()
                     } else {
@@ -3089,11 +3205,13 @@ impl ChatPane {
                                 .opacity(if copied { 1. } else { 0. })
                                 .group_hover(group, |s| s.opacity(1.))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+                                .hover(|s| {
+                                    s.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
+                                })
                                 .child(icon(
                                     if copied { Icon::Check } else { Icon::Copy },
                                     11.,
-                                    theme::DIM,
+                                    theme::dim(),
                                 ))
                                 .child(if copied { "Copied" } else { "Copy" })
                                 .on_click(cx.listener(move |c, _, _, cx| {
@@ -3115,7 +3233,7 @@ impl ChatPane {
                     .font_family(theme::MONO)
                     .text_size(u(12.))
                     .line_height(u(18.))
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(theme::text()))
                     .child(div().whitespace_nowrap().child(code.to_string())),
             )
             .into_any_element()
@@ -3159,14 +3277,14 @@ fn diff_stat(added: usize, removed: usize) -> AnyElement {
         .when(added > 0, |d| {
             d.child(
                 div()
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(theme::text()))
                     .child(format!("+{added}")),
             )
         })
         .when(removed > 0, |d| {
             d.child(
                 div()
-                    .text_color(rgb(theme::DIM))
+                    .text_color(rgb(theme::dim()))
                     .child(format!("−{removed}")),
             )
         })
@@ -3282,20 +3400,20 @@ fn text_runs(spans: &Spans, color: u32, weight: FontWeight) -> Vec<TextRun> {
         len,
         font: base(st),
         color: rgb(if st.link || st.code {
-            theme::TEXT
+            theme::text()
         } else {
             color
         })
         .into(),
-        background_color: st.code.then(|| rgb(theme::SURFACE).into()),
+        background_color: st.code.then(|| rgb(theme::surface()).into()),
         underline: st.link.then(|| UnderlineStyle {
             thickness: px(1.),
-            color: Some(rgb(theme::DIM).into()),
+            color: Some(rgb(theme::dim()).into()),
             wavy: false,
         }),
         strikethrough: st.strike.then(|| StrikethroughStyle {
             thickness: px(1.),
-            color: Some(rgb(theme::DIM).into()),
+            color: Some(rgb(theme::dim()).into()),
         }),
     };
     let mut out = Vec::new();
@@ -3504,7 +3622,7 @@ fn render_plan(items: &[(String, PlanState)]) -> AnyElement {
                     div()
                         .flex_none()
                         .w(u(14.))
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child(match state {
                             PlanState::Done => "☑",
                             PlanState::Doing => "◐",
@@ -3516,14 +3634,14 @@ fn render_plan(items: &[(String, PlanState)]) -> AnyElement {
                         .flex_1()
                         .min_w_0()
                         .when(*state == PlanState::Done, |d| {
-                            d.text_color(rgb(theme::DIM)).line_through()
+                            d.text_color(rgb(theme::dim())).line_through()
                         })
                         .when(*state == PlanState::Doing, |d| {
-                            d.text_color(rgb(theme::TEXT))
+                            d.text_color(rgb(theme::text()))
                                 .font_weight(FontWeight::MEDIUM)
                         })
                         .when(*state == PlanState::Todo, |d| {
-                            d.text_color(rgb(theme::TEXT_2))
+                            d.text_color(rgb(theme::text_2()))
                         })
                         .child(text.clone()),
                 ),
@@ -3591,9 +3709,13 @@ fn render_command(command: &str, output: &str, failed: bool, running: bool) -> A
         .px(u(10.))
         .py(u(8.))
         .rounded(u(8.))
-        .bg(rgb(theme::RAISED))
+        .bg(rgb(theme::raised()))
         .border_1()
-        .border_color(rgba(if failed { 0xffffff30 } else { theme::HAIRLINE }))
+        .border_color(rgba(if failed {
+            theme::strong_edge()
+        } else {
+            theme::hairline()
+        }))
         .font_family(theme::MONO)
         .text_size(u(11.5))
         .line_height(u(17.))
@@ -3606,13 +3728,13 @@ fn render_command(command: &str, output: &str, failed: bool, running: bool) -> A
                 .child(
                     div()
                         .flex_none()
-                        .text_color(rgb(theme::DIM))
+                        .text_color(rgb(theme::dim()))
                         .child(if i == 0 { "$" } else { " " }),
                 )
                 .child(
                     div()
                         .whitespace_nowrap()
-                        .text_color(rgb(theme::TEXT))
+                        .text_color(rgb(theme::text()))
                         .child(line.to_string()),
                 ),
         );
@@ -3621,7 +3743,7 @@ fn render_command(command: &str, output: &str, failed: bool, running: bool) -> A
         col = col.child(
             div()
                 .mt(u(4.))
-                .text_color(rgb(theme::DIM))
+                .text_color(rgb(theme::dim()))
                 .child(format!("… {skip} earlier lines")),
         );
     }
@@ -3629,12 +3751,16 @@ fn render_command(command: &str, output: &str, failed: bool, running: bool) -> A
         col = col.child(
             div()
                 .whitespace_nowrap()
-                .text_color(rgb(if failed { theme::TEXT } else { theme::TEXT_2 }))
+                .text_color(rgb(if failed {
+                    theme::text()
+                } else {
+                    theme::text_2()
+                }))
                 .child(line.to_string()),
         );
     }
     if lines.is_empty() && !running {
-        col = col.child(div().text_color(rgb(theme::DIM)).child("(no output)"));
+        col = col.child(div().text_color(rgb(theme::dim())).child("(no output)"));
     }
     col.into_any_element()
 }
@@ -3748,27 +3874,27 @@ fn render_output(text: &str, diff: bool, keep: usize) -> AnyElement {
         .px(u(10.))
         .py(u(8.))
         .rounded(u(8.))
-        .bg(rgb(theme::RAISED))
+        .bg(rgb(theme::raised()))
         .font_family(theme::MONO)
         .text_size(u(11.5))
         .line_height(u(17.));
     if skip > 0 {
         col = col.child(
             div()
-                .text_color(rgb(theme::DIM))
+                .text_color(rgb(theme::dim()))
                 .child(format!("… {skip} earlier lines")),
         );
     }
     for line in &lines[skip..] {
         let el = div().whitespace_nowrap().child(line.to_string());
         col = col.child(if !diff {
-            el.text_color(rgb(theme::TEXT_2))
+            el.text_color(rgb(theme::text_2()))
         } else if line.starts_with('+') && !line.starts_with("+++") {
-            el.text_color(rgb(theme::TEXT)).bg(rgba(0xffffff0d))
+            el.text_color(rgb(theme::text())).bg(rgba(theme::tint()))
         } else if line.starts_with('-') && !line.starts_with("---") {
-            el.text_color(rgb(theme::DIM)).line_through()
+            el.text_color(rgb(theme::dim())).line_through()
         } else {
-            el.text_color(rgb(theme::DIM))
+            el.text_color(rgb(theme::dim()))
         });
     }
     col.overflow_x_hidden().into_any_element()
@@ -3781,7 +3907,7 @@ impl Render for ChatPane {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANE))
+            .bg(rgb(theme::pane()))
             .text_size(u(13.5))
             .line_height(u(21.))
             .on_mouse_down(
@@ -3793,7 +3919,7 @@ impl Render for ChatPane {
                 c.attach_paths(paths.paths(), cx);
                 window.focus(&c.composer.read(cx).focus);
             }))
-            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme::RAISED)))
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme::raised())))
             .children(self.menu.as_ref().map(menu::Open::render))
             .when(empty, |d| d.child(self.render_empty(window, cx)))
             .when(!empty, |d| {
@@ -3848,7 +3974,7 @@ const MAX_FILES: usize = 50_000;
 
 /// Paths under `cwd`, relative to it, with each folder listed once (ending
 /// in `/`) so folders can be mentioned too.
-fn project_files(cwd: &std::path::Path) -> Vec<String> {
+pub fn project_files(cwd: &std::path::Path) -> Vec<String> {
     let git = std::process::Command::new("git")
         .args(["ls-files", "--cached", "--others", "--exclude-standard"])
         .current_dir(cwd)
@@ -4070,7 +4196,7 @@ mod tests {
         let MdBlock::Paragraph(s) = &doc.blocks[0] else {
             panic!()
         };
-        let runs = text_runs(s, theme::TEXT, FontWeight::NORMAL);
+        let runs = text_runs(s, theme::text(), FontWeight::NORMAL);
         assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), s.text.len());
         let code = runs
             .iter()

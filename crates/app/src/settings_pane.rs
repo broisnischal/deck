@@ -28,6 +28,9 @@ pub struct SettingsPane {
     /// The toggle that just flipped and how many flips so far, so only it
     /// slides (a fresh id restarts the animation) and the rest sit still.
     flip: Option<(&'static str, u64)>,
+    /// The page the sidebar has open.
+    page: Page,
+    scroll: gpui::ScrollHandle,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsPane {}
@@ -101,6 +104,8 @@ impl SettingsPane {
             focus: cx.focus_handle(),
             agents,
             flip: None,
+            page: Page::Appearance,
+            scroll: gpui::ScrollHandle::new(),
         }
     }
 
@@ -167,10 +172,10 @@ impl SettingsPane {
                 .size(u(28.))
                 .rounded(u(6.))
                 .text_size(u(15.))
-                .text_color(rgb(if live { theme::TEXT } else { theme::DIM }))
+                .text_color(rgb(if live { theme::text() } else { theme::dim() }))
                 .when(live, |d| {
                     d.cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
+                        .hover(|s| s.bg(rgb(theme::surface_hover())))
                 })
                 .child(glyph)
         };
@@ -188,7 +193,7 @@ impl SettingsPane {
             .items_center()
             .p(u(2.))
             .rounded(u(8.))
-            .bg(rgb(theme::SURFACE))
+            .bg(rgb(theme::surface()))
             .child(minus)
             .child(
                 div()
@@ -196,7 +201,7 @@ impl SettingsPane {
                     .flex()
                     .justify_center()
                     .text_size(u(13.))
-                    .text_color(rgb(theme::TEXT))
+                    .text_color(rgb(theme::text()))
                     .child(value),
             )
             .child(plus)
@@ -219,7 +224,7 @@ impl SettingsPane {
             .gap(u(2.))
             .p(u(2.))
             .rounded(u(8.))
-            .bg(rgb(theme::SURFACE));
+            .bg(rgb(theme::surface()));
         for (ix, (value, name)) in options.iter().enumerate() {
             let on = *value == current;
             let value = *value;
@@ -234,13 +239,13 @@ impl SettingsPane {
                     .text_size(u(12.))
                     .cursor_pointer()
                     .when(on, |d| {
-                        d.bg(rgb(theme::SELECTION))
-                            .text_color(rgb(theme::TEXT))
+                        d.bg(rgb(theme::selection()))
+                            .text_color(rgb(theme::text()))
                             .font_weight(FontWeight::MEDIUM)
                     })
                     .when(!on, |d| {
-                        d.text_color(rgb(theme::TEXT_2))
-                            .hover(|s| s.text_color(rgb(theme::TEXT)))
+                        d.text_color(rgb(theme::text_2()))
+                            .hover(|s| s.text_color(rgb(theme::text())))
                     })
                     .child(*name)
                     .on_click(self.on(move |s| set(s, value), cx)),
@@ -263,7 +268,7 @@ impl SettingsPane {
             .top(u(2.))
             .size(u(16.))
             .rounded_full()
-            .bg(rgb(if on { theme::PANE } else { theme::TEXT_2 }));
+            .bg(rgb(if on { theme::pane() } else { theme::text_2() }));
         let knob = match self.flip {
             Some((flipped, n)) if flipped == id => knob
                 .with_animation(
@@ -283,9 +288,9 @@ impl SettingsPane {
             .rounded_full()
             .cursor_pointer()
             .bg(rgb(if on {
-                theme::TEXT
+                theme::text()
             } else {
-                theme::SURFACE_HOVER
+                theme::surface_hover()
             }))
             .child(knob)
             .on_click(cx.listener(move |p, _, _, cx| {
@@ -310,14 +315,14 @@ impl SettingsPane {
             .text_size(u(13.))
             .cursor_pointer()
             .when(on, |d| {
-                d.bg(rgb(theme::SURFACE))
-                    .border_color(rgba(0xffffffb3))
-                    .text_color(rgb(theme::TEXT))
+                d.bg(rgb(theme::surface()))
+                    .border_color(rgba(theme::alpha(theme::text(), 0xb3)))
+                    .text_color(rgb(theme::text()))
             })
             .when(!on, |d| {
-                d.border_color(rgba(theme::INPUT_EDGE))
-                    .text_color(rgb(theme::TEXT_2))
-                    .hover(|s| s.bg(rgb(theme::ROW_HOVER)).text_color(rgb(theme::TEXT)))
+                d.border_color(rgba(theme::input_edge()))
+                    .text_color(rgb(theme::text_2()))
+                    .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
             })
     }
 
@@ -353,7 +358,7 @@ impl SettingsPane {
                 .rounded(u(6.))
                 .bg(rgb(p.bg))
                 .border_1()
-                .border_color(rgba(theme::HAIRLINE))
+                .border_color(rgba(theme::hairline()))
                 .child(
                     div()
                         .mr(u(4.))
@@ -377,11 +382,12 @@ impl SettingsPane {
                     .border_1()
                     .cursor_pointer()
                     .when(on, |d| {
-                        d.bg(rgb(theme::SURFACE)).border_color(rgba(0xffffffb3))
+                        d.bg(rgb(theme::surface()))
+                            .border_color(rgba(theme::alpha(theme::text(), 0xb3)))
                     })
                     .when(!on, |d| {
-                        d.border_color(rgba(theme::HAIRLINE))
-                            .hover(|s| s.bg(rgb(theme::ROW_HOVER)))
+                        d.border_color(rgba(theme::hairline()))
+                            .hover(|s| s.bg(rgb(theme::row_hover())))
                     })
                     .child(strip)
                     .child(
@@ -390,50 +396,11 @@ impl SettingsPane {
                             .items_center()
                             .px(u(2.))
                             .text_size(u(12.))
-                            .text_color(rgb(if on { theme::TEXT } else { theme::TEXT_2 }))
+                            .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
                             .child(div().flex_1().child(scheme.name()))
-                            .when(on, |d| d.child(icon(Icon::Check, 13., theme::TEXT))),
+                            .when(on, |d| d.child(icon(Icon::Check, 13., theme::text()))),
                     )
                     .on_click(self.on(move |s| s.scheme = scheme, cx)),
-            );
-        }
-        wrap.into_any_element()
-    }
-
-    fn agents(&self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.settings.default_agent.clone();
-        let mut wrap = div().flex().flex_wrap().gap(u(6.)).child(
-            Self::chip("agent-auto".into(), current.is_none())
-                .child("Automatic")
-                .on_click(self.on(|s| s.default_agent = None, cx)),
-        );
-        let mut listed: Vec<(SharedString, SharedString)> = self.agents.clone();
-        // An agent chosen earlier that is not ready now still shows as chosen.
-        if let Some(id) = current.as_deref() {
-            if !listed.iter().any(|(a, _)| a.as_ref() == id) {
-                listed.push((id.to_string().into(), format!("{id} (not ready)").into()));
-            }
-        }
-        for (ix, (id, name)) in listed.into_iter().enumerate() {
-            let on = current.as_deref() == Some(id.as_ref());
-            let pick = id.to_string();
-            wrap = wrap.child(
-                Self::chip(ElementId::NamedInteger("agent".into(), ix as u64), on)
-                    .child(icon(
-                        Icon::agent(&id),
-                        14.,
-                        if on { theme::TEXT } else { theme::TEXT_2 },
-                    ))
-                    .child(name)
-                    .on_click(self.on(move |s| s.default_agent = Some(pick.clone()), cx)),
-            );
-        }
-        if self.agents.is_empty() {
-            wrap = wrap.child(
-                div()
-                    .text_size(u(12.))
-                    .text_color(rgb(theme::DIM))
-                    .child("Detecting agents…"),
             );
         }
         wrap.into_any_element()
@@ -442,87 +409,404 @@ impl SettingsPane {
 
 // -- layout -----------------------------------------------------------------------
 
-/// A setting: name and one line of explanation on the left, its control on
-/// the right.
-fn row(label: &'static str, about: impl Into<SharedString>, control: AnyElement) -> Div {
+/// The pages, as the sidebar lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    General,
+    Appearance,
+    Terminal,
+    Browser,
+    Agents,
+}
+
+impl Page {
+    const ALL: [Page; 5] = [
+        Page::General,
+        Page::Appearance,
+        Page::Terminal,
+        Page::Browser,
+        Page::Agents,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Page::General => "General",
+            Page::Appearance => "Appearance",
+            Page::Terminal => "Terminal",
+            Page::Browser => "Browser",
+            Page::Agents => "Agents",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Page::General => Icon::Settings,
+            Page::Appearance => Icon::PanelRight,
+            Page::Terminal => Icon::Terminal,
+            Page::Browser => Icon::Globe,
+            Page::Agents => Icon::Claude,
+        }
+    }
+}
+
+/// The page column's width, and the inset every row shares.
+const PAGE_W: f32 = 560.;
+const ROW_X: f32 = 14.;
+
+/// One row of a group: the name on the leading edge, its control on the
+/// trailing one, as System Settings lays them out.
+fn row(label: &'static str, control: AnyElement) -> Div {
     div()
         .flex()
         .items_center()
-        .gap(u(24.))
-        .min_h(u(60.))
-        .px(u(16.))
-        .py(u(12.))
-        .child(describe(label, about).flex_1().min_w_0())
-        .child(control)
-}
-
-/// A setting whose control needs the full width (a list to pick from).
-fn stacked(label: &'static str, about: impl Into<SharedString>, control: AnyElement) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(u(12.))
-        .px(u(16.))
-        .py(u(14.))
-        .child(describe(label, about))
-        .child(control)
-}
-
-fn describe(label: &'static str, about: impl Into<SharedString>) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(u(2.))
+        .gap(u(16.))
+        .min_h(u(44.))
+        .px(u(ROW_X))
+        .py(u(7.))
         .child(
             div()
+                .flex_1()
+                .min_w_0()
                 .text_size(u(13.))
-                .text_color(rgb(theme::TEXT))
+                .text_color(rgb(theme::text()))
                 .child(label),
         )
-        .child(
-            div()
-                .text_size(u(12.))
-                .line_height(u(17.))
-                .text_color(rgb(theme::DIM))
-                .child(about.into()),
-        )
+        .child(control)
 }
 
-/// A titled card of rows with a hairline between each.
-fn section(title: &'static str, rows: Vec<Div>) -> Div {
-    let mut card = div()
-        .flex()
-        .flex_col()
-        .rounded(u(theme::CARD_RADIUS))
-        .bg(rgb(theme::RAISED))
-        .border_1()
-        .border_color(rgba(theme::HAIRLINE));
-    for (ix, r) in rows.into_iter().enumerate() {
-        card = card.child(r.when(ix > 0, |d| {
-            d.border_t_1().border_color(rgba(theme::HAIRLINE))
-        }));
-    }
+/// A row whose control needs the width: the name above, the choices below.
+fn wide(label: &'static str, control: AnyElement) -> Div {
     div()
         .flex()
         .flex_col()
         .gap(u(10.))
-        .mt(u(28.))
+        .px(u(ROW_X))
+        .pt(u(12.))
+        .pb(u(14.))
         .child(
             div()
-                .pl(u(4.))
                 .text_size(u(13.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(theme::TEXT))
-                .child(title),
+                .text_color(rgb(theme::text()))
+                .child(label),
         )
-        .child(card)
+        .child(control)
 }
 
-impl Render for SettingsPane {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let s = self.settings.clone();
-        let (min_zoom, max_zoom) = (ZOOMS[0], ZOOMS[ZOOMS.len() - 1]);
+/// An inset group: rows on one raised surface, a hairline between them
+/// that starts where the text does, and a note under the group saying what
+/// it does rather than repeating it in every row.
+fn group(heading: Option<&'static str>, rows: Vec<Div>, note: Option<SharedString>) -> Div {
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .rounded(u(10.))
+        .bg(rgb(theme::raised()))
+        .border_1()
+        .border_color(rgba(theme::hairline()));
+    for (ix, r) in rows.into_iter().enumerate() {
+        if ix > 0 {
+            card = card.child(div().h(u(1.)).ml(u(ROW_X)).bg(rgba(theme::hairline())));
+        }
+        card = card.child(r);
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap(u(6.))
+        .children(heading.map(|h| {
+            div()
+                .pl(u(ROW_X))
+                .text_size(u(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::text_2()))
+                .child(h)
+        }))
+        .child(card)
+        .children(note.map(|n| {
+            div()
+                .px(u(ROW_X))
+                .text_size(u(11.))
+                .line_height(u(15.))
+                .text_color(rgb(theme::dim()))
+                .child(n)
+        }))
+}
 
+/// One choice in a list group: an optional mark, the name and a line under
+/// it, a check on the chosen one.
+fn choice(
+    id: ElementId,
+    mark: Option<Icon>,
+    label: SharedString,
+    detail: Option<SharedString>,
+    on: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(u(10.))
+        .min_h(u(40.))
+        .px(u(ROW_X))
+        .py(u(6.))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::row_hover())))
+        .children(mark.map(|m| icon(m, 15., if on { theme::text() } else { theme::text_2() })))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(u(13.))
+                        .text_color(rgb(theme::text()))
+                        .child(label),
+                )
+                .children(detail.map(|d| {
+                    div()
+                        .text_size(u(11.))
+                        .text_color(rgb(theme::dim()))
+                        .child(d)
+                })),
+        )
+        .child(
+            div()
+                .w(u(14.))
+                .flex_none()
+                .when(on, |d| d.child(icon(Icon::Check, 14., theme::text()))),
+        )
+}
+
+/// A group of choices: its first and last rows round with the card.
+fn choices(
+    heading: Option<&'static str>,
+    rows: Vec<Stateful<Div>>,
+    note: Option<SharedString>,
+) -> Div {
+    let n = rows.len();
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(ix, r)| {
+            div().child(
+                r.when(ix == 0, |d| d.rounded_t(u(9.)))
+                    .when(ix + 1 == n, |d| d.rounded_b(u(9.))),
+            )
+        })
+        .collect();
+    group(heading, rows, note)
+}
+
+/// A small window in a theme's colours: sidebar, a pane with a few lines,
+/// the accent where the caret would be.
+fn preview(c: &theme::Colors) -> Div {
+    let line = |w: f32, color: u32| div().h(u(3.)).w(u(w)).rounded(u(2.)).bg(rgb(color));
+    div()
+        .flex()
+        .w(u(104.))
+        .h(u(66.))
+        .rounded(u(8.))
+        .overflow_hidden()
+        .bg(rgb(c.sidebar))
+        .border_1()
+        .border_color(rgba(if c.dark { 0xffffff1f } else { 0x0000001f }))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(u(4.))
+                .w(u(28.))
+                .pt(u(14.))
+                .px(u(5.))
+                .child(div().h(u(6.)).rounded(u(2.)).bg(rgb(c.surface)))
+                .child(line(14., c.dim))
+                .child(line(16., c.dim)),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(u(5.))
+                .flex_1()
+                .mt(u(8.))
+                .mr(u(5.))
+                .mb(u(5.))
+                .p(u(6.))
+                .rounded(u(5.))
+                .bg(rgb(c.pane))
+                .child(line(38., c.text))
+                .child(line(30., c.text_2))
+                .child(line(44., c.dim))
+                .child(div().w(u(2.)).h(u(8.)).bg(rgb(c.accent))),
+        )
+}
+
+impl SettingsPane {
+    /// The window themes as tiles, System first, as macOS shows its own.
+    fn themes(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let system_dark = matches!(
+            window.appearance(),
+            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+        );
+        let mut tiles = div().flex().flex_wrap().gap(u(14.));
+        for (ix, t) in theme::Theme::ALL.iter().copied().enumerate() {
+            let on = t == self.settings.theme;
+            let face = if t == theme::Theme::System {
+                // Half light, half dark: it is both.
+                div()
+                    .relative()
+                    .child(preview(theme::Theme::Light.colors(system_dark)))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left(u(52.))
+                            .w(u(52.))
+                            .h(u(66.))
+                            .overflow_hidden()
+                            .rounded_r(u(8.))
+                            .child(
+                                div()
+                                    .ml(u(-52.))
+                                    .child(preview(theme::Theme::Black.colors(true))),
+                            ),
+                    )
+            } else {
+                preview(t.colors(system_dark))
+            };
+            tiles = tiles.child(
+                div()
+                    .id(ElementId::NamedInteger("theme".into(), ix as u64))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(u(6.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .p(u(2.))
+                            .rounded(u(10.))
+                            .border_2()
+                            .border_color(rgba(if on {
+                                theme::alpha(theme::accent(), 0xff)
+                            } else {
+                                0x00000000
+                            }))
+                            .child(face),
+                    )
+                    .child(
+                        div()
+                            .text_size(u(12.))
+                            .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
+                            .when(on, |d| d.font_weight(FontWeight::MEDIUM))
+                            .child(t.name()),
+                    )
+                    .on_click(self.on(move |s| s.theme = t, cx)),
+            );
+        }
+        tiles.into_any_element()
+    }
+
+    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .gap(u(2.))
+            .w(u(196.))
+            .h_full()
+            .pt(u(20.))
+            .px(u(10.))
+            .bg(rgb(theme::sidebar()))
+            .border_r_1()
+            .border_color(rgba(theme::hairline()))
+            .child(
+                div()
+                    .pl(u(8.))
+                    .pb(u(10.))
+                    .text_size(u(11.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::dim()))
+                    .child("Settings"),
+            );
+        for (ix, page) in Page::ALL.iter().copied().enumerate() {
+            let on = page == self.page;
+            col = col.child(
+                div()
+                    .id(ElementId::NamedInteger("page".into(), ix as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(10.))
+                    .h(u(32.))
+                    .px(u(8.))
+                    .rounded(u(theme::ROW_RADIUS))
+                    .text_size(u(13.))
+                    .cursor_pointer()
+                    .when(on, |d| {
+                        d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
+                    })
+                    .when(!on, |d| {
+                        d.text_color(rgb(theme::text_2()))
+                            .hover(|s| s.bg(rgb(theme::row_hover())))
+                    })
+                    // The mark in a rounded tile, as System Settings has it,
+                    // in the theme's monochrome.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .size(u(22.))
+                            .rounded(u(6.))
+                            .bg(rgb(if on { theme::text() } else { theme::surface() }))
+                            .child(icon(
+                                page.icon(),
+                                13.,
+                                if on { theme::pane() } else { theme::text_2() },
+                            )),
+                    )
+                    .child(page.name())
+                    .on_click(cx.listener(move |p, _, _, cx| {
+                        p.page = page;
+                        p.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+                        cx.notify();
+                    })),
+            );
+        }
+        col.into_any_element()
+    }
+
+    fn page_general(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        let path = settings::path();
+        let shown = tilde(&path.display().to_string());
+        let reveal = button("reveal", "Show in Finder").on_click(move |_, _, _| {
+            let _ = std::process::Command::new("/usr/bin/open")
+                .arg("-R")
+                .arg(&path)
+                .spawn();
+        });
+        let reset = button("defaults", "Restore Defaults")
+            .on_click(self.on(|s| *s = Settings::default(), cx));
+        vec![
+            group(
+                None,
+                vec![row("Settings file", reveal.into_any_element())],
+                Some(format!("Every change is saved to {shown} the moment you make it.").into()),
+            ),
+            group(
+                None,
+                vec![row("Restore defaults", reset.into_any_element())],
+                Some("Puts every setting back the way deck ships. Your tabs and threads are not touched.".into()),
+            ),
+        ]
+    }
+
+    fn page_appearance(&self, window: &Window, cx: &mut Context<Self>) -> Vec<Div> {
+        let s = &self.settings;
+        let (min_zoom, max_zoom) = (ZOOMS[0], ZOOMS[ZOOMS.len() - 1]);
         let zoom = self.stepper(
             "zoom",
             format!("{:.0}%", s.zoom * 100.),
@@ -530,6 +814,27 @@ impl Render for SettingsPane {
             (s.zoom < max_zoom).then_some(|s: &mut Settings| s.zoom = s.stepped(1)),
             cx,
         );
+        vec![
+            group(
+                None,
+                vec![wide("Theme", self.themes(window, cx))],
+                Some("The whole window: sidebar, panes, chats and menus, and the appearance web pages and scrollbars take. System follows macOS.".into()),
+            ),
+            group(
+                None,
+                vec![row("Zoom", zoom)],
+                Some("One size for everything. ⌘+ and ⌘− step it, ⌘0 puts it back.".into()),
+            ),
+            group(
+                Some("Terminal colours"),
+                vec![wide("Palette", self.schemes(cx))],
+                Some("What terminals and agent TUIs draw with. Match window uses the theme's own.".into()),
+            ),
+        ]
+    }
+
+    fn page_terminal(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        let s = &self.settings;
         let font_px = self.stepper(
             "font-px",
             format!("{} pt", s.font_px.round()),
@@ -554,165 +859,239 @@ impl Render for SettingsPane {
         );
         let cursors: Vec<(Cursor, &'static str)> =
             Cursor::ALL.iter().map(|c| (*c, c.name())).collect();
-        let engines: Vec<(Search, &'static str)> =
-            Search::ALL.iter().map(|e| (*e, e.name())).collect();
-        let access: Vec<(Access, &'static str)> =
-            Access::ALL.iter().map(|a| (*a, a.name())).collect();
-
-        let appearance = section(
-            "Appearance",
-            vec![
-                row(
-                    "Zoom",
-                    "One size for the whole window: sidebar, chats, terminals and pages. ⌘+ / ⌘− / ⌘0.",
-                    zoom,
-                ),
-                stacked(
-                    "Terminal colours",
-                    "The palette terminals and agent TUIs draw with. Deck's chrome stays monochrome.",
-                    self.schemes(cx),
-                ),
-            ],
-        );
-        let terminal = section(
-            "Terminal",
-            vec![
-                stacked(
-                    "Font",
-                    "Monospace faces installed on this Mac.",
-                    self.fonts(cx),
-                ),
-                row("Font size", "At 100% zoom.", font_px),
-                row(
-                    "Line height",
-                    "Space between lines, as a multiple of the font size.",
-                    line,
-                ),
-                row(
-                    "Cursor",
-                    "Until a program asks for its own shape.",
-                    self.segmented("cursor", &cursors, s.cursor, |s, c| s.cursor = c, cx),
-                ),
-                row(
-                    "Blink cursor",
-                    "Only while the terminal has focus.",
-                    self.toggle("blink", s.cursor_blink, |s, on| s.cursor_blink = on, cx),
-                ),
-                row(
-                    "Option as Meta",
-                    "⌥ sends Esc+key (⌥B, ⌥F word jumps) instead of typing ∫ or ƒ.",
+        vec![
+            group(
+                Some("Text"),
+                vec![
+                    wide("Font", self.fonts(cx)),
+                    row("Size", font_px),
+                    row("Line height", line),
+                ],
+                Some("Monospace faces installed on this Mac. Size is at 100% zoom.".into()),
+            ),
+            group(
+                Some("Cursor"),
+                vec![
+                    row(
+                        "Shape",
+                        self.segmented("cursor", &cursors, s.cursor, |s, c| s.cursor = c, cx),
+                    ),
+                    row(
+                        "Blink",
+                        self.toggle("blink", s.cursor_blink, |s, on| s.cursor_blink = on, cx),
+                    ),
+                ],
+                Some("Until a program asks for a shape of its own. Blinking only while the terminal has focus.".into()),
+            ),
+            group(
+                Some("Keyboard"),
+                vec![row(
+                    "Use ⌥ as Meta",
                     self.toggle("meta", s.option_as_meta, |s, on| s.option_as_meta = on, cx),
-                ),
-            ],
-        );
-        let browser = section(
-            "Browser",
-            vec![row(
-                "Search engine",
-                // The engine's real results URL, so the choice is concrete.
-                format!(
-                    "Anything typed in the address bar that is not an address goes to {}",
-                    s.search_url("…")
-                        .trim_start_matches("https://")
-                        .trim_start_matches("www.")
-                ),
-                self.segmented("search", &engines, s.search, |s, e| s.search = e, cx),
-            )],
-        );
-        let agents = section(
-            "Agents",
-            vec![
-                stacked(
-                    "New chats start with",
-                    "Automatic picks Claude when it is signed in, else the first agent that is ready.",
-                    self.agents(cx),
-                ),
-                row(
-                    "Starting access",
-                    "What a new thread may do without asking. Each thread's chip still changes it.",
-                    self.segmented("access", &access, s.access, |s, a| s.access = a, cx),
-                ),
-            ],
-        );
+                )],
+                Some("⌥B and ⌥F jump by word in the shell, instead of typing ∫ and ƒ.".into()),
+            ),
+        ]
+    }
 
-        let path = settings::path();
-        let footer = div()
-            .flex()
-            .items_center()
-            .gap(u(12.))
-            .mt(u(24.))
-            .px(u(4.))
-            .text_size(u(12.))
-            .text_color(rgb(theme::DIM))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(format!("Saved to {}", tilde(&path.display().to_string()))),
-            )
-            .child(
-                div()
-                    .id("reveal")
-                    .flex_none()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(rgb(theme::TEXT)))
-                    .child("Show in Finder")
-                    .on_click(move |_, _, _| {
-                        let _ = std::process::Command::new("/usr/bin/open")
-                            .arg("-R")
-                            .arg(&path)
-                            .spawn();
-                    }),
-            )
-            .child(
-                div()
-                    .id("defaults")
-                    .flex_none()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(rgb(theme::TEXT)))
-                    .child("Restore defaults")
-                    .on_click(self.on(|s| *s = Settings::default(), cx)),
+    fn page_browser(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        let rows = Search::ALL
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ix, e)| {
+                let host = Settings {
+                    search: e,
+                    ..Settings::default()
+                }
+                .search_url("…")
+                .trim_start_matches("https://")
+                .trim_start_matches("www.")
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+                choice(
+                    ElementId::NamedInteger("engine".into(), ix as u64),
+                    None,
+                    e.name().into(),
+                    Some(host.into()),
+                    e == self.settings.search,
+                )
+                .on_click(self.on(move |s| s.search = e, cx))
+            })
+            .collect();
+        vec![choices(
+            Some("Search engine"),
+            rows,
+            Some("Anything typed in the address bar that is not an address is searched for here, and suggestions come from it too.".into()),
+        )]
+    }
+
+    fn page_agents(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        let current = self.settings.default_agent.clone();
+        let mut listed: Vec<(SharedString, SharedString)> = self.agents.clone();
+        // An agent chosen earlier that is not ready now still shows as chosen.
+        if let Some(id) = current.as_deref() {
+            if !listed.iter().any(|(a, _)| a.as_ref() == id) {
+                listed.push((id.to_string().into(), format!("{id} (not ready)").into()));
+            }
+        }
+        let mut start = vec![choice(
+            "agent-auto".into(),
+            Some(Icon::GenericAgent),
+            "Automatic".into(),
+            Some("Claude when it is signed in, else the first agent that is ready".into()),
+            current.is_none(),
+        )
+        .on_click(self.on(|s| s.default_agent = None, cx))];
+        for (ix, (id, name)) in listed.into_iter().enumerate() {
+            let on = current.as_deref() == Some(id.as_ref());
+            let pick = id.to_string();
+            start.push(
+                choice(
+                    ElementId::NamedInteger("agent".into(), ix as u64),
+                    Some(Icon::agent(&id)),
+                    name,
+                    None,
+                    on,
+                )
+                .on_click(self.on(move |s| s.default_agent = Some(pick.clone()), cx)),
             );
+        }
+        let access = Access::ALL
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ix, a)| {
+                let detail = match a {
+                    Access::Ask => "Asks before every edit and command",
+                    Access::Edits => "Edits files on its own, asks before commands",
+                    Access::Full => "Edits and runs commands without asking",
+                };
+                choice(
+                    ElementId::NamedInteger("access".into(), ix as u64),
+                    None,
+                    a.name().into(),
+                    Some(detail.into()),
+                    a == self.settings.access,
+                )
+                .on_click(self.on(move |s| s.access = a, cx))
+            })
+            .collect();
+        vec![
+            choices(
+                Some("New chats start with"),
+                start,
+                (self.agents.is_empty()).then(|| "Detecting agents…".into()),
+            ),
+            choices(
+                Some("Starting access"),
+                access,
+                Some(
+                    "What a new thread may do without asking. Each thread's chip still changes it."
+                        .into(),
+                ),
+            ),
+            group(
+                Some("Notifications"),
+                vec![
+                    row(
+                        "When an agent needs you",
+                        self.toggle(
+                            "notify-attention",
+                            self.settings.notify_attention,
+                            |s, on| s.notify_attention = on,
+                            cx,
+                        ),
+                    ),
+                    row(
+                        "When an agent finishes",
+                        self.toggle(
+                            "notify-done",
+                            self.settings.notify_done,
+                            |s, on| s.notify_done = on,
+                            cx,
+                        ),
+                    ),
+                ],
+                Some(
+                    "Only while you are looking at something else. A finish is told once work has run for ten seconds; quick replies are not."
+                        .into(),
+                ),
+            ),
+        ]
+    }
+}
 
-        let column = div()
+/// A plain push button, the kind System Settings puts at a row's end.
+fn button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .h(u(26.))
+        .px(u(12.))
+        .rounded(u(6.))
+        .bg(rgb(theme::surface()))
+        .border_1()
+        .border_color(rgba(theme::hairline()))
+        .text_size(u(12.))
+        .text_color(rgb(theme::text()))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::surface_hover())))
+        .child(label)
+}
+
+impl Render for SettingsPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let groups = match self.page {
+            Page::General => self.page_general(cx),
+            Page::Appearance => self.page_appearance(window, cx),
+            Page::Terminal => self.page_terminal(cx),
+            Page::Browser => self.page_browser(cx),
+            Page::Agents => self.page_agents(cx),
+        };
+        let mut column = div()
             .flex()
             .flex_col()
-            .w(u(640.))
+            .gap(u(24.))
+            .w(u(PAGE_W))
             .max_w(relative(1.))
             .px(u(24.))
-            .pt(u(36.))
-            .pb(u(56.))
+            .pt(u(28.))
+            .pb(u(48.))
             .child(
                 div()
-                    .px(u(4.))
-                    .text_size(u(22.))
+                    .px(u(2.))
+                    .text_size(u(20.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(theme::TEXT))
-                    .child("Settings"),
-            )
-            .child(
-                div()
-                    .px(u(4.))
-                    .pt(u(4.))
-                    .text_size(u(13.))
-                    .text_color(rgb(theme::TEXT_2))
-                    .child("Changes apply right away and are kept across launches."),
-            )
-            .child(appearance)
-            .child(terminal)
-            .child(browser)
-            .child(agents)
-            .child(footer);
+                    .text_color(rgb(theme::text()))
+                    .child(self.page.name()),
+            );
+        for g in groups {
+            column = column.child(g);
+        }
 
         div()
             .id("settings")
             .track_focus(&self.focus)
             .key_context("Settings")
             .size_full()
-            .overflow_y_scroll()
-            .bg(rgb(theme::PANE))
-            .child(div().flex().justify_center().child(column))
+            .flex()
+            .bg(rgb(theme::pane()))
+            .child(self.sidebar(cx))
+            .child(
+                div()
+                    .id("settings-page")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(div().flex().justify_center().child(column)),
+            )
     }
 }
 

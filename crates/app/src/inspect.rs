@@ -194,10 +194,19 @@ extern "C" {
     ) -> c_int;
     fn proc_listpids(kind: u32, typeinfo: u32, buffer: *mut c_void, buffersize: c_int) -> c_int;
     fn proc_name(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    fn sysctl(
+        name: *mut c_int,
+        namelen: u32,
+        oldp: *mut c_void,
+        oldlenp: *mut usize,
+        newp: *mut c_void,
+        newlen: usize,
+    ) -> c_int;
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
 }
 
 const PROC_PIDLISTFDS: c_int = 1;
+const PROC_PIDTBSDINFO: c_int = 3;
 const PROC_PIDFDSOCKETINFO: c_int = 3;
 const PROC_PIDTASKINFO: c_int = 4;
 const PROC_PIDT_SHORTBSDINFO: c_int = 13;
@@ -304,12 +313,124 @@ fn ticks_to_ns(ticks: u64) -> u64 {
     (ticks as u128 * numer as u128 / denom as u128) as u64
 }
 
+/// `struct proc_bsdinfo` (136 bytes); only the terminal fields are read.
+#[repr(C)]
+struct ProcBsdInfo {
+    _ids: [u32; 12],
+    _comm: [u8; 16],
+    _name: [u8; 32],
+    _nfiles: u32,
+    _pgid: u32,
+    _pjobc: u32,
+    _tdev: u32,
+    /// The foreground process group of the process's terminal.
+    tpgid: u32,
+    _nice: i32,
+    _start_sec: u64,
+    _start_usec: u64,
+}
+
+/// The process in front of `shell`'s terminal: the leader of its
+/// foreground process group (`claude` while Claude Code runs, the shell
+/// itself at a prompt). Exact, unlike guessing from the process tree, where
+/// an agent's helpers sit below it.
+pub fn foreground(shell: u32) -> Option<u32> {
+    // SAFETY: an all-zero proc_bsdinfo is valid; the kernel fills it.
+    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdInfo>() as c_int;
+    // SAFETY: `info` is exactly the size passed.
+    let n = unsafe {
+        proc_pidinfo(
+            shell as c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdInfo).cast(),
+            size,
+        )
+    };
+    (n == size && info.tpgid != 0).then_some(info.tpgid)
+}
+
+/// A process's name, as the inspector lists it.
+pub fn process_name(pid: u32) -> String {
+    name_of(pid)
+}
+
+/// `2.1.300`: a file named after a release rather than a program.
+fn is_version(name: &str) -> bool {
+    name.contains('.') && name.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// A process's arguments, `argv[0]` first. Empty for one we may not read
+/// (another user's) or that has exited.
+pub fn argv(pid: u32) -> Vec<String> {
+    const CTL_KERN: c_int = 1;
+    const KERN_PROCARGS2: c_int = 49;
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, pid as c_int];
+    let mut size = 0usize;
+    let null = std::ptr::null_mut();
+    // SAFETY: a size query; the kernel writes only `size`.
+    if unsafe { sysctl(mib.as_mut_ptr(), 3, null, &mut size, null, 0) } != 0 || size < 4 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: the kernel writes at most `size` bytes and updates `size`.
+    if unsafe {
+        sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            null,
+            0,
+        )
+    } != 0
+    {
+        return Vec::new();
+    }
+    buf.truncate(size);
+    parse_procargs(&buf)
+}
+
+/// KERN_PROCARGS2: `argc`, the executable's path, NUL padding, then the
+/// arguments (and the environment after them).
+fn parse_procargs(buf: &[u8]) -> Vec<String> {
+    let Some(argc) = buf
+        .get(..4)
+        .and_then(|b| b.try_into().ok())
+        .map(i32::from_ne_bytes)
+    else {
+        return Vec::new();
+    };
+    let rest = &buf[4..];
+    let Some(path_end) = rest.iter().position(|&b| b == 0) else {
+        return Vec::new();
+    };
+    let rest = &rest[path_end..];
+    let start = rest.iter().position(|&b| b != 0).unwrap_or(rest.len());
+    rest[start..]
+        .split(|&b| b == 0)
+        .take(argc.max(0) as usize)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect()
+}
+
 fn name_of(pid: u32) -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the kernel writes at most `buf.len()` bytes and returns the length.
     let n = unsafe { proc_name(pid as c_int, buf.as_mut_ptr().cast(), buf.len() as u32) };
     if n > 0 {
-        return String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+        let name = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+        // Claude Code's binary is its version (`…/claude/versions/2.1.300`);
+        // the name it was started by says what it is.
+        if is_version(&name) {
+            if let Some(cmd) = argv(pid).first().and_then(|a| a.rsplit('/').next()) {
+                if !cmd.is_empty() {
+                    return cmd.to_string();
+                }
+            }
+        }
+        return name;
     }
     // Another user's process (setuid `login`): the 16-byte `comm` is public.
     short_info(pid)
@@ -821,5 +942,19 @@ mod tests {
         assert!(list_dir(&base.join("missing")).is_empty());
 
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn procargs_parse_and_our_own_argv_reads() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/opt/claude/versions/2.1.300\0\0\0claude\0--resume\0HOME=/x\0");
+        assert_eq!(parse_procargs(&buf), vec!["claude", "--resume"]);
+        assert!(parse_procargs(b"\x01").is_empty());
+        let me = argv(std::process::id());
+        assert!(!me.is_empty() && me[0].contains("deck"), "{me:?}");
+        assert!(is_version("2.1.300") && !is_version("zsh") && !is_version("42"));
+        assert_eq!(std::mem::size_of::<ProcBsdInfo>(), 136);
+        // Our own row reads (the test may have no terminal, so no tpgid).
+        let _ = foreground(std::process::id());
     }
 }

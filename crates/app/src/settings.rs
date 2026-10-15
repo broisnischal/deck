@@ -16,6 +16,8 @@ pub const DEFAULT_LINE_HEIGHT: f32 = 1.4;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Settings {
+    /// The window's theme: every surface, the chrome and native views.
+    pub theme: theme::Theme,
     /// Terminal font size at 100% zoom.
     pub font_px: f32,
     /// One zoom for everything: UI, terminals, web pages.
@@ -33,11 +35,16 @@ pub struct Settings {
     /// it is ready, else the first agent that is.
     pub default_agent: Option<String>,
     pub access: Access,
+    /// A notification when an agent asks for permission or a question.
+    pub notify_attention: bool,
+    /// A notification when an agent finishes a long piece of work.
+    pub notify_done: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme: theme::Theme::default(),
             font_px: theme::FONT_PX,
             zoom: DEFAULT_ZOOM,
             font_family: theme::MONO.into(),
@@ -48,6 +55,8 @@ impl Default for Settings {
             option_as_meta: false,
             search: Search::default(),
             default_agent: None,
+            notify_attention: true,
+            notify_done: true,
             access: Access::default(),
         }
     }
@@ -81,7 +90,7 @@ impl Scheme {
 
     pub fn name(self) -> &'static str {
         match self {
-            Scheme::Deck => "Deck",
+            Scheme::Deck => "Match window",
             Scheme::TomorrowNight => "Tomorrow Night",
             Scheme::CatppuccinMocha => "Catppuccin Mocha",
             Scheme::TokyoNight => "Tokyo Night",
@@ -165,7 +174,7 @@ impl Scheme {
     /// The cursor: white on Deck's black, the scheme's foreground elsewhere.
     pub fn cursor_color(self) -> u32 {
         match self {
-            Scheme::Deck => theme::ACCENT,
+            Scheme::Deck => theme::accent(),
             s => s.palette().fg,
         }
     }
@@ -339,6 +348,8 @@ impl Settings {
 #[serde(default)]
 struct Stored {
     #[serde(deserialize_with = "lenient")]
+    theme: Option<theme::Theme>,
+    #[serde(deserialize_with = "lenient")]
     font_px: Option<f32>,
     #[serde(deserialize_with = "lenient")]
     zoom: Option<f32>,
@@ -360,6 +371,10 @@ struct Stored {
     default_agent: Option<String>,
     #[serde(deserialize_with = "lenient")]
     access: Option<Access>,
+    #[serde(deserialize_with = "lenient")]
+    notify_attention: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    notify_done: Option<bool>,
 }
 
 /// A value that does not parse (a scheme a newer build added, a string
@@ -389,6 +404,7 @@ fn from_stored(s: Stored) -> Settings {
     };
     let d = Settings::default();
     Settings {
+        theme: s.theme.unwrap_or(d.theme),
         font_px,
         zoom,
         font_family: s
@@ -405,6 +421,8 @@ fn from_stored(s: Stored) -> Settings {
         search: s.search.unwrap_or(d.search),
         default_agent: s.default_agent.filter(|a| !a.is_empty()),
         access: s.access.unwrap_or(d.access),
+        notify_attention: s.notify_attention.unwrap_or(d.notify_attention),
+        notify_done: s.notify_done.unwrap_or(d.notify_done),
     }
 }
 
@@ -469,6 +487,7 @@ mod tests {
     #[test]
     fn settings_round_trip_through_the_file() {
         let s = Settings {
+            theme: theme::Theme::Graphite,
             font_px: 15.,
             zoom: 1.2,
             font_family: "JetBrains Mono".into(),
@@ -480,10 +499,13 @@ mod tests {
             search: Search::Kagi,
             default_agent: Some("codex".into()),
             access: Access::Full,
+            notify_attention: false,
+            notify_done: true,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(parse(&json), s);
         assert!(json.contains(r#""scheme":"catppuccin-mocha""#));
+        assert!(json.contains(r#""theme":"graphite""#));
     }
 
     #[test]
