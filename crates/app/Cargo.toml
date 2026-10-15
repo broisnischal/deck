@@ -1,0 +1,28 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "deck"
+path = "src/main.rs"
+
+[dependencies]
+term.workspace = true
+agent-core.workspace = true
+agent-claude.workspace = true
+agent-cli.workspace = true
+session.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+gpui.workspace = true
+wry.workspace = true
+raw-window-handle.workspace = true
+objc2-app-kit.workspace = true
+objc2-quartz-core = "0.3"
+objc2-foundation = "0.3"

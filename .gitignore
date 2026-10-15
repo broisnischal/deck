@@ -1,0 +1,5 @@
+/target
+.DS_Store
+
+# Local Claude Code / plugin state
+.claude/

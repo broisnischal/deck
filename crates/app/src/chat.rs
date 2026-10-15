@@ -1,0 +1,4157 @@
+//! The control plane's chat: talk to an agent (Claude Code, OpenCode, Codex,
+//! Gemini…) in a structured thread (streamed text, tool calls, interrupt)
+//! while the agent drives deck itself through the `deck` CLI: it can open
+//! terminals beside the chat, run servers there, and open pages in deck's
+//! browser.
+//!
+//! The session machinery (adapters, the tokio↔gpui driver, the canonical
+//! transcript) comes from yourcode's agent crates; this module is only the
+//! view and the wiring.
+
+use crate::field::{Field, FieldEvent};
+use crate::icon::{icon, spinner, Icon};
+use crate::markdown::{self, MdBlock, Spans};
+use crate::pasteboard::Pasted;
+use crate::theme::{self, u};
+use crate::threads;
+use agent_core::{
+    Action, AgentEvent, AgentId, AppliedKind, Attachment, AttachmentKind, Block, Decision,
+    PermissionMode, RequestId, Role, SessionId, StopReason, ToolInvocation, ToolOutput, Transcript,
+    UserTurn,
+};
+use futures::StreamExt;
+use gpui::prelude::*;
+use gpui::{
+    div, img, list, pulsating_between, px, relative, rgb, rgba, Animation, AnimationExt,
+    AnyElement, Context, ElementId, Entity, EventEmitter, ExternalPaths, FontStyle, FontWeight,
+    InteractiveText, ListAlignment, ListState, SharedString, StrikethroughStyle, StyledImage,
+    StyledText, Subscription, Task, TextRun, UnderlineStyle, Window,
+};
+use session::{Conn, DriverEvent};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// What every agent is told about running inside deck. Appended to the
+/// vendor's own prompt, never replacing it.
+const HARNESS: &str = "\
+You are running inside deck, a macOS workspace of terminals, a browser and \
+coding agents. Drive it with the `deck` CLI, already on PATH and authorised \
+for this session. Output is JSON.
+- `deck pane list`: the terminals, browser pages and agents open right now.
+- `deck pane split --cmd 'npm run dev'`: start a long-running command (dev \
+servers, watchers) in a new terminal beside this chat. Prefer this to running \
+servers in your own shell, which would block you.
+- `deck pane read --pane N`: read a terminal's screen (check a server came up).
+- `deck pane send --pane N 'text'`: type into a terminal.
+- `deck open http://localhost:3000`: open a page in deck's browser beside this chat.
+- `deck browser eval --pane N 'document.title'`: inspect a page.
+Use these whenever the user asks to run, serve, preview or check something. \
+Keep answers short; say what you ran and what you saw.";
+
+/// Probed agents and the runtime they run on, shared by every chat.
+pub struct ChatEnv {
+    pub backend: session::Backend,
+    pub registry: session::Registry,
+    pub substrate: session::Substrate,
+}
+
+impl ChatEnv {
+    /// Blocking (it probes every agent CLI); run it off the UI thread.
+    pub fn start() -> anyhow::Result<Self> {
+        let root = crate::control::socket_dir().join("agents");
+        let backend = session::Backend::new(&root)?;
+        let mut adapters: Vec<Arc<dyn agent_core::AgentAdapter>> =
+            vec![Arc::new(agent_claude::ClaudeAdapter::new())];
+        adapters.extend(agent_cli::CliAdapter::all());
+        let registry = backend
+            .handle()
+            .block_on(session::Registry::probe_all(adapters));
+        Ok(Self {
+            backend,
+            registry,
+            substrate: session::Substrate {
+                system_prompt: Arc::from(HARNESS),
+                ..Default::default()
+            },
+        })
+    }
+
+    /// The agent a new chat starts with: Claude if it is ready, else the
+    /// first one that is.
+    pub fn default_agent(&self) -> Option<AgentId> {
+        let claude = AgentId::new("claude");
+        if self.registry.get(&claude).is_some_and(|e| e.is_ready()) {
+            return Some(claude);
+        }
+        self.registry
+            .default_agent()
+            .filter(|e| e.is_ready())
+            .map(|e| e.id())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatStatus {
+    Idle,
+    Working,
+    /// Working, but stopped on an approval or a question for the user.
+    Waiting,
+    Failed,
+}
+
+pub enum ChatEvent {
+    Focused,
+    /// A link in a reply was clicked.
+    OpenUrl(String),
+}
+
+/// A message on its way out: typed text plus what was attached.
+#[derive(Clone)]
+struct Outgoing {
+    text: String,
+    attachments: Vec<PathBuf>,
+    /// ⌘⏎: read it now rather than after the current step.
+    now: bool,
+}
+
+impl Outgoing {
+    fn blocks(&self) -> Vec<Block> {
+        self.attachments
+            .iter()
+            .map(|p| Block::Attachment {
+                path: p.display().to_string(),
+                kind: if is_image(p) {
+                    AttachmentKind::Image
+                } else {
+                    AttachmentKind::File
+                },
+            })
+            .collect()
+    }
+
+    fn turn(&self, id: String) -> UserTurn {
+        UserTurn {
+            text: self.text.clone(),
+            attachments: self
+                .attachments
+                .iter()
+                .map(|p| Attachment {
+                    path: p.clone(),
+                    mime: mime_for(p).into(),
+                })
+                .collect(),
+            id: Some(id),
+            now: self.now,
+        }
+    }
+}
+
+/// Something the agent is waiting on the user for, shown as a card above the
+/// composer.
+enum Ask {
+    Permission {
+        id: RequestId,
+        action: Action,
+        input: serde_json::Value,
+        reason: Option<String>,
+        tool: String,
+        tool_use: Option<agent_core::ToolId>,
+    },
+    Question {
+        id: RequestId,
+        tool_use: Option<agent_core::ToolId>,
+        questions: Vec<agent_core::Question>,
+        /// Answers so far, one per question, in order.
+        picked: Vec<String>,
+        /// Options ticked in a multi-select question.
+        toggled: HashSet<usize>,
+    },
+}
+
+impl Ask {
+    fn id(&self) -> RequestId {
+        match self {
+            Ask::Permission { id, .. } | Ask::Question { id, .. } => *id,
+        }
+    }
+
+    fn tool_use(&self) -> Option<&agent_core::ToolId> {
+        match self {
+            Ask::Permission { tool_use, .. } | Ask::Question { tool_use, .. } => tool_use.as_ref(),
+        }
+    }
+}
+
+/// The answers to an approval, as in Claude Code's own prompt.
+const PERMISSION_CHOICES: [(Decision, &str, &str); 3] = [
+    (Decision::Allow, "Yes", "⏎"),
+    (
+        Decision::AllowAlways,
+        "Yes, and don't ask again for this in this chat",
+        "",
+    ),
+    (Decision::Deny, "No", "esc"),
+];
+
+/// The `@` file picker above the composer.
+struct Mention {
+    /// Byte offset of the `@` in the composer.
+    start: usize,
+    matches: Vec<String>,
+    selected: usize,
+}
+
+pub struct ChatPane {
+    env: Arc<ChatEnv>,
+    pub agent: AgentId,
+    session_id: SessionId,
+    transcript: Transcript,
+    /// Parsed markdown per (message, block), re-parsed only while streaming.
+    docs: HashMap<(usize, usize), markdown::Cache>,
+    conn: Option<Conn>,
+    pub status: ChatStatus,
+    error: Option<SharedString>,
+    pub composer: Entity<Field>,
+    list: ListState,
+    expanded: HashSet<String>,
+    /// Steps that open by themselves (the latest plan) but were closed.
+    collapsed: HashSet<String>,
+    /// When each tool started and, once done, how long it took.
+    tool_times: HashMap<String, (Instant, Option<Duration>)>,
+    switching: bool,
+    mode: PermissionMode,
+    cwd: PathBuf,
+    /// `DECK_*` credentials so the agent can drive this window.
+    agent_env: Vec<(String, String)>,
+    pub title: SharedString,
+    pub last_activity: Instant,
+    /// Messages sent while a turn runs, for agents that cannot take input
+    /// mid-turn: deck holds them and sends each when the turn ends.
+    queued: std::collections::VecDeque<Outgoing>,
+    /// Messages sent while a turn runs to an agent that queues them itself
+    /// (Claude Code): already with the agent, shown as queued until it reads
+    /// them, then placed in the thread where it did.
+    inflight: Vec<(String, Outgoing)>,
+    /// Esc was pressed: the turn that ends next was stopped, not failed.
+    interrupting: bool,
+    /// Approvals and questions the agent is waiting on, oldest first.
+    asks: Vec<Ask>,
+    /// The highlighted choice on the top card.
+    ask_choice: usize,
+    turn_started: Option<Instant>,
+    /// How long each finished turn took, by assistant message.
+    worked: HashMap<usize, Duration>,
+    /// Work logs the user opened or closed by hand, by (message, group).
+    log_open: HashMap<(usize, usize), bool>,
+    copied: Option<String>,
+    /// Files and images going out with the next message.
+    attachments: Vec<PathBuf>,
+    /// Files under `cwd` for `@`, listed on first use and again when stale.
+    files: Option<Arc<Vec<String>>>,
+    files_at: Option<Instant>,
+    listing: bool,
+    mention: Option<Mention>,
+    /// The `@` whose picker was dismissed with Escape, so it stays shut.
+    mention_dismissed: Option<usize>,
+    /// Where this thread is saved, and whether it is the pinned control chat.
+    thread_id: String,
+    pub control: bool,
+    archived: bool,
+    /// The agent's own session id, so a later launch can resume it.
+    native_id: Option<String>,
+    /// A turn sent into a resumed session; if the resume fails it is sent
+    /// again into a fresh one that gets the thread replayed.
+    resuming: Option<UserTurn>,
+    _save: Option<Task<()>>,
+    _pump: Option<Task<()>>,
+    _composer: Subscription,
+    _lifecycle: [Subscription; 2],
+}
+
+impl EventEmitter<ChatEvent> for ChatPane {}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+fn is_image(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+}
+
+fn mime_for(p: &std::path::Path) -> &'static str {
+    match p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        _ if p.is_dir() => "inode/directory",
+        _ => "application/octet-stream",
+    }
+}
+
+fn file_name(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+impl ChatPane {
+    pub fn new(
+        env: Arc<ChatEnv>,
+        agent: AgentId,
+        cwd: PathBuf,
+        agent_env: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let composer = cx.new(|cx| {
+            let mut f = Field::multiline(
+                "Ask anything, @ to mention a file, paste or drop images…",
+                cx,
+            );
+            f.bare = true;
+            f.attachments = true;
+            f
+        });
+        let sub = cx.subscribe(&composer, |chat, _, ev: &FieldEvent, cx| match ev {
+            FieldEvent::Submit(_) => chat.submit(false, cx),
+            FieldEvent::SubmitNow => chat.submit(true, cx),
+            FieldEvent::Cancel => chat.interrupt(cx),
+            FieldEvent::Attach(p) => chat.paste(p, cx),
+            FieldEvent::Changed => {
+                chat.update_mention(cx);
+                chat.sync_popup(cx);
+                chat.schedule_save(cx);
+                cx.notify();
+            }
+            FieldEvent::PopupKey(k) => chat.popup_key(k, cx),
+        });
+        // Whatever is unsaved when deck quits or the window closes is written
+        // before it goes.
+        let lifecycle = [
+            cx.on_app_quit(|c, cx| {
+                c.flush(cx);
+                async {}
+            }),
+            cx.on_release(|c, cx| c.flush(cx)),
+        ];
+        Self {
+            env,
+            agent,
+            session_id: SessionId::new(),
+            transcript: Transcript::default(),
+            docs: HashMap::new(),
+            conn: None,
+            status: ChatStatus::Idle,
+            error: None,
+            composer,
+            list: ListState::new(0, ListAlignment::Bottom, px(800.)),
+            expanded: HashSet::new(),
+            collapsed: HashSet::new(),
+            tool_times: HashMap::new(),
+            switching: false,
+            // Edits flow; shell commands stay gated, except `deck …`, which is
+            // pre-approved so the agent can always drive this window.
+            mode: PermissionMode::Edit,
+            cwd,
+            agent_env,
+            title: SharedString::default(),
+            last_activity: Instant::now(),
+            queued: Default::default(),
+            inflight: Vec::new(),
+            interrupting: false,
+            asks: Vec::new(),
+            ask_choice: 0,
+            turn_started: None,
+            worked: HashMap::new(),
+            log_open: HashMap::new(),
+            copied: None,
+            attachments: Vec::new(),
+            files: None,
+            files_at: None,
+            listing: false,
+            mention: None,
+            mention_dismissed: None,
+            thread_id: uuid_like(),
+            control: false,
+            archived: false,
+            native_id: None,
+            resuming: None,
+            _save: None,
+            _pump: None,
+            _composer: sub,
+            _lifecycle: lifecycle,
+        }
+    }
+
+    /// A thread saved by an earlier launch, with its draft, attachments and
+    /// history. The agent is not started until the next message, which
+    /// resumes its own session when it can.
+    pub fn restore(
+        env: Arc<ChatEnv>,
+        saved: threads::Saved,
+        agent_env: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let agent = AgentId::new(saved.agent.as_str());
+        let mut c = Self::new(env, agent, saved.cwd.clone(), agent_env, cx);
+        let mut transcript = saved.transcript;
+        settle(&mut transcript);
+        c.list.reset(transcript.messages.len());
+        c.transcript = transcript;
+        c.thread_id = saved.id;
+        c.control = saved.control;
+        c.title = saved.title.into();
+        c.mode = if saved.full_access {
+            PermissionMode::Yolo
+        } else {
+            PermissionMode::Edit
+        };
+        c.native_id = saved.native_id;
+        c.attachments = saved
+            .attachments
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+        c.worked = saved
+            .worked
+            .into_iter()
+            .map(|(ix, ms)| (ix, Duration::from_millis(ms)))
+            .collect();
+        let (draft, history) = (saved.draft, saved.history);
+        tracing::debug!(
+            draft = draft.len(),
+            attachments = c.attachments.len(),
+            "restored thread"
+        );
+        c.composer.update(cx, |f, cx| {
+            f.set_history(history);
+            f.set_text(&draft, cx);
+            f.forget_undo();
+        });
+        c
+    }
+
+    /// The thread as saved to disk.
+    fn snapshot(&self, cx: &gpui::App) -> threads::Saved {
+        let f = self.composer.read(cx);
+        threads::Saved {
+            id: self.thread_id.clone(),
+            control: self.control,
+            agent: self.agent.as_str().to_string(),
+            cwd: self.cwd.clone(),
+            full_access: self.mode == PermissionMode::Yolo,
+            title: self.title.to_string(),
+            transcript: self.transcript.clone(),
+            draft: f.text().to_string(),
+            attachments: self.attachments.clone(),
+            history: f.history().to_vec(),
+            native_id: self.native_id.clone(),
+            worked: self
+                .worked
+                .iter()
+                .map(|(ix, d)| (*ix, d.as_millis() as u64))
+                .collect(),
+            updated: now(),
+        }
+    }
+
+    /// Save shortly after the last change, off the UI thread. Every edit
+    /// pushes the save back, so typing costs one write when it pauses.
+    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        if self.archived {
+            return;
+        }
+        self._save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let Ok(Some(saved)) =
+                this.update(cx, |c, cx| c.worth_saving(cx).then(|| c.snapshot(cx)))
+            else {
+                return;
+            };
+            let wrote = cx
+                .background_executor()
+                .spawn(async move { threads::write(&saved) })
+                .await;
+            if let Err(e) = wrote {
+                tracing::warn!("could not save the thread: {e}");
+            }
+        }));
+    }
+
+    /// An untouched new chat is not worth a file; a closed one is filed away.
+    fn worth_saving(&self, cx: &gpui::App) -> bool {
+        let blank = self.transcript.messages.is_empty()
+            && self.attachments.is_empty()
+            && self.composer.read(cx).text().is_empty()
+            && !self.control;
+        !blank && !self.archived
+    }
+
+    /// Save now, on this thread: the app is quitting or the pane is going.
+    fn flush(&mut self, cx: &gpui::App) {
+        self._save = None;
+        if self.worth_saving(cx) {
+            if let Err(e) = threads::write(&self.snapshot(cx)) {
+                tracing::warn!("could not save the thread: {e}");
+            }
+        }
+    }
+
+    /// Closing a thread files it away; it is no longer saved.
+    pub fn archive(&mut self) {
+        self.archived = true;
+        self._save = None;
+        threads::archive(&self.thread_id);
+    }
+
+    /// A turn is running, whether or not it is waiting on the user.
+    pub fn busy(&self) -> bool {
+        matches!(self.status, ChatStatus::Working | ChatStatus::Waiting)
+    }
+
+    /// How long the current turn has been running.
+    pub fn working_for(&self) -> Option<Duration> {
+        self.turn_started.map(|t| t.elapsed())
+    }
+
+    pub fn agent_name(&self) -> SharedString {
+        self.env
+            .registry
+            .get(&self.agent)
+            .map(|e| SharedString::from(e.display_name().to_string()))
+            .unwrap_or_else(|| self.agent.as_str().to_string().into())
+    }
+
+    /// The thread as plain text, for `deck pane read`.
+    pub fn read_text(&self) -> String {
+        let mut out = String::new();
+        for m in &self.transcript.messages {
+            out.push_str(match m.role {
+                Role::User => "## user\n",
+                Role::Assistant => "## assistant\n",
+            });
+            for b in &m.blocks {
+                match b {
+                    Block::Text { text, .. } => out.push_str(text),
+                    Block::Tool(t) => out.push_str(&format!("[tool] {}", t.title)),
+                    Block::Attachment { path, .. } => out.push_str(&format!("[attached] {path}")),
+                    _ => continue,
+                }
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn start(
+        &mut self,
+        hydrate: Option<Transcript>,
+        resume: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(entry) = self.env.registry.get(&self.agent).cloned() else {
+            self.fail(format!("{} is not available", self.agent.as_str()), cx);
+            return false;
+        };
+        if !entry.is_ready() {
+            let why = match &entry.availability {
+                agent_core::Availability::NeedsAuth { hint }
+                | agent_core::Availability::Missing { hint } => hint.clone(),
+                _ => String::new(),
+            };
+            self.fail(format!("{} is not ready. {why}", entry.display_name()), cx);
+            return false;
+        }
+        if let Some(old) = self.conn.take() {
+            old.shutdown();
+        }
+        let mut ctx = self.env.substrate.session_ctx(
+            &self.env.backend,
+            self.session_id,
+            &self.cwd,
+            None,
+            self.mode,
+            resume,
+        );
+        ctx.env = self.agent_env.clone();
+        ctx.allowed_tools = vec!["Bash(deck:*)".into()];
+        let mut conn = session::spawn(
+            self.env.backend.handle(),
+            entry.adapter.clone(),
+            ctx,
+            hydrate,
+        );
+        let Some(mut events) = conn.take_events() else {
+            self.fail("the session did not start".into(), cx);
+            return false;
+        };
+        self.conn = Some(conn);
+        self.error = None;
+        let sid = self.session_id;
+        // Everything that arrived since the last wake is applied together,
+        // with one repaint, so a fast stream costs one layout per frame.
+        self._pump = Some(cx.spawn(async move |this, cx| {
+            while let Some(first) = events.next().await {
+                let mut batch = vec![first];
+                while let Ok(more) = events.try_recv() {
+                    batch.push(more);
+                }
+                if this
+                    .update(cx, |chat, cx| chat.apply(sid, batch, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
+        true
+    }
+
+    fn queues_input(&self) -> bool {
+        self.env
+            .registry
+            .get(&self.agent)
+            .is_some_and(|e| e.caps().queues_input)
+    }
+
+    /// Start a session that carries the thread so far: the agent's own
+    /// session when it can resume one, else the thread replayed to it.
+    fn start_carrying(&mut self, prior: &Transcript, cx: &mut Context<Self>) -> bool {
+        let native = self
+            .env
+            .registry
+            .get(&self.agent)
+            .is_some_and(|e| e.caps().native_resume);
+        match self.native_id.clone().filter(|_| native) {
+            Some(id) => self.start(None, Some(id), cx),
+            None => self.start(
+                (!prior.messages.is_empty()).then(|| prior.clone()),
+                None,
+                cx,
+            ),
+        }
+    }
+
+    fn fail(&mut self, message: String, cx: &mut Context<Self>) {
+        self.error = Some(message.into());
+        self.status = ChatStatus::Failed;
+        cx.notify();
+    }
+
+    /// Send what is in the composer, with its attachments.
+    fn submit(&mut self, now: bool, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).text().trim().to_string();
+        if text.is_empty() && self.attachments.is_empty() {
+            return;
+        }
+        // With a card up, typing answers it: a question takes the words as
+        // its answer; an approval is refused and the words go on to the agent.
+        if !self.asks.is_empty() && !text.is_empty() && self.answer_in_words(text.clone(), cx) {
+            self.composer.update(cx, |f, cx| f.set_text("", cx));
+            return;
+        }
+        let attachments = std::mem::take(&mut self.attachments);
+        self.mention = None;
+        self.composer.update(cx, |f, cx| {
+            if !text.is_empty() {
+                f.push_history(&text);
+            }
+            f.popup = false;
+            f.set_text("", cx);
+        });
+        self.send_turn(
+            Outgoing {
+                text,
+                attachments,
+                now,
+            },
+            cx,
+        );
+    }
+
+    /// Send a message that did not come from the composer (a starter, or
+    /// another agent through `deck pane send`); the draft is left alone.
+    pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if !text.is_empty() {
+            self.send_turn(
+                Outgoing {
+                    text,
+                    attachments: Vec::new(),
+                    now: false,
+                },
+                cx,
+            );
+        }
+    }
+
+    fn send_turn(&mut self, out: Outgoing, cx: &mut Context<Self>) {
+        if matches!(self.status, ChatStatus::Working | ChatStatus::Waiting) && self.conn.is_some() {
+            // An agent that queues input gets the message now and reads it
+            // when its current step ends, inside the same turn, as in Claude
+            // Code. Any other agent gets it from deck when the turn is over.
+            if self.queues_input() {
+                let id = uuid_like();
+                if self
+                    .conn
+                    .as_ref()
+                    .is_some_and(|c| c.send(out.turn(id.clone())))
+                {
+                    self.inflight.push((id, out));
+                    cx.notify();
+                    return;
+                }
+            }
+            self.queued.push_back(out);
+            cx.notify();
+            return;
+        }
+        self.copied = None;
+        if self.title.is_empty() {
+            let first = out
+                .text
+                .lines()
+                .next()
+                .map(str::to_string)
+                .filter(|l| !l.trim().is_empty());
+            let first = first
+                .or_else(|| out.attachments.first().map(|p| file_name(p)))
+                .unwrap_or_default();
+            let mut t: String = first.chars().take(48).collect();
+            if first.chars().count() > 48 {
+                t.push('…');
+            }
+            self.title = t.into();
+        }
+        // A session that ended (an error, a restart) is picked up again with
+        // the thread so far, not started blank.
+        let prior = self.conn.is_none().then(|| self.transcript.clone());
+        let before = self.transcript.messages.len();
+        self.transcript
+            .push_user(out.text.clone(), out.blocks(), now());
+        self.sync_list(before, &[], cx);
+        let turn = out.turn(uuid_like());
+        if let Some(prior) = prior {
+            if !self.start_carrying(&prior, cx) {
+                return;
+            }
+            if self.native_id.is_some() {
+                self.resuming = Some(turn.clone());
+            }
+        }
+        match &self.conn {
+            Some(conn) if conn.send(turn) => {
+                self.status = ChatStatus::Working;
+                self.last_activity = Instant::now();
+                self.turn_started = Some(Instant::now());
+            }
+            _ => self.fail("the session is no longer accepting input".into(), cx),
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    pub fn interrupt(&mut self, cx: &mut Context<Self>) {
+        if self.mention.is_some() {
+            self.close_mention(cx);
+            return;
+        }
+        if let (Some(conn), ChatStatus::Working | ChatStatus::Waiting) = (&self.conn, self.status) {
+            self.interrupting = conn.interrupt();
+        }
+        cx.notify();
+    }
+
+    // -- attachments ----------------------------------------------------------
+
+    pub fn attach_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        for p in paths {
+            if !self.attachments.contains(p) {
+                self.attachments.push(p.clone());
+            }
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn paste(&mut self, pasted: &Pasted, cx: &mut Context<Self>) {
+        match pasted {
+            Pasted::Files(paths) => self.attach_paths(paths, cx),
+            Pasted::Image(bytes, ext) => {
+                let bytes = bytes.clone();
+                let ext = *ext;
+                cx.spawn(async move |this, cx| {
+                    let saved = cx
+                        .background_executor()
+                        .spawn(async move { save_pasted_image(&bytes, ext) })
+                        .await;
+                    let _ = this.update(cx, |c, cx| match saved {
+                        Ok(path) => c.attach_paths(&[path], cx),
+                        Err(e) => c.fail(format!("could not keep the pasted image: {e}"), cx),
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn pick_files(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let _ = this.update(cx, |c, cx| c.attach_paths(&paths, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn detach(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        self.attachments.retain(|p| p != path);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    // -- @ mentions -------------------------------------------------------------
+
+    fn update_mention(&mut self, cx: &mut Context<Self>) {
+        let token = self.composer.read(cx).mention();
+        if token.as_ref().map(|t| t.0) != self.mention_dismissed {
+            self.mention_dismissed = None;
+        }
+        self.mention = match token {
+            Some((start, _)) if self.mention_dismissed == Some(start) => None,
+            Some((start, query)) => match self.files.clone() {
+                Some(files) => {
+                    // A new `@` re-lists in the background if the list is
+                    // old, so files made since show up; the old list serves
+                    // meanwhile.
+                    let fresh = self.mention.as_ref().is_some_and(|m| m.start == start);
+                    if !fresh && self.files_at.is_some_and(|t| t.elapsed() > FILES_STALE) {
+                        self.list_files(cx);
+                    }
+                    let selected = self
+                        .mention
+                        .as_ref()
+                        .filter(|m| m.start == start)
+                        .map_or(0, |m| m.selected);
+                    let matches = rank_files(&files, &query, 8);
+                    let selected = selected.min(matches.len().saturating_sub(1));
+                    Some(Mention {
+                        start,
+                        matches,
+                        selected,
+                    })
+                }
+                None => {
+                    self.list_files(cx);
+                    Some(Mention {
+                        start,
+                        matches: Vec::new(),
+                        selected: 0,
+                    })
+                }
+            },
+            None => None,
+        };
+        self.sync_popup(cx);
+        cx.notify();
+    }
+
+    /// List the project's files once, in the background: git's view of it
+    /// when it is a repository (so ignored build output stays out), else a
+    /// bounded walk.
+    fn list_files(&mut self, cx: &mut Context<Self>) {
+        if self.listing {
+            return;
+        }
+        self.listing = true;
+        let cwd = self.cwd.clone();
+        cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { project_files(&cwd) })
+                .await;
+            let _ = this.update(cx, |c, cx| {
+                c.files = Some(Arc::new(files));
+                c.files_at = Some(Instant::now());
+                c.listing = false;
+                c.update_mention(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn mention_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(m) = self.mention.as_mut() else {
+            return;
+        };
+        let n = m.matches.len().max(1);
+        match key {
+            "up" => m.selected = (m.selected + n - 1) % n,
+            "down" => m.selected = (m.selected + 1) % n,
+            "enter" | "tab" => {
+                if let Some(path) = m.matches.get(m.selected).cloned() {
+                    let start = m.start;
+                    self.mention = None;
+                    self.composer.update(cx, |f, cx| {
+                        f.popup = false;
+                        f.complete_mention(start, &path, cx);
+                    });
+                }
+            }
+            _ => self.close_mention(cx),
+        }
+        cx.notify();
+    }
+
+    fn close_mention(&mut self, cx: &mut Context<Self>) {
+        self.mention_dismissed = self.mention.take().map(|m| m.start);
+        self.sync_popup(cx);
+        cx.notify();
+    }
+
+    // -- approvals and questions ------------------------------------------------
+
+    /// The composer's keys go to the open popup: the `@` picker, or the
+    /// approval card while nothing is typed.
+    fn sync_popup(&mut self, cx: &mut Context<Self>) {
+        let mention = self.mention.as_ref().is_some_and(|m| !m.matches.is_empty());
+        let empty = self.composer.read(cx).text().trim().is_empty();
+        let open = mention || (!self.asks.is_empty() && empty);
+        self.composer.update(cx, |f, _| f.popup = open);
+    }
+
+    fn popup_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.mention.as_ref().is_some_and(|m| !m.matches.is_empty()) {
+            self.mention_key(key, cx);
+            return;
+        }
+        let Some(ask) = self.asks.first() else { return };
+        let n = match ask {
+            Ask::Permission { .. } => PERMISSION_CHOICES.len(),
+            Ask::Question {
+                questions, picked, ..
+            } => {
+                let q = &questions[picked.len().min(questions.len() - 1)];
+                q.options.len() + usize::from(q.multi)
+            }
+        };
+        match key {
+            "up" => self.ask_choice = (self.ask_choice + n - 1) % n.max(1),
+            "down" | "tab" => self.ask_choice = (self.ask_choice + 1) % n.max(1),
+            "enter" => self.choose(self.ask_choice, cx),
+            "escape" => self.decline(cx),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Pick option `i` of the card on top: an approval choice, or an answer.
+    fn choose(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(ask) = self.asks.first_mut() else {
+            return;
+        };
+        match ask {
+            Ask::Permission { id, .. } => {
+                let id = *id;
+                let decision = PERMISSION_CHOICES.get(i).map_or(Decision::Allow, |c| c.0);
+                self.settle_ask(id, cx, |conn| conn.decide(id, decision));
+            }
+            Ask::Question {
+                questions,
+                picked,
+                toggled,
+                ..
+            } => {
+                let qi = picked.len();
+                let Some(q) = questions.get(qi) else { return };
+                if q.multi && i < q.options.len() {
+                    // Several may be picked: toggle, and Done sends them.
+                    if !toggled.remove(&i) {
+                        toggled.insert(i);
+                    }
+                    self.ask_choice = i;
+                    cx.notify();
+                    return;
+                }
+                let answer = if q.multi {
+                    let mut chosen: Vec<usize> = toggled.drain().collect();
+                    chosen.sort_unstable();
+                    chosen
+                        .iter()
+                        .filter_map(|&o| q.options.get(o))
+                        .map(|o| o.label.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    q.options
+                        .get(i)
+                        .map(|o| o.label.clone())
+                        .unwrap_or_default()
+                };
+                picked.push(answer);
+                self.ask_choice = 0;
+                self.finish_question(cx);
+            }
+        }
+    }
+
+    /// Esc on the card: deny the action, or leave the question unanswered.
+    fn decline(&mut self, cx: &mut Context<Self>) {
+        let Some(ask) = self.asks.first() else { return };
+        let id = ask.id();
+        match ask {
+            Ask::Permission { .. } => {
+                self.settle_ask(id, cx, |conn| conn.decide(id, Decision::Deny))
+            }
+            Ask::Question { .. } => self.settle_ask(id, cx, |conn| conn.decide(id, Decision::Deny)),
+        }
+    }
+
+    /// Text typed while a card is up answers it in words: for a question it
+    /// is the answer; for an approval it means no, and the text goes to the
+    /// agent as what to do instead.
+    fn answer_in_words(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        // A choice's number picks it, as in Claude Code's own prompt.
+        let choices = match self.asks.first() {
+            Some(Ask::Permission { .. }) => PERMISSION_CHOICES.len(),
+            Some(Ask::Question {
+                questions, picked, ..
+            }) => questions.get(picked.len()).map_or(0, |q| q.options.len()),
+            None => return false,
+        };
+        if let Ok(n @ 1..) = text.parse::<usize>() {
+            if n <= choices {
+                self.choose(n - 1, cx);
+                return true;
+            }
+        }
+        let Some(ask) = self.asks.first_mut() else {
+            return false;
+        };
+        match ask {
+            Ask::Question { picked, .. } => {
+                picked.push(text);
+                self.finish_question(cx);
+                true
+            }
+            Ask::Permission { id, .. } => {
+                let id = *id;
+                self.settle_ask(id, cx, |conn| conn.decide(id, Decision::Deny));
+                false
+            }
+        }
+    }
+
+    /// Send a question's answers once each of its questions has one.
+    fn finish_question(&mut self, cx: &mut Context<Self>) {
+        let Some(Ask::Question {
+            id,
+            questions,
+            picked,
+            ..
+        }) = self.asks.first()
+        else {
+            return;
+        };
+        if picked.len() < questions.len() {
+            cx.notify();
+            return;
+        }
+        let id = *id;
+        let answers: Vec<(String, String)> = questions
+            .iter()
+            .map(|q| q.question.clone())
+            .zip(picked.iter().cloned())
+            .collect();
+        self.settle_ask(id, cx, move |conn| conn.answer(id, answers));
+    }
+
+    fn settle_ask(
+        &mut self,
+        id: RequestId,
+        cx: &mut Context<Self>,
+        send: impl FnOnce(&Conn) -> bool,
+    ) {
+        if let Some(conn) = &self.conn {
+            send(conn);
+        }
+        self.asks.retain(|a| a.id() != id);
+        self.ask_choice = 0;
+        if self.asks.is_empty() && self.status == ChatStatus::Waiting {
+            self.status = ChatStatus::Working;
+        }
+        self.sync_popup(cx);
+        cx.notify();
+    }
+
+    fn render_ask(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ask = self.asks.first()?;
+        let more = self.asks.len() - 1;
+        let agent = self.agent_name();
+        let card = div()
+            .flex()
+            .flex_col()
+            .gap(u(8.))
+            .p(u(12.))
+            .rounded(u(14.))
+            .bg(rgb(theme::RAISED))
+            .border_1()
+            .border_color(rgba(0xffffff30))
+            .text_size(u(12.5));
+        let option = |i: usize,
+                      selected: bool,
+                      label: String,
+                      detail: Option<String>,
+                      key: Option<&'static str>| {
+            div()
+                .id(ElementId::NamedInteger("ask-opt".into(), i as u64))
+                .flex()
+                .items_center()
+                .gap(u(10.))
+                .min_h(u(30.))
+                .px(u(10.))
+                .py(u(4.))
+                .rounded(u(8.))
+                .cursor_pointer()
+                .when(selected, |d| {
+                    d.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+                })
+                .when(!selected, |d| d.text_color(rgb(theme::TEXT_2)))
+                .hover(|s| s.bg(rgb(theme::SURFACE)))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(u(14.))
+                        .font_family(theme::MONO)
+                        .text_size(u(11.))
+                        .text_color(rgb(theme::DIM))
+                        .child(format!("{}", i + 1)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().child(label))
+                        .when_some(detail, |d, t| {
+                            d.child(
+                                div()
+                                    .text_size(u(11.5))
+                                    .text_color(rgb(theme::DIM))
+                                    .child(t),
+                            )
+                        }),
+                )
+                .when_some(key, |d, k| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .text_size(u(11.))
+                            .text_color(rgb(theme::DIM))
+                            .child(k),
+                    )
+                })
+                .on_click(cx.listener(move |c, _, _, cx| c.choose(i, cx)))
+        };
+        let card = match ask {
+            Ask::Permission {
+                action,
+                input,
+                reason,
+                tool,
+                ..
+            } => {
+                let (title, preview) = permission_preview(action, input, tool, &self.cwd);
+                let mut card = card
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(u(8.))
+                            .text_color(rgb(theme::TEXT))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(icon(Icon::Info, 14., theme::TEXT))
+                            .child(div().flex_1().child(format!("{agent} wants to {title}")))
+                            .when(more > 0, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(u(11.))
+                                        .text_color(rgb(theme::DIM))
+                                        .child(format!("+{more} more")),
+                                )
+                            }),
+                    )
+                    .when_some(reason.clone(), |d, r| {
+                        d.child(div().text_color(rgb(theme::TEXT_2)).child(r))
+                    })
+                    .when_some(preview, |d, p| d.child(p));
+                for (i, (_, label, key)) in PERMISSION_CHOICES.iter().enumerate() {
+                    card = card.child(option(
+                        i,
+                        i == self.ask_choice,
+                        label.to_string(),
+                        None,
+                        Some(*key),
+                    ));
+                }
+                card.child(
+                    div()
+                        .text_size(u(11.))
+                        .text_color(rgb(theme::DIM))
+                        .child("Or type what to do instead and press ⏎"),
+                )
+            }
+            Ask::Question {
+                questions,
+                picked,
+                toggled,
+                ..
+            } => {
+                let qi = picked.len().min(questions.len().saturating_sub(1));
+                let q = &questions[qi];
+                let mut card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(8.))
+                        .text_color(rgb(theme::TEXT))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(icon(Icon::Info, 14., theme::TEXT))
+                        .child(div().flex_1().child(q.question.clone()))
+                        .when(!q.header.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::DIM))
+                                    .child(q.header.clone()),
+                            )
+                        })
+                        .when(questions.len() > 1, |d| {
+                            d.child(
+                                div()
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::DIM))
+                                    .child(format!("{} of {}", qi + 1, questions.len())),
+                            )
+                        }),
+                );
+                for (i, o) in q.options.iter().enumerate() {
+                    let label = if q.multi {
+                        format!(
+                            "{} {}",
+                            if toggled.contains(&i) { "☑" } else { "☐" },
+                            o.label
+                        )
+                    } else {
+                        o.label.clone()
+                    };
+                    let detail = (!o.description.is_empty()).then(|| o.description.clone());
+                    card = card.child(option(i, i == self.ask_choice, label, detail, None));
+                }
+                if q.multi {
+                    let i = q.options.len();
+                    card = card.child(option(
+                        i,
+                        i == self.ask_choice,
+                        "Done".into(),
+                        None,
+                        Some("⏎"),
+                    ));
+                }
+                card.child(
+                    div()
+                        .text_size(u(11.))
+                        .text_color(rgb(theme::DIM))
+                        .child("↑↓ choose · ⏎ answer · or type your own answer · esc skip"),
+                )
+            }
+        };
+        Some(card.into_any_element())
+    }
+
+    fn switch_agent(&mut self, to: AgentId, cx: &mut Context<Self>) {
+        self.switching = false;
+        if to == self.agent {
+            cx.notify();
+            return;
+        }
+        self.agent = to;
+        // The old agent's session id means nothing to the new one.
+        self.native_id = None;
+        // A fresh backend that is handed our transcript, so the new agent
+        // picks up the thread; the handoff row says how faithfully.
+        if !self.transcript.messages.is_empty() {
+            let carry = self.transcript.clone();
+            self.start(Some(carry), None, cx);
+        } else if let Some(old) = self.conn.take() {
+            old.shutdown();
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn toggle_mode(&mut self, cx: &mut Context<Self>) {
+        // Ask before edits → auto-accept edits → full access → ask…
+        self.mode = match self.mode {
+            PermissionMode::Ask | PermissionMode::Auto => PermissionMode::Edit,
+            PermissionMode::Edit => PermissionMode::Yolo,
+            PermissionMode::Yolo => PermissionMode::Ask,
+        };
+        // The mode is a launch flag: restart with it, resuming the agent's own
+        // session when it can so nothing is replayed.
+        if self.conn.is_some() {
+            let carry = self.transcript.clone();
+            self.start_carrying(&carry, cx);
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn apply(&mut self, sid: SessionId, batch: Vec<DriverEvent>, cx: &mut Context<Self>) {
+        if sid != self.session_id {
+            return;
+        }
+        let before = self.transcript.messages.len();
+        let mut touched = Vec::new();
+        let mut failed_resume = false;
+        for ev in batch {
+            match ev {
+                DriverEvent::Agent(ev) => {
+                    match &ev {
+                        AgentEvent::Started {
+                            native_session_id: Some(id),
+                            ..
+                        } => {
+                            self.native_id = Some(id.clone());
+                        }
+                        AgentEvent::Fatal { message, .. } => {
+                            failed_resume |= self.resuming.is_some();
+                            self.error = Some(message.clone().into());
+                            self.status = ChatStatus::Failed;
+                        }
+                        AgentEvent::ToolCall { id, .. } => {
+                            self.resuming = None;
+                            if self.asks.is_empty() {
+                                self.status = ChatStatus::Working;
+                            }
+                            self.tool_times
+                                .entry(id.0.to_string())
+                                .or_insert((Instant::now(), None));
+                        }
+                        AgentEvent::ToolResult { id, .. } => {
+                            if let Some((start, end)) = self.tool_times.get_mut(id.0.as_str()) {
+                                end.get_or_insert(start.elapsed());
+                            }
+                        }
+                        AgentEvent::Permission {
+                            id,
+                            action,
+                            input,
+                            reason,
+                            tool_use,
+                            ..
+                        } => {
+                            let tool = match action {
+                                Action::Other { name, .. } => name.to_string(),
+                                _ => String::new(),
+                            };
+                            self.asks.push(Ask::Permission {
+                                id: *id,
+                                action: action.clone(),
+                                input: input.clone(),
+                                reason: reason.clone(),
+                                tool,
+                                tool_use: tool_use.clone(),
+                            });
+                            self.status = ChatStatus::Waiting;
+                        }
+                        AgentEvent::Question {
+                            id,
+                            tool_use,
+                            questions,
+                        } if !questions.is_empty() => {
+                            self.asks.push(Ask::Question {
+                                id: *id,
+                                tool_use: tool_use.clone(),
+                                questions: questions.clone(),
+                                picked: Vec::new(),
+                                toggled: HashSet::new(),
+                            });
+                            self.status = ChatStatus::Waiting;
+                        }
+                        AgentEvent::AskCancelled { id } => {
+                            self.asks.retain(|a| a.id() != *id);
+                            if self.asks.is_empty() && self.status == ChatStatus::Waiting {
+                                self.status = ChatStatus::Working;
+                            }
+                        }
+                        AgentEvent::UserDelivered { id } => {
+                            if let Some(i) = self.inflight.iter().position(|(q, _)| q == id) {
+                                let (_, out) = self.inflight.remove(i);
+                                self.deliver(out, &mut touched);
+                            }
+                        }
+                        // Dropped unread: it goes back into the composer.
+                        AgentEvent::UserDropped { id } => {
+                            if let Some(i) = self.inflight.iter().position(|(q, _)| q == id) {
+                                let (_, out) = self.inflight.remove(i);
+                                self.return_to_composer(out, cx);
+                            }
+                        }
+                        AgentEvent::Text { .. } | AgentEvent::Reasoning { .. } => {
+                            // The resumed session answered, so it took.
+                            self.resuming = None;
+                            if self.asks.is_empty() {
+                                self.status = ChatStatus::Working;
+                            }
+                        }
+                        AgentEvent::TurnEnd { stop } => {
+                            self.resuming = None;
+                            // Whatever it was waiting on no longer matters.
+                            self.asks.clear();
+                            // Claude reports a turn stopped by Esc as an error.
+                            let stopped = std::mem::take(&mut self.interrupting);
+                            let stop = if stopped && *stop == StopReason::Error {
+                                &StopReason::Interrupted
+                            } else {
+                                stop
+                            };
+                            self.status = if !self.inflight.is_empty() {
+                                // It still holds messages it will read next,
+                                // in a turn of their own.
+                                ChatStatus::Working
+                            } else if stop.is_clean() || *stop == StopReason::Interrupted {
+                                ChatStatus::Idle
+                            } else {
+                                ChatStatus::Failed
+                            };
+                            if let Some(started) = self.turn_started.take() {
+                                if let Some(ix) = self
+                                    .transcript
+                                    .messages
+                                    .iter()
+                                    .rposition(|m| m.role == Role::Assistant)
+                                {
+                                    self.worked.insert(ix, started.elapsed());
+                                    touched.push(ix);
+                                }
+                            }
+                            if self.status == ChatStatus::Working {
+                                self.turn_started = Some(Instant::now());
+                            }
+                        }
+                        _ => {}
+                    }
+                    let applied = self.transcript.apply(&self.agent, &ev, now());
+                    if applied.kind != AppliedKind::Ignored {
+                        if let Some(ix) = applied.message {
+                            touched.push(ix);
+                        }
+                    }
+                }
+                DriverEvent::Hydrated(mode) => {
+                    if !mode.is_lossless() && !self.transcript.messages.is_empty() {
+                        self.transcript
+                            .push_handoff(None, self.agent.clone(), mode, now());
+                    }
+                    self.status = ChatStatus::Idle;
+                }
+                DriverEvent::Ended { error } => {
+                    self.asks.clear();
+                    // The session died holding messages it never read: deck
+                    // sends them to the next one.
+                    for (_, out) in self.inflight.drain(..) {
+                        self.queued.push_back(out);
+                    }
+                    if let Some(e) = error {
+                        failed_resume |= self.resuming.is_some();
+                        self.error = Some(e.into());
+                        self.status = ChatStatus::Failed;
+                    } else if self.busy() {
+                        self.status = ChatStatus::Idle;
+                    }
+                    self.conn = None;
+                }
+            }
+        }
+        // The saved session could not be resumed (expired, or made on another
+        // machine): replay the thread into a fresh one and send the turn again.
+        if failed_resume {
+            if let Some(turn) = self.resuming.take() {
+                tracing::warn!("resume failed; replaying the thread instead");
+                self.native_id = None;
+                let mut prior = self.transcript.clone();
+                if let Some(i) = prior.messages.iter().rposition(|m| m.role == Role::User) {
+                    prior.messages.truncate(i);
+                }
+                if self.start(Some(prior), None, cx)
+                    && self.conn.as_ref().is_some_and(|c| c.send(turn))
+                {
+                    self.error = None;
+                    self.status = ChatStatus::Working;
+                }
+            }
+        }
+        self.sync_popup(cx);
+        self.last_activity = Instant::now();
+        self.sync_list(before, &touched, cx);
+        // The turn is over: the next queued message goes now.
+        if self.status == ChatStatus::Idle {
+            if let Some(next) = self.queued.pop_front() {
+                self.send_turn(next, cx);
+            }
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// The agent read a message sent mid-turn: close the reply it was
+    /// writing (with its time so far), and put the message in the thread at
+    /// that point, so the rest of the turn reads as the answer to it.
+    fn deliver(&mut self, out: Outgoing, touched: &mut Vec<usize>) {
+        if let Some(ix) = self.transcript.messages.len().checked_sub(1) {
+            let last = &mut self.transcript.messages[ix];
+            if last.role == Role::Assistant && last.stop.is_none() {
+                for b in &mut last.blocks {
+                    if let Block::Text { open, .. } | Block::Reasoning { open, .. } = b {
+                        *open = false;
+                    }
+                }
+                last.stop = Some(StopReason::EndTurn);
+                if let Some(started) = self.turn_started {
+                    self.worked.insert(ix, started.elapsed());
+                }
+                touched.push(ix);
+            }
+        }
+        self.transcript
+            .push_user(out.text.clone(), out.blocks(), now());
+        self.turn_started = Some(Instant::now());
+        self.status = ChatStatus::Working;
+    }
+
+    /// A queued message the agent dropped comes back to the composer, ahead
+    /// of anything typed since, with its attachments.
+    fn return_to_composer(&mut self, out: Outgoing, cx: &mut Context<Self>) {
+        for p in out.attachments.into_iter().rev() {
+            if !self.attachments.contains(&p) {
+                self.attachments.insert(0, p);
+            }
+        }
+        self.composer.update(cx, |f, cx| {
+            let draft = f.text().trim().to_string();
+            let text = if draft.is_empty() {
+                out.text
+            } else {
+                format!("{}\n\n{draft}", out.text)
+            };
+            f.set_text(&text, cx);
+        });
+    }
+
+    /// Re-measure only what changed: touched rows, plus any new ones.
+    fn sync_list(&mut self, before: usize, touched: &[usize], cx: &mut Context<Self>) {
+        let now_len = self.transcript.messages.len();
+        let mut seen = HashSet::new();
+        for &ix in touched {
+            if ix < before && seen.insert(ix) {
+                self.list.splice(ix..ix + 1, 1);
+            }
+        }
+        if now_len > before {
+            self.list.splice(before..before, now_len - before);
+        }
+        cx.notify();
+    }
+
+    // -- rendering ----------------------------------------------------------
+
+    /// Everything readable sits in one centred column: long lines are hard to
+    /// read, and the composer shares the column's edges with the messages.
+    fn column(content: impl IntoElement) -> gpui::Div {
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .child(div().w_full().max_w(u(COLUMN)).px(u(24.)).child(content))
+    }
+
+    fn render_message(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(msg) = self.transcript.messages.get(ix) else {
+            return div().into_any_element();
+        };
+        match msg.role {
+            Role::User => {
+                let text = message_text(msg);
+                let files: Vec<PathBuf> = msg
+                    .blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Attachment { path, .. } => Some(PathBuf::from(path)),
+                        _ => None,
+                    })
+                    .collect();
+                let mut col = div().flex().flex_col().items_end().gap(u(6.)).pt(u(24.));
+                if !files.is_empty() {
+                    col = col.child(self.render_attachments(
+                        &format!("sent-{ix}"),
+                        &files,
+                        false,
+                        cx,
+                    ));
+                }
+                let waiting = ix + 1 == self.transcript.messages.len() && self.busy();
+                if !text.is_empty() {
+                    col = col.child(
+                        div()
+                            .max_w(relative(0.8))
+                            .px(u(14.))
+                            .py(u(9.))
+                            .rounded(u(18.))
+                            .bg(rgb(theme::SURFACE))
+                            .text_color(rgb(theme::TEXT))
+                            .child(text),
+                    );
+                }
+                // Sent, and nothing back yet: say it is being worked on.
+                if waiting {
+                    col = col.child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap(u(6.))
+                            .pt(u(18.))
+                            .h(u(44.))
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::TEXT_2))
+                            .child(spinner(
+                                ElementId::Name(format!("wait-spin-{ix}").into()),
+                                12.,
+                                theme::TEXT_2,
+                            ))
+                            .child(working_label(format!("wait-{ix}"), "Working…".into())),
+                    );
+                }
+                Self::column(col).into_any_element()
+            }
+            Role::Assistant => {
+                let blocks = msg.blocks.clone();
+                let text = message_text(msg);
+                let last = ix + 1 == self.transcript.messages.len();
+                let live = last && self.busy();
+                let worked = self.worked.get(&ix).copied();
+                let group = SharedString::from(format!("msg-{ix}"));
+
+                // Text stands alone; consecutive tool calls and thinking fold
+                // into one work log, which is how a turn reads as a story.
+                let mut parts: Vec<Part> = Vec::new();
+                for (bix, b) in blocks.iter().enumerate() {
+                    match b {
+                        Block::Tool(_) | Block::Reasoning { .. } => match parts.last_mut() {
+                            Some(Part::Work(v)) => v.push(bix),
+                            _ => parts.push(Part::Work(vec![bix])),
+                        },
+                        _ => parts.push(Part::One(bix)),
+                    }
+                }
+                let last_work = parts.iter().rposition(|p| matches!(p, Part::Work(_)));
+
+                let mut col = div().flex().flex_col().gap(u(12.)).pt(u(24.));
+                for (pi, part) in parts.iter().enumerate() {
+                    col = col.child(match part {
+                        Part::One(bix) => self.render_block(ix, *bix, &blocks[*bix], cx),
+                        Part::Work(bixes) => {
+                            let duration = worked.filter(|_| Some(pi) == last_work);
+                            let running = live && Some(pi) == last_work && pi + 1 == parts.len();
+                            self.render_work_log(ix, pi, bixes, &blocks, running, duration, cx)
+                        }
+                    });
+                }
+                // The agent is working but has not said or done anything yet.
+                if live && parts.is_empty() {
+                    col = col.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(u(6.))
+                            .h(u(26.))
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::TEXT_2))
+                            .child(spinner(
+                                ElementId::Name(format!("pending-spin-{ix}").into()),
+                                12.,
+                                theme::TEXT_2,
+                            ))
+                            .child(working_label(format!("pending-{ix}"), "Working…".into())),
+                    );
+                }
+                // Once the turn is over, what it changed, file by file.
+                if !live {
+                    if let Some(card) = self.render_changed_files(ix, &blocks, cx) {
+                        col = col.child(card);
+                    }
+                }
+                if !live && !text.is_empty() {
+                    let key = format!("msg-{ix}");
+                    let copied = self.copied.as_deref() == Some(key.as_str());
+                    col = col.child(
+                        div().flex().items_center().gap(u(4.)).h(u(24.)).child(
+                            div()
+                                .id(ElementId::NamedInteger("copy".into(), ix as u64))
+                                .flex()
+                                .items_center()
+                                .gap(u(5.))
+                                .h(u(24.))
+                                .px(u(6.))
+                                .rounded(u(6.))
+                                .text_size(u(11.))
+                                .text_color(rgb(theme::DIM))
+                                .opacity(if copied { 1. } else { 0. })
+                                .group_hover(group.clone(), |s| s.opacity(1.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+                                .child(icon(
+                                    if copied { Icon::Check } else { Icon::Copy },
+                                    12.,
+                                    theme::DIM,
+                                ))
+                                .child(if copied { "Copied" } else { "Copy" })
+                                .on_click(cx.listener(move |c, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        text.clone(),
+                                    ));
+                                    c.copied = Some(key.clone());
+                                    cx.notify();
+                                })),
+                        ),
+                    );
+                }
+                Self::column(div().group(group).child(col)).into_any_element()
+            }
+        }
+    }
+
+    fn render_block(
+        &mut self,
+        ix: usize,
+        bix: usize,
+        block: &Block,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match block {
+            Block::Text { text, .. } => {
+                let doc = self.docs.entry((ix, bix)).or_default().update(text).clone();
+                self.render_doc(&format!("{ix}-{bix}"), &doc, cx)
+            }
+            Block::Handoff { to, mode, .. } => div()
+                .text_size(u(12.))
+                .text_color(rgb(theme::DIM))
+                .child(format!(
+                    "Continued with {} ({})",
+                    to.as_str(),
+                    handoff_label(*mode)
+                ))
+                .into_any_element(),
+            Block::Attachment { path, .. } => div()
+                .text_size(u(12.))
+                .text_color(rgb(theme::TEXT_2))
+                .child(path.clone())
+                .into_any_element(),
+            // Tools and thinking are drawn by the work log.
+            Block::Tool(_) | Block::Reasoning { .. } => div().into_any_element(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_work_log(
+        &mut self,
+        ix: usize,
+        pi: usize,
+        bixes: &[usize],
+        blocks: &[Block],
+        running: bool,
+        duration: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = (ix, pi);
+        // Open while the agent is working in it, folded once it is done;
+        // a click overrides either way.
+        let open = self.log_open.get(&key).copied().unwrap_or(running);
+        let tools: Vec<&ToolInvocation> = bixes
+            .iter()
+            .filter_map(|&b| match &blocks[b] {
+                Block::Tool(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        let failed = tools.iter().filter(|t| t.is_error).count();
+        let (added, removed) = tools
+            .iter()
+            .filter_map(|t| edit_stats(t))
+            .fold((0, 0), |(a, r), (x, y)| (a + x, r + y));
+        let label: SharedString = match (running, duration) {
+            (true, _) => match self
+                .turn_started
+                .map(|t| t.elapsed())
+                .filter(|d| d.as_secs() >= 1)
+            {
+                Some(d) => format!("Working for {}", human_duration(d)).into(),
+                None => "Working…".into(),
+            },
+            (false, Some(d)) => format!("Worked for {}", human_duration(d)).into(),
+            (false, None) => "Worked".into(),
+        };
+        let summary = summarize(&tools);
+        let meta = if summary.is_empty() {
+            String::new()
+        } else {
+            format!(" · {summary}")
+        };
+
+        let mut log =
+            div().flex().flex_col().child(
+                div()
+                    .id(ElementId::Name(format!("log-{ix}-{pi}").into()))
+                    .flex()
+                    .items_center()
+                    .gap(u(6.))
+                    .h(u(26.))
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::TEXT_2))
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(rgb(theme::TEXT)))
+                    .child(if running {
+                        spinner(
+                            ElementId::Name(format!("log-spin-{ix}-{pi}").into()),
+                            12.,
+                            theme::TEXT_2,
+                        )
+                    } else {
+                        icon(
+                            if open {
+                                Icon::ChevronDown
+                            } else {
+                                Icon::ChevronRight
+                            },
+                            12.,
+                            theme::DIM,
+                        )
+                    })
+                    .child(if running {
+                        working_label(format!("log-label-{ix}-{pi}"), label)
+                    } else {
+                        div().flex_none().child(label).into_any_element()
+                    })
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_color(rgb(theme::DIM))
+                                .child(meta),
+                        ),
+                    )
+                    .when(added + removed > 0, |d| d.child(diff_stat(added, removed)))
+                    .when(failed > 0, |d| {
+                        d.child(div().flex_none().text_color(rgb(theme::TEXT)).child(
+                            if failed == 1 {
+                                "· a step failed".to_string()
+                            } else {
+                                format!("· {failed} steps failed")
+                            },
+                        ))
+                    })
+                    .on_click(cx.listener(move |c, _, _, cx| {
+                        c.log_open.insert(key, !open);
+                        cx.notify();
+                    })),
+            );
+        if open {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap(u(2.))
+                .ml(u(5.5))
+                .pl(u(12.))
+                .border_l_1()
+                .border_color(rgba(theme::HAIRLINE));
+            // Only the newest plan in the reply opens by itself.
+            let last_plan = blocks
+                .iter()
+                .rposition(|b| matches!(b, Block::Tool(t) if plan_items(t).is_some()));
+            for &bix in bixes {
+                list = list.child(match &blocks[bix] {
+                    Block::Tool(t) => self.render_step(t, Some(bix) == last_plan, cx),
+                    Block::Reasoning { text, open } => {
+                        self.render_thought(ix, bix, text, *open, cx)
+                    }
+                    _ => div().into_any_element(),
+                });
+            }
+            log = log.child(fade_in(
+                format!("log-body-{ix}-{pi}"),
+                list.into_any_element(),
+            ));
+        }
+        log.into_any_element()
+    }
+
+    fn render_thought(
+        &mut self,
+        ix: usize,
+        bix: usize,
+        text: &str,
+        streaming: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = format!("r{ix}:{bix}");
+        let expanded = self.expanded.contains(&key);
+        let k = key.clone();
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(ElementId::Name(key.clone().into()))
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(26.))
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::DIM))
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(rgb(theme::TEXT_2)))
+                    .child(if streaming {
+                        working_label(format!("think-{key}"), "Thinking…".into())
+                    } else {
+                        div().child("Thought").into_any_element()
+                    })
+                    .on_click(cx.listener(move |c, _, _, cx| {
+                        if !c.expanded.remove(&k) {
+                            c.expanded.insert(k.clone());
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(expanded, |d| {
+                d.child(
+                    div()
+                        .pb(u(6.))
+                        .text_size(u(12.))
+                        .text_color(rgb(theme::DIM))
+                        .child(text.to_string()),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_step(
+        &mut self,
+        t: &ToolInvocation,
+        last_plan: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = t.id.0.to_string();
+        let running = t.is_open();
+        let kind = tool_kind(&t.name);
+        let plan = plan_items(t);
+        // The latest plan in a reply is open unless closed by hand; every
+        // other step opens on a click.
+        let expanded = self.expanded.contains(&key)
+            || (last_plan && plan.is_some() && !self.collapsed.contains(&key));
+        let stats = edit_stats(t);
+        // Whether there is anything to open, decided without building it:
+        // this runs every frame while a spinner turns.
+        let has_output = match &t.result {
+            None => !t.progress.trim().is_empty(),
+            Some(ToolOutput::Terminal { text, .. })
+            | Some(ToolOutput::Text(text))
+            | Some(ToolOutput::FileExcerpt { text, .. }) => !text.trim().is_empty(),
+            Some(ToolOutput::Diff { unified, .. }) => !unified.trim().is_empty(),
+            Some(ToolOutput::Structured(_)) => true,
+            Some(ToolOutput::Truncated { preview, .. }) => !preview.trim().is_empty(),
+        };
+        let has_body = plan.is_some() || kind == Kind::Command || stats.is_some() || has_output;
+        // A command that is still running shows its latest output unasked.
+        let live_tail = running && kind == Kind::Command && has_output && !expanded;
+        let body = || -> (Option<String>, bool) {
+            // An edit reads best as the change itself, whatever the tool said.
+            if let Some(change) = (kind == Kind::Edit).then(|| edit_diff(t)).flatten() {
+                return (Some(change), true);
+            }
+            match &t.result {
+                None => (Some(t.progress.clone()), false),
+                Some(ToolOutput::Terminal { text, .. }) | Some(ToolOutput::Text(text)) => {
+                    (Some(text.clone()), false)
+                }
+                Some(ToolOutput::FileExcerpt { text, .. }) => (Some(text.clone()), false),
+                Some(ToolOutput::Diff { unified, .. }) => (Some(unified.clone()), true),
+                Some(ToolOutput::Structured(v)) => (
+                    Some(serde_json::to_string_pretty(v).unwrap_or_default()),
+                    false,
+                ),
+                Some(ToolOutput::Truncated { preview, .. }) => (Some(preview.clone()), false),
+            }
+        };
+        let (verb, target) = step_phrase(t, running, &self.cwd);
+        let took = self
+            .tool_times
+            .get(&key)
+            .map(|(start, end)| end.unwrap_or_else(|| start.elapsed()));
+        // Held up on the card above the composer.
+        let held = running && self.asks.iter().any(|a| a.tool_use() == Some(&t.id));
+        let k = key.clone();
+        let row = div()
+            .id(ElementId::Name(format!("step-{key}").into()))
+            .flex()
+            .items_center()
+            .gap(u(8.))
+            .h(u(26.))
+            .px(u(4.))
+            .text_size(u(12.))
+            .when(has_body, |d| {
+                d.cursor_pointer().hover(|s| s.bg(rgb(theme::ROW_HOVER)))
+            })
+            .rounded(u(6.))
+            .child(if held {
+                icon(Icon::Info, 13., theme::TEXT)
+            } else if running {
+                spinner(
+                    ElementId::Name(format!("spin-{key}").into()),
+                    12.,
+                    theme::TEXT_2,
+                )
+            } else {
+                icon(
+                    tool_icon(&t.name),
+                    13.,
+                    if t.is_error { theme::TEXT } else { theme::DIM },
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(if running { theme::TEXT } else { theme::TEXT_2 }))
+                    .child(verb),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    div()
+                        .w_full()
+                        .truncate()
+                        .font_family(theme::MONO)
+                        .text_size(u(11.5))
+                        .text_color(rgb(if running { theme::TEXT_2 } else { theme::DIM }))
+                        .child(target),
+                ),
+            )
+            .when_some(stats.filter(|(a, r)| a + r > 0), |d, (a, r)| {
+                d.child(diff_stat(a, r))
+            })
+            .when(t.is_error, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(theme::TEXT))
+                        .child("failed"),
+                )
+            })
+            // Seconds count up while it runs; afterwards only slow steps
+            // say how long they took.
+            .when(held, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(theme::TEXT))
+                        .child("waiting for you"),
+                )
+            })
+            .when_some(
+                took.filter(|d| !held && (running || d.as_millis() >= 1000)),
+                |d, took| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .font_family(theme::MONO)
+                            .text_size(u(11.))
+                            .text_color(rgb(theme::DIM))
+                            .child(step_duration(took)),
+                    )
+                },
+            )
+            .when(has_body, |d| {
+                d.child(icon(
+                    if expanded {
+                        Icon::ChevronDown
+                    } else {
+                        Icon::ChevronRight
+                    },
+                    11.,
+                    theme::DIM,
+                ))
+            })
+            .on_click(cx.listener(move |c, _, _, cx| {
+                if expanded {
+                    c.expanded.remove(&k);
+                    c.collapsed.insert(k.clone());
+                } else {
+                    c.expanded.insert(k.clone());
+                    c.collapsed.remove(&k);
+                }
+                cx.notify();
+            }));
+
+        let detail: Option<AnyElement> = if !expanded {
+            live_tail.then(|| render_output(&body().0.unwrap_or_default(), false, 6))
+        } else if let Some(items) = plan {
+            Some(render_plan(&items))
+        } else if kind == Kind::Command {
+            // A command reads like a terminal: the prompt line, then what it
+            // printed.
+            let command = t
+                .input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&t.title)
+                .to_string();
+            Some(render_command(
+                &command,
+                body().0.as_deref().unwrap_or(""),
+                t.is_error,
+                running,
+            ))
+        } else {
+            let (b, diff) = body();
+            b.filter(|b| !b.trim().is_empty())
+                .map(|b| render_output(&b, diff, 40))
+        };
+        div()
+            .flex()
+            .flex_col()
+            .child(row)
+            .when_some(detail, |d, detail| {
+                d.child(fade_in(format!("detail-{key}-{expanded}"), detail))
+            })
+            .into_any_element()
+    }
+
+    /// After a turn, the files it changed: one row each with its +/−, a
+    /// click shows every change made to that file.
+    fn render_changed_files(
+        &mut self,
+        ix: usize,
+        blocks: &[Block],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let files = changed_files(blocks, &self.cwd);
+        if files.is_empty() {
+            return None;
+        }
+        let (added, removed) = files
+            .iter()
+            .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .rounded(u(10.))
+            .border_1()
+            .border_color(rgba(theme::INPUT_EDGE))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(32.))
+                    .px(u(10.))
+                    .bg(rgb(theme::RAISED))
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::TEXT_2))
+                    .child(icon(Icon::Files, 13., theme::DIM))
+                    .child(div().flex_1().child(if files.len() == 1 {
+                        "1 file changed".to_string()
+                    } else {
+                        format!("{} files changed", files.len())
+                    }))
+                    .child(diff_stat(added, removed)),
+            );
+        for f in files {
+            let key = format!("cf-{ix}-{}", f.path);
+            let open = self.expanded.contains(&key);
+            let k = key.clone();
+            let (dir, name) = match f.path.rfind('/') {
+                Some(cut) => (f.path[..=cut].to_string(), f.path[cut + 1..].to_string()),
+                None => (String::new(), f.path.clone()),
+            };
+            card = card.child(
+                div()
+                    .id(ElementId::Name(key.clone().into()))
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(30.))
+                    .px(u(10.))
+                    .border_t_1()
+                    .border_color(rgba(theme::HAIRLINE))
+                    .text_size(u(12.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::ROW_HOVER)))
+                    .child(icon(Icon::Pencil, 12., theme::DIM))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(theme::MONO)
+                            .text_size(u(11.5))
+                            .child(div().flex_none().text_color(rgb(theme::TEXT)).child(name))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .pl(u(8.))
+                                    .text_color(rgb(theme::DIM))
+                                    .child(dir),
+                            ),
+                    )
+                    .child(diff_stat(f.added, f.removed))
+                    .child(icon(
+                        if open {
+                            Icon::ChevronDown
+                        } else {
+                            Icon::ChevronRight
+                        },
+                        11.,
+                        theme::DIM,
+                    ))
+                    .on_click(cx.listener(move |c, _, _, cx| {
+                        if !c.expanded.remove(&k) {
+                            c.expanded.insert(k.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+            if open {
+                card = card.child(fade_in(
+                    format!("{key}-diff"),
+                    div()
+                        .px(u(8.))
+                        .child(render_output(&f.diff(blocks), true, 200))
+                        .into_any_element(),
+                ));
+            }
+        }
+        Some(card.into_any_element())
+    }
+
+    /// Attached files as a row: images as thumbnails, everything else as a
+    /// named chip. In the composer each has a × to take it off; in a sent
+    /// message a click opens it.
+    fn render_attachments(
+        &self,
+        key: &str,
+        files: &[PathBuf],
+        removable: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .gap(u(6.))
+            .when(!removable, |d| d.justify_end());
+        for (i, path) in files.iter().enumerate() {
+            let id = ElementId::Name(format!("att-{key}-{i}").into());
+            let group = SharedString::from(format!("att-{key}-{i}"));
+            let p = path.clone();
+            let tile = if is_image(path) {
+                let size = if removable { 56. } else { 140. };
+                div().size(u(size)).child(
+                    img(path.clone())
+                        .size_full()
+                        .rounded(u(10.))
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+            } else {
+                let dir = path.is_dir();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(6.))
+                    .h(u(32.))
+                    .pl(u(9.))
+                    .pr(u(if removable { 26. } else { 11. }))
+                    .max_w(u(260.))
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::TEXT_2))
+                    .child(icon(
+                        if dir { Icon::Folder } else { Icon::File },
+                        13.,
+                        theme::DIM,
+                    ))
+                    .child(div().min_w_0().truncate().child(file_name(path)))
+            };
+            let tile = tile
+                .id(id)
+                .relative()
+                .group(group.clone())
+                .rounded(u(10.))
+                .bg(rgb(theme::SURFACE))
+                .border_1()
+                .border_color(rgba(theme::INPUT_EDGE))
+                .when(!removable, |d| {
+                    d.cursor_pointer()
+                        .hover(|s| s.border_color(rgba(0xffffff40)))
+                        .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&p)))
+                });
+            let tile = if removable {
+                let p = path.clone();
+                tile.child(
+                    div()
+                        .id(ElementId::Name(format!("detach-{key}-{i}").into()))
+                        .absolute()
+                        .top(u(4.))
+                        .right(u(4.))
+                        .size(u(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgba(0x000000c0))
+                        .border_1()
+                        .border_color(rgba(theme::INPUT_EDGE))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
+                        .child(icon(Icon::Close, 10., theme::TEXT))
+                        .on_click(cx.listener(move |c, _, _, cx| c.detach(&p, cx))),
+                )
+            } else {
+                tile
+            };
+            row = row.child(tile);
+        }
+        row.into_any_element()
+    }
+
+    /// Files matching what follows `@`, above the composer. ↑↓ choose,
+    /// Enter or Tab insert, Escape closes.
+    fn render_mentions(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let m = self.mention.as_ref().filter(|m| !m.matches.is_empty())?;
+        let mut list = div()
+            .id("mentions")
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(relative(1.))
+            .mb(u(6.))
+            .p(u(4.))
+            .flex()
+            .flex_col()
+            .rounded(u(12.))
+            .bg(rgb(theme::RAISED))
+            .border_1()
+            .border_color(rgba(theme::INPUT_EDGE))
+            .shadow_lg()
+            .occlude();
+        for (i, path) in m.matches.iter().enumerate() {
+            let dir = path.ends_with('/');
+            let trimmed = path.trim_end_matches('/');
+            let (parent, name) = match trimmed.rfind('/') {
+                Some(cut) => (&trimmed[..=cut], &trimmed[cut + 1..]),
+                None => ("", trimmed),
+            };
+            let selected = i == m.selected;
+            let start = m.start;
+            let chosen = path.clone();
+            list = list.child(
+                div()
+                    .id(ElementId::NamedInteger("mention".into(), i as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .h(u(28.))
+                    .px(u(8.))
+                    .rounded(u(8.))
+                    .text_size(u(12.5))
+                    .cursor_pointer()
+                    .when(selected, |d| d.bg(rgb(theme::SURFACE)))
+                    .hover(|s| s.bg(rgb(theme::SURFACE)))
+                    .child(icon(
+                        if dir { Icon::Folder } else { Icon::File },
+                        13.,
+                        theme::DIM,
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(theme::TEXT))
+                            .child(format!("{name}{}", if dir { "/" } else { "" })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(theme::DIM))
+                            .child(parent.to_string()),
+                    )
+                    .on_click(cx.listener(move |c, _, window, cx| {
+                        c.mention = None;
+                        let path = chosen.clone();
+                        c.composer.update(cx, |f, cx| {
+                            f.popup = false;
+                            f.complete_mention(start, &path, cx);
+                        });
+                        window.focus(&c.composer.read(cx).focus);
+                        cx.notify();
+                    })),
+            );
+        }
+        Some(list.into_any_element())
+    }
+
+    fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let working = self.busy();
+        let has_text =
+            !self.composer.read(cx).text().trim().is_empty() || !self.attachments.is_empty();
+        // Stop only while running with nothing typed; typing while it runs
+        // turns the button back into send, which queues.
+        let stop = working && !has_text;
+        let can_send = stop || has_text;
+        let chip = |id: &'static str| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(u(6.))
+                .h(u(28.))
+                .px(u(9.))
+                .rounded(u(8.))
+                .text_size(u(12.))
+                .cursor_pointer()
+        };
+
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap(u(4.))
+            .child(
+                chip("attach")
+                    .px(u(0.))
+                    .w(u(28.))
+                    .justify_center()
+                    .hover(|s| s.bg(rgb(theme::SURFACE)))
+                    .child(icon(Icon::Plus, 14., theme::TEXT_2))
+                    .on_click(cx.listener(|c, _, _, cx| c.pick_files(cx))),
+            )
+            .child(
+                chip("agent")
+                    .text_color(rgb(theme::TEXT_2))
+                    .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+                    .child(icon(Icon::agent(self.agent.as_str()), 13., theme::TEXT_2))
+                    .child(self.agent_name())
+                    .child(icon(Icon::ChevronDown, 11., theme::DIM))
+                    .on_click(cx.listener(|c, _, _, cx| {
+                        c.switching = !c.switching;
+                        cx.notify();
+                    })),
+            )
+            .child({
+                let (label, loud) = match self.mode {
+                    PermissionMode::Yolo => ("Full access", true),
+                    PermissionMode::Edit => ("Auto-accept edits", false),
+                    _ => ("Ask before edits", false),
+                };
+                chip("mode")
+                    .when(loud, |d| {
+                        d.bg(rgb(theme::TEXT)).text_color(rgb(theme::PANE))
+                    })
+                    .when(!loud, |d| {
+                        d.text_color(rgb(theme::TEXT_2))
+                            .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+                    })
+                    .child(label)
+                    .on_click(cx.listener(|c, _, _, cx| c.toggle_mode(cx)))
+            })
+            .child(div().flex_1())
+            .when_some(
+                (self.transcript.usage.input + self.transcript.usage.output > 0)
+                    .then_some(self.transcript.usage),
+                |d, u_| {
+                    let cost = u_
+                        .cost_usd
+                        .map(|c| format!(" · ${c:.2}"))
+                        .unwrap_or_default();
+                    d.child(
+                        div()
+                            .mr(u(6.))
+                            .text_size(u(11.))
+                            .text_color(rgb(theme::DIM))
+                            .child(format!(
+                                "{} tokens{cost}",
+                                compact_count(u_.input + u_.output + u_.cache_read)
+                            )),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .id("send")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(u(30.))
+                    .rounded(u(15.))
+                    .when(can_send, |d| {
+                        d.bg(rgb(theme::TEXT))
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                    })
+                    .when(!can_send, |d| d.bg(rgb(theme::SURFACE)))
+                    .child(icon(
+                        if stop { Icon::Stop } else { Icon::ArrowUp },
+                        15.,
+                        if can_send { theme::PANE } else { theme::DIM },
+                    ))
+                    .on_click(cx.listener(move |c, _, _, cx| {
+                        let empty = c.composer.read(cx).text().trim().is_empty()
+                            && c.attachments.is_empty();
+                        if c.busy() && empty {
+                            c.interrupt(cx);
+                        } else {
+                            c.submit(false, cx);
+                        }
+                    })),
+            );
+
+        let mut stack = div().w_full().flex().flex_col().gap(u(8.));
+        if self.switching {
+            stack = stack.child(self.render_switcher(cx));
+        }
+        // Queued messages, oldest first: those already with the agent (it
+        // reads them when its current step ends), then those deck holds.
+        let rows = self
+            .inflight
+            .iter()
+            .map(|(_, q)| (q, true))
+            .chain(self.queued.iter().map(|q| (q, false)))
+            .enumerate()
+            .map(|(i, (q, with_agent))| (i, q.clone(), with_agent))
+            .collect::<Vec<_>>();
+        for (i, q, with_agent) in rows {
+            let what = match (q.text.is_empty(), q.attachments.len()) {
+                (_, 0) => q.text.clone(),
+                (true, n) => format!("{n} attachment{}", if n == 1 { "" } else { "s" }),
+                (false, n) => format!(
+                    "{} · {n} attachment{}",
+                    q.text,
+                    if n == 1 { "" } else { "s" }
+                ),
+            };
+            let deck_ix = i.saturating_sub(self.inflight.len());
+            stack = stack.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .pl(u(12.))
+                    .pr(u(if with_agent { 12. } else { 4. }))
+                    .h(u(30.))
+                    .rounded(u(10.))
+                    .border_1()
+                    .border_color(rgba(theme::HAIRLINE))
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::TEXT_2))
+                    .child(icon(Icon::ArrowUp, 12., theme::DIM))
+                    .child(div().text_color(rgb(theme::DIM)).child(if q.now {
+                        "Sending now"
+                    } else {
+                        "Queued"
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().w_full().truncate().child(what)),
+                    )
+                    // Already handed over: the agent cannot give it back, so
+                    // there is nothing to cancel; it reads it next.
+                    .when(with_agent, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(u(11.))
+                                .text_color(rgb(theme::DIM))
+                                .child("after this step"),
+                        )
+                    })
+                    .when(!with_agent, |d| {
+                        d.child(
+                            crate::workspace::icon_button(
+                                ElementId::NamedInteger("unqueue".into(), deck_ix as u64),
+                                Icon::Close,
+                            )
+                            .size(u(22.))
+                            .on_click(cx.listener(
+                                move |c, _, _, cx| {
+                                    if deck_ix < c.queued.len() {
+                                        c.queued.remove(deck_ix);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    }),
+            );
+        }
+        if let Some(e) = self.error.clone() {
+            stack = stack.child(
+                div()
+                    .px(u(12.))
+                    .py(u(8.))
+                    .rounded(u(10.))
+                    .border_1()
+                    .border_color(rgba(0xffffff30))
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::TEXT))
+                    .child(e),
+            );
+        }
+        if let Some(card) = self.render_ask(cx) {
+            stack = stack.child(card);
+        }
+        let focus = self.composer.read(cx).focus.clone();
+        let focused = focus.contains_focused(window, cx);
+        let hint = if !self.asks.is_empty() {
+            "↑↓ choose · ⏎ confirm · esc no · or type a reply"
+        } else if working && self.queues_input() {
+            "esc to stop · ⏎ queue for after this step · ⌘⏎ send now"
+        } else if working {
+            "esc to stop · messages you send now wait for the turn to end"
+        } else if self.mention.as_ref().is_some_and(|m| !m.matches.is_empty()) {
+            "↑↓ choose · ⏎ or ⇥ insert · esc close"
+        } else {
+            "⏎ send · ⇧⏎ new line · ↑ last message · @ file · ⌘V image"
+        };
+        // Concentric: 8px chips sit 8px inside the composer's 16px card.
+        stack
+            .child(
+                div()
+                    .id("composer")
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .gap(u(4.))
+                    .p(u(8.))
+                    .rounded(u(16.))
+                    .bg(rgb(theme::RAISED))
+                    .border_1()
+                    .border_color(rgba(if focused {
+                        theme::INPUT_EDGE
+                    } else {
+                        theme::HAIRLINE
+                    }))
+                    .cursor_text()
+                    // A click anywhere on the card, not just on the text, types.
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, _| {
+                        window.focus(&focus)
+                    })
+                    .when(!self.attachments.is_empty(), |d| {
+                        d.child(div().pt(u(2.)).px(u(2.)).child(self.render_attachments(
+                            "draft",
+                            &self.attachments,
+                            true,
+                            cx,
+                        )))
+                    })
+                    .child(self.composer.clone())
+                    .child(toolbar)
+                    .children(self.render_mentions(cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_center()
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::DIM))
+                    .child(hint),
+            )
+            .into_any_element()
+    }
+
+    fn render_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div().flex().flex_wrap().gap(u(6.));
+        for entry in self.env.registry.all() {
+            let id = entry.id();
+            let ready = entry.is_ready();
+            let current = id == self.agent;
+            let to = id.clone();
+            row = row.child(
+                div()
+                    .id(ElementId::Name(format!("switch-{}", id.as_str()).into()))
+                    .flex()
+                    .items_center()
+                    .gap(u(6.))
+                    .h(u(30.))
+                    .px(u(10.))
+                    .rounded(u(9.))
+                    .text_size(u(12.))
+                    .border_1()
+                    .when(current, |d| {
+                        d.bg(rgb(theme::SURFACE))
+                            .border_color(rgba(0xffffff30))
+                            .text_color(rgb(theme::TEXT))
+                    })
+                    .when(!current, |d| d.border_color(rgba(theme::HAIRLINE)))
+                    .when(!current && ready, |d| {
+                        d.text_color(rgb(theme::TEXT_2))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::SURFACE)))
+                            .on_click(
+                                cx.listener(move |c, _, _, cx| c.switch_agent(to.clone(), cx)),
+                            )
+                    })
+                    .when(!ready, |d| d.text_color(rgb(theme::DIM)))
+                    .child(icon(
+                        Icon::agent(id.as_str()),
+                        13.,
+                        if ready { theme::TEXT_2 } else { theme::DIM },
+                    ))
+                    .child(entry.display_name().to_string())
+                    .when(!ready, |d| {
+                        d.child(div().text_color(rgb(theme::DIM)).child("not set up"))
+                    }),
+            );
+        }
+        row.into_any_element()
+    }
+
+    /// A new thread: the composer is the centre of the screen, with a few
+    /// things worth asking underneath.
+    fn render_empty(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let mut starters = div().flex().flex_col().gap(u(6.));
+        for (i, (title, prompt)) in [
+            (
+                "Run it",
+                "Start the dev server in a terminal here and open it in the browser",
+            ),
+            ("Explain it", "Explain how this project is put together"),
+            ("Test it", "Run the tests and fix what fails"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            starters = starters.child(
+                div()
+                    .id(ElementId::NamedInteger("starter".into(), i as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(10.))
+                    .px(u(12.))
+                    .h(u(38.))
+                    .rounded(u(10.))
+                    .border_1()
+                    .border_color(rgba(theme::HAIRLINE))
+                    .text_size(u(13.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::RAISED)))
+                    .child(
+                        div()
+                            .w(u(72.))
+                            .flex_none()
+                            .text_color(rgb(theme::TEXT))
+                            .child(title),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            div()
+                                .w_full()
+                                .truncate()
+                                .text_color(rgb(theme::DIM))
+                                .child(prompt),
+                        ),
+                    )
+                    .on_click(cx.listener(move |c, _, _, cx| c.send(prompt.to_string(), cx))),
+            );
+        }
+        div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .child(Self::column(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(24.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(u(6.))
+                            .child(
+                                div()
+                                    .text_size(u(22.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(theme::TEXT))
+                                    .child("What should we work on?"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(u(13.))
+                                    .text_color(rgb(theme::TEXT_2))
+                                    .child(format!(
+                                "{} works in {} and can open terminals and pages in this window.",
+                                self.agent_name(),
+                                short_path(&self.cwd)
+                            )),
+                            ),
+                    )
+                    .child(self.render_composer(window, cx))
+                    .child(starters),
+            ))
+            .into_any_element()
+    }
+
+    /// A paragraph's text with its inline styles: inline code in the mono
+    /// face, links underlined and clickable (they open in deck's browser).
+    fn rich_text(
+        &self,
+        id: String,
+        spans: &Spans,
+        color: u32,
+        weight: FontWeight,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let text = StyledText::new(spans.text.clone()).with_runs(text_runs(spans, color, weight));
+        if spans.links.is_empty() {
+            return text.into_any_element();
+        }
+        let ranges: Vec<std::ops::Range<usize>> =
+            spans.links.iter().map(|(r, _)| r.clone()).collect();
+        let urls: Vec<String> = spans.links.iter().map(|(_, u)| u.clone()).collect();
+        let chat = cx.entity().downgrade();
+        InteractiveText::new(ElementId::Name(id.into()), text)
+            .on_click(ranges, move |i, _, cx| {
+                if let Some(url) = urls.get(i).cloned() {
+                    let _ = chat.update(cx, |_, cx| cx.emit(ChatEvent::OpenUrl(url)));
+                }
+            })
+            .into_any_element()
+    }
+
+    /// Markdown blocks as elements: monochrome, one text layout per paragraph.
+    fn render_doc(&mut self, key: &str, doc: &markdown::Doc, cx: &mut Context<Self>) -> AnyElement {
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(u(10.))
+            .text_color(rgb(theme::TEXT));
+        for (bi, block) in doc.blocks.iter().enumerate() {
+            let id = format!("md-{key}-{bi}");
+            col = col.child(match block {
+                MdBlock::Paragraph(s) => div()
+                    .child(self.rich_text(id, s, theme::TEXT, FontWeight::NORMAL, cx))
+                    .into_any_element(),
+                MdBlock::Heading { level, spans } => div()
+                    .pt(u(if *level <= 2 { 8. } else { 4. }))
+                    .text_size(u(match level {
+                        1 => 19.,
+                        2 => 16.5,
+                        _ => 14.5,
+                    }))
+                    .line_height(u(match level {
+                        1 => 26.,
+                        2 => 23.,
+                        _ => 21.,
+                    }))
+                    .child(self.rich_text(id, spans, theme::TEXT, FontWeight::SEMIBOLD, cx))
+                    .into_any_element(),
+                MdBlock::Code { lang, code, open } => self.render_code(&id, lang, code, *open, cx),
+                MdBlock::List { items } => {
+                    let mut l = div().flex().flex_col().gap(u(4.));
+                    for (ii, item) in items.iter().enumerate() {
+                        let task = item.marker == "☐" || item.marker == "☑";
+                        let ordered = item.marker.ends_with('.');
+                        l = l.child(
+                            div()
+                                .flex()
+                                .gap(u(8.))
+                                .pl(u(item.depth as f32 * 18.))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .min_w(u(if ordered { 18. } else { 12. }))
+                                        .when(ordered, |d| d.flex().justify_end())
+                                        .text_color(rgb(if task {
+                                            theme::TEXT_2
+                                        } else {
+                                            theme::DIM
+                                        }))
+                                        .child(item.marker.clone()),
+                                )
+                                .child(div().flex_1().min_w_0().child(self.rich_text(
+                                    format!("{id}-{ii}"),
+                                    &item.spans,
+                                    if item.marker == "☑" {
+                                        theme::TEXT_2
+                                    } else {
+                                        theme::TEXT
+                                    },
+                                    FontWeight::NORMAL,
+                                    cx,
+                                ))),
+                        );
+                    }
+                    l.into_any_element()
+                }
+                MdBlock::Quote(s) => div()
+                    .pl(u(12.))
+                    .border_l_2()
+                    .border_color(rgb(theme::SURFACE_HOVER))
+                    .child(self.rich_text(id, s, theme::TEXT_2, FontWeight::NORMAL, cx))
+                    .into_any_element(),
+                MdBlock::Rule => div()
+                    .my(u(4.))
+                    .h(px(1.))
+                    .bg(rgba(theme::INPUT_EDGE))
+                    .into_any_element(),
+                MdBlock::Table { head, rows } => {
+                    let mut t = div()
+                        .flex()
+                        .flex_col()
+                        .rounded(u(8.))
+                        .border_1()
+                        .border_color(rgba(theme::INPUT_EDGE))
+                        .overflow_hidden()
+                        .text_size(u(12.5))
+                        .line_height(u(19.));
+                    for (ri, cells) in std::iter::once(head).chain(rows.iter()).enumerate() {
+                        let mut r = div()
+                            .flex()
+                            .gap(u(12.))
+                            .px(u(10.))
+                            .py(u(6.))
+                            .when(ri == 0, |d| d.bg(rgb(theme::RAISED)))
+                            .when(ri > 0, |d| {
+                                d.border_t_1().border_color(rgba(theme::HAIRLINE))
+                            });
+                        for (ci, c) in cells.iter().enumerate() {
+                            let weight = if ri == 0 {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::NORMAL
+                            };
+                            r = r.child(div().flex_1().min_w_0().child(self.rich_text(
+                                format!("{id}-{ri}-{ci}"),
+                                c,
+                                theme::TEXT,
+                                weight,
+                                cx,
+                            )));
+                        }
+                        t = t.child(r);
+                    }
+                    t.into_any_element()
+                }
+            });
+        }
+        col.into_any_element()
+    }
+
+    /// A fenced code block: lines never wrap (the block scrolls sideways
+    /// instead), with its language and a Copy button on top.
+    fn render_code(
+        &mut self,
+        id: &str,
+        lang: &str,
+        code: &str,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let copied = self.copied.as_deref() == Some(id);
+        let group = SharedString::from(format!("{id}-g"));
+        let key = id.to_string();
+        let text = code.to_string();
+        div()
+            .group(group.clone())
+            .flex()
+            .flex_col()
+            .rounded(u(10.))
+            .bg(rgb(theme::RAISED))
+            .border_1()
+            .border_color(rgba(theme::HAIRLINE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h(u(28.))
+                    .pl(u(12.))
+                    .pr(u(4.))
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::DIM))
+                    .child(div().flex_1().child(if lang.is_empty() {
+                        "code".to_string()
+                    } else {
+                        lang.to_string()
+                    }))
+                    .when(!open, |d| {
+                        d.child(
+                            div()
+                                .id(ElementId::Name(format!("{id}-copy").into()))
+                                .flex()
+                                .items_center()
+                                .gap(u(5.))
+                                .h(u(22.))
+                                .px(u(6.))
+                                .rounded(u(6.))
+                                .opacity(if copied { 1. } else { 0. })
+                                .group_hover(group, |s| s.opacity(1.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+                                .child(icon(
+                                    if copied { Icon::Check } else { Icon::Copy },
+                                    11.,
+                                    theme::DIM,
+                                ))
+                                .child(if copied { "Copied" } else { "Copy" })
+                                .on_click(cx.listener(move |c, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        text.clone(),
+                                    ));
+                                    c.copied = Some(key.clone());
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name(format!("{id}-scroll").into()))
+                    .overflow_x_scroll()
+                    .px(u(12.))
+                    .pb(u(10.))
+                    .font_family(theme::MONO)
+                    .text_size(u(12.))
+                    .line_height(u(18.))
+                    .text_color(rgb(theme::TEXT))
+                    .child(div().whitespace_nowrap().child(code.to_string())),
+            )
+            .into_any_element()
+    }
+}
+
+/// How a run of tool calls and thinking is laid out in a message.
+enum Part {
+    One(usize),
+    Work(Vec<usize>),
+}
+
+/// The width readable text never exceeds.
+const COLUMN: f32 = 760.;
+
+fn message_text(msg: &agent_core::Message) -> String {
+    msg.blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// A label that breathes while the agent works on it.
+fn working_label(id: String, label: SharedString) -> AnyElement {
+    div()
+        .flex_none()
+        .child(label)
+        .with_animation(
+            ElementId::Name(id.into()),
+            Animation::new(Duration::from_millis(1400))
+                .repeat()
+                .with_easing(pulsating_between(0.45, 1.)),
+            |d, t| d.opacity(t),
+        )
+        .into_any_element()
+}
+
+/// `+12 −3`, additions bright and removals dim, in the mono face so the
+/// numbers line up down a log.
+fn diff_stat(added: usize, removed: usize) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .gap(u(4.))
+        .font_family(theme::MONO)
+        .text_size(u(11.))
+        .when(added > 0, |d| {
+            d.child(
+                div()
+                    .text_color(rgb(theme::TEXT))
+                    .child(format!("+{added}")),
+            )
+        })
+        .when(removed > 0, |d| {
+            d.child(
+                div()
+                    .text_color(rgb(theme::DIM))
+                    .child(format!("−{removed}")),
+            )
+        })
+        .into_any_element()
+}
+
+/// Lines added and removed by an edit, from its diff when it reported one,
+/// else from what it was asked to write.
+fn edit_stats(t: &ToolInvocation) -> Option<(usize, usize)> {
+    if tool_kind(&t.name) != Kind::Edit {
+        return None;
+    }
+    if let Some(ToolOutput::Diff { unified, .. }) = &t.result {
+        let added = unified
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count();
+        let removed = unified
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .count();
+        return Some((added, removed));
+    }
+    let lines =
+        |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map_or(0, |s| s.lines().count());
+    let i = &t.input;
+    if let Some(edits) = i.get("edits").and_then(|e| e.as_array()) {
+        return Some(edits.iter().fold((0, 0), |(a, r), e| {
+            (
+                a + lines(e.get("new_string")),
+                r + lines(e.get("old_string")),
+            )
+        }));
+    }
+    if i.get("old_string").is_some() || i.get("new_string").is_some() {
+        return Some((lines(i.get("new_string")), lines(i.get("old_string"))));
+    }
+    i.get("content").map(|c| (lines(Some(c)), 0))
+}
+
+/// An edit as a diff, built from the tool's input when it reported none.
+fn edit_diff(t: &ToolInvocation) -> Option<String> {
+    if let Some(ToolOutput::Diff { unified, .. }) = &t.result {
+        return Some(unified.clone());
+    }
+    input_diff(&t.input)
+}
+
+/// The change an edit or write would make, from its input.
+fn input_diff(i: &serde_json::Value) -> Option<String> {
+    let pair =
+        |old: Option<&serde_json::Value>, new: Option<&serde_json::Value>, out: &mut String| {
+            for l in old.and_then(|v| v.as_str()).unwrap_or("").lines() {
+                out.push_str(&format!("-{l}\n"));
+            }
+            for l in new.and_then(|v| v.as_str()).unwrap_or("").lines() {
+                out.push_str(&format!("+{l}\n"));
+            }
+        };
+    let mut out = String::new();
+    if let Some(edits) = i.get("edits").and_then(|e| e.as_array()) {
+        for (n, e) in edits.iter().enumerate() {
+            if n > 0 {
+                out.push_str("@@\n");
+            }
+            pair(e.get("old_string"), e.get("new_string"), &mut out);
+        }
+    } else if i.get("old_string").is_some() || i.get("new_string").is_some() {
+        pair(i.get("old_string"), i.get("new_string"), &mut out);
+    } else if let Some(c) = i.get("content") {
+        pair(None, Some(c), &mut out);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// A path in a tool title, shown relative to the project when inside it.
+fn relative_to(title: &str, cwd: &std::path::Path) -> String {
+    let root = cwd.display().to_string();
+    let short = title.replace(&format!("{root}/"), "");
+    match std::env::var("HOME") {
+        Ok(home) if short.starts_with(&home) => format!("~{}", &short[home.len()..]),
+        _ => short,
+    }
+}
+
+/// 1234 → "1.2k", 1500000 → "1.5M".
+fn compact_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3).replace(".0k", "k"),
+        _ => format!("{:.1}M", n as f64 / 1e6).replace(".0M", "M"),
+    }
+}
+
+/// Text runs for a paragraph: the base face, with bold, italic, struck,
+/// linked and inline-code stretches over it.
+fn text_runs(spans: &Spans, color: u32, weight: FontWeight) -> Vec<TextRun> {
+    let base = |st: markdown::Style| {
+        let mut f = gpui::font(if st.code { theme::MONO } else { theme::UI });
+        f.weight = if st.bold {
+            FontWeight::SEMIBOLD
+        } else {
+            weight
+        };
+        f.style = if st.italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        };
+        f
+    };
+    let run = |len: usize, st: markdown::Style| TextRun {
+        len,
+        font: base(st),
+        color: rgb(if st.link || st.code {
+            theme::TEXT
+        } else {
+            color
+        })
+        .into(),
+        background_color: st.code.then(|| rgb(theme::SURFACE).into()),
+        underline: st.link.then(|| UnderlineStyle {
+            thickness: px(1.),
+            color: Some(rgb(theme::DIM).into()),
+            wavy: false,
+        }),
+        strikethrough: st.strike.then(|| StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(rgb(theme::DIM).into()),
+        }),
+    };
+    let mut out = Vec::new();
+    let mut at = 0;
+    for (r, st) in &spans.runs {
+        if r.start < at || r.end > spans.text.len() {
+            continue;
+        }
+        if r.start > at {
+            out.push(run(r.start - at, markdown::Style::default()));
+        }
+        out.push(run(r.end - r.start, *st));
+        at = r.end;
+    }
+    if at < spans.text.len() {
+        out.push(run(spans.text.len() - at, markdown::Style::default()));
+    }
+    out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Command,
+    Edit,
+    Read,
+    Web,
+    Other,
+}
+
+fn tool_kind(name: &str) -> Kind {
+    let n = name.to_lowercase();
+    // Planning tools mention "write" but touch no file.
+    if n.contains("todo") || n == "task" || n.contains("plan") {
+        return Kind::Other;
+    }
+    if n.contains("bash") || n.contains("shell") || n.contains("exec") || n.contains("command") {
+        Kind::Command
+    } else if n.contains("edit") || n.contains("write") || n.contains("patch") {
+        Kind::Edit
+    } else if n.contains("read")
+        || n.contains("grep")
+        || n.contains("glob")
+        || n == "ls"
+        || n.contains("list")
+    {
+        Kind::Read
+    } else if n.contains("web") || n.contains("fetch") || n.contains("search") {
+        Kind::Web
+    } else {
+        Kind::Other
+    }
+}
+
+/// "Ran 2 commands and edited 3 files": at most two kinds named, commands
+/// and edits first because they changed something; the rest are counted.
+fn summarize(tools: &[&ToolInvocation]) -> String {
+    let count = |k: Kind| tools.iter().filter(|t| tool_kind(&t.name) == k).count();
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let named: Vec<(usize, String)> = [
+        (count(Kind::Command), "ran", "command", "commands"),
+        (count(Kind::Edit), "edited", "file", "files"),
+        (count(Kind::Read), "read", "file", "files"),
+        (count(Kind::Web), "searched the web", "time", "times"),
+    ]
+    .into_iter()
+    .filter(|(n, ..)| *n > 0)
+    .map(|(n, verb, one, many)| (n, format!("{verb} {}", plural(n, one, many))))
+    .collect();
+    let shown: Vec<String> = named.iter().take(2).map(|(_, s)| s.clone()).collect();
+    let rest = tools.len() - named.iter().take(2).map(|(n, _)| n).sum::<usize>();
+    let mut out = shown.join(" and ");
+    if rest > 0 {
+        let other = plural(rest, "other action", "other actions");
+        out = if out.is_empty() {
+            format!("performed {other}")
+        } else {
+            format!("{out}, and {other}")
+        };
+    }
+    let mut chars = out.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => out,
+    }
+}
+
+fn tool_icon(name: &str) -> Icon {
+    let n = name.to_lowercase();
+    if n.contains("todo") || n.contains("plan") {
+        return Icon::ListCheck;
+    }
+    match tool_kind(name) {
+        Kind::Command => Icon::Terminal,
+        Kind::Edit => Icon::Pencil,
+        Kind::Web => Icon::Globe,
+        _ if n.contains("grep") || n.contains("glob") || n.contains("search") => Icon::Search,
+        _ if n == "ls" || n.contains("list") => Icon::Folder,
+        _ => Icon::File,
+    }
+}
+
+/// What a step did, as a verb and its object: "Ran" `cargo test`, "Edited"
+/// `src/chat.rs`. Present tense while it runs.
+fn step_phrase(t: &ToolInvocation, running: bool, cwd: &std::path::Path) -> (&'static str, String) {
+    let n = t.name.to_lowercase();
+    let input = |k: &str| t.input.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let path = || {
+        input("file_path")
+            .or_else(|| input("path"))
+            .or_else(|| input("notebook_path"))
+            .map(|p| relative_to(&p, cwd))
+            .unwrap_or_else(|| relative_to(&t.title, cwd))
+    };
+    let pick = |now: &'static str, done: &'static str| if running { now } else { done };
+    if n.contains("todo") || n.contains("plan") {
+        return (pick("Planning", "Updated the plan"), String::new());
+    }
+    match tool_kind(&t.name) {
+        Kind::Command => (
+            pick("Running", "Ran"),
+            relative_to(&input("command").unwrap_or_else(|| t.title.clone()), cwd),
+        ),
+        Kind::Edit if n.contains("write") || n.contains("create") => {
+            (pick("Writing", "Wrote"), path())
+        }
+        Kind::Edit => (pick("Editing", "Edited"), path()),
+        Kind::Read if n.contains("grep") || n.contains("glob") || n.contains("search") => (
+            pick("Searching", "Searched"),
+            input("pattern").unwrap_or_else(|| t.title.clone()),
+        ),
+        Kind::Read if n == "ls" || n.contains("list") => (pick("Listing", "Listed"), path()),
+        Kind::Read => (pick("Reading", "Read"), path()),
+        Kind::Web if n.contains("fetch") => (
+            pick("Fetching", "Fetched"),
+            input("url").unwrap_or_else(|| t.title.clone()),
+        ),
+        Kind::Web => (
+            pick("Searching the web for", "Searched the web for"),
+            input("query").unwrap_or_else(|| t.title.clone()),
+        ),
+        Kind::Other if n == "task" || n == "agent" => {
+            (pick("Delegating", "Delegated"), t.title.clone())
+        }
+        Kind::Other => ("", t.title.clone()),
+    }
+}
+
+/// "0.8s", "12s", "2m 5s": how long a step ran.
+fn step_duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    match ms {
+        0..=9_999 => format!("{:.1}s", ms as f64 / 1000.),
+        10_000..=59_999 => format!("{}s", ms / 1000),
+        _ => format!("{}m {}s", ms / 60_000, (ms / 1000) % 60),
+    }
+}
+
+/// The checklist in a plan update (Claude's TodoWrite): each item's text
+/// and state.
+fn plan_items(t: &ToolInvocation) -> Option<Vec<(String, PlanState)>> {
+    let todos = t.input.get("todos")?.as_array()?;
+    Some(
+        todos
+            .iter()
+            .filter_map(|todo| {
+                let text = todo.get("content").and_then(|v| v.as_str())?.to_string();
+                let state = match todo.get("status").and_then(|v| v.as_str()) {
+                    Some("completed") => PlanState::Done,
+                    Some("in_progress") => PlanState::Doing,
+                    _ => PlanState::Todo,
+                };
+                Some((text, state))
+            })
+            .collect(),
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlanState {
+    Todo,
+    Doing,
+    Done,
+}
+
+fn render_plan(items: &[(String, PlanState)]) -> AnyElement {
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap(u(2.))
+        .my(u(4.))
+        .pl(u(26.))
+        .text_size(u(12.5));
+    for (text, state) in items {
+        col = col.child(
+            div()
+                .flex()
+                .items_start()
+                .gap(u(8.))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(u(14.))
+                        .text_color(rgb(theme::DIM))
+                        .child(match state {
+                            PlanState::Done => "☑",
+                            PlanState::Doing => "◐",
+                            PlanState::Todo => "☐",
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .when(*state == PlanState::Done, |d| {
+                            d.text_color(rgb(theme::DIM)).line_through()
+                        })
+                        .when(*state == PlanState::Doing, |d| {
+                            d.text_color(rgb(theme::TEXT))
+                                .font_weight(FontWeight::MEDIUM)
+                        })
+                        .when(*state == PlanState::Todo, |d| {
+                            d.text_color(rgb(theme::TEXT_2))
+                        })
+                        .child(text.clone()),
+                ),
+        );
+    }
+    col.into_any_element()
+}
+
+/// What an approval card says the agent wants ("run a command", "edit
+/// src/a.rs") and what it shows of it: the command, or the change.
+fn permission_preview(
+    action: &Action,
+    input: &serde_json::Value,
+    tool: &str,
+    cwd: &std::path::Path,
+) -> (String, Option<AnyElement>) {
+    let diff = || input_diff(input).map(|d| render_output(&d, true, 14));
+    match action {
+        Action::Bash { command, .. } => (
+            "run a command".into(),
+            Some(render_command(command, "", false, true)),
+        ),
+        Action::EditFile { path } => (format!("edit {}", relative_to(path, cwd)), diff()),
+        Action::WriteFile { path } => (format!("write {}", relative_to(path, cwd)), diff()),
+        Action::ReadFile { path } => (format!("read {}", relative_to(path, cwd)), None),
+        Action::Fetch { url } => (format!("fetch {url}"), None),
+        Action::McpCall { server, tool, .. } => (
+            format!("use {tool} from {server}"),
+            Some(render_output(
+                &serde_json::to_string_pretty(input).unwrap_or_default(),
+                false,
+                10,
+            )),
+        ),
+        Action::Other { .. } if tool == "ExitPlanMode" => {
+            let plan = input
+                .get("plan")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            (
+                "start on this plan".into(),
+                Some(render_output(&plan, false, 30)),
+            )
+        }
+        Action::Other { name, .. } => (
+            format!("use {name}"),
+            Some(render_output(
+                &serde_json::to_string_pretty(input).unwrap_or_default(),
+                false,
+                10,
+            )),
+        ),
+    }
+}
+
+/// A command as it would look in a terminal: `$ command`, then its output.
+fn render_command(command: &str, output: &str, failed: bool, running: bool) -> AnyElement {
+    let lines: Vec<&str> = output.lines().collect();
+    let skip = lines.len().saturating_sub(40);
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .my(u(4.))
+        .px(u(10.))
+        .py(u(8.))
+        .rounded(u(8.))
+        .bg(rgb(theme::RAISED))
+        .border_1()
+        .border_color(rgba(if failed { 0xffffff30 } else { theme::HAIRLINE }))
+        .font_family(theme::MONO)
+        .text_size(u(11.5))
+        .line_height(u(17.))
+        .overflow_x_hidden();
+    for (i, line) in command.lines().enumerate() {
+        col = col.child(
+            div()
+                .flex()
+                .gap(u(8.))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(theme::DIM))
+                        .child(if i == 0 { "$" } else { " " }),
+                )
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_color(rgb(theme::TEXT))
+                        .child(line.to_string()),
+                ),
+        );
+    }
+    if skip > 0 {
+        col = col.child(
+            div()
+                .mt(u(4.))
+                .text_color(rgb(theme::DIM))
+                .child(format!("… {skip} earlier lines")),
+        );
+    }
+    for line in &lines[skip..] {
+        col = col.child(
+            div()
+                .whitespace_nowrap()
+                .text_color(rgb(if failed { theme::TEXT } else { theme::TEXT_2 }))
+                .child(line.to_string()),
+        );
+    }
+    if lines.is_empty() && !running {
+        col = col.child(div().text_color(rgb(theme::DIM)).child("(no output)"));
+    }
+    col.into_any_element()
+}
+
+/// Content that eases in as it appears, so opening a log or a step does not
+/// pop.
+fn fade_in(id: String, el: AnyElement) -> AnyElement {
+    div()
+        .child(el)
+        .with_animation(
+            ElementId::Name(id.into()),
+            Animation::new(Duration::from_millis(180)).with_easing(gpui::ease_in_out),
+            |d, t| d.opacity(t),
+        )
+        .into_any_element()
+}
+
+struct ChangedFile {
+    path: String,
+    added: usize,
+    removed: usize,
+    /// The edits that touched it, by block index.
+    edits: Vec<usize>,
+}
+
+impl ChangedFile {
+    fn diff(&self, blocks: &[Block]) -> String {
+        let parts: Vec<String> = self
+            .edits
+            .iter()
+            .filter_map(|&b| match &blocks[b] {
+                Block::Tool(t) => edit_diff(t),
+                _ => None,
+            })
+            .collect();
+        parts.join("@@\n")
+    }
+}
+
+/// Every file a reply's edits touched, in the order first touched, with
+/// their changes added up.
+fn changed_files(blocks: &[Block], cwd: &std::path::Path) -> Vec<ChangedFile> {
+    let mut out: Vec<ChangedFile> = Vec::new();
+    for (bix, b) in blocks.iter().enumerate() {
+        let Block::Tool(t) = b else { continue };
+        if t.is_error || t.is_open() {
+            continue;
+        }
+        let Some((added, removed)) = edit_stats(t) else {
+            continue;
+        };
+        let path = ["file_path", "path", "notebook_path"]
+            .iter()
+            .find_map(|k| t.input.get(*k).and_then(|v| v.as_str()))
+            .map(|p| relative_to(p, cwd))
+            .unwrap_or_else(|| relative_to(&t.title, cwd));
+        match out.iter_mut().find(|f| f.path == path) {
+            Some(f) => {
+                f.added += added;
+                f.removed += removed;
+                f.edits.push(bix);
+            }
+            None => out.push(ChangedFile {
+                path,
+                added,
+                removed,
+                edits: vec![bix],
+            }),
+        }
+    }
+    out
+}
+
+fn handoff_label(mode: agent_core::HydrateMode) -> &'static str {
+    use agent_core::HydrateMode as H;
+    match mode {
+        H::NativeResume => "resumed",
+        H::Replayed => "with the full thread",
+        H::ReplayedPartial { .. } => "with the recent thread",
+        H::Summarized => "with a summary",
+        H::Fresh => "fresh",
+    }
+}
+
+pub fn human_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0 => "under a second".into(),
+        1..=59 => format!("{s}s"),
+        _ => format!("{}m {}s", s / 60, s % 60),
+    }
+}
+
+fn short_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if s.starts_with(&home) => format!("~{}", &s[home.len()..]),
+        _ => s,
+    }
+}
+
+/// A tool's output: the last `keep` lines in mono; a diff shows additions
+/// in full white and removals dimmed and struck, so it reads without colour.
+fn render_output(text: &str, diff: bool, keep: usize) -> AnyElement {
+    let lines: Vec<&str> = text.lines().collect();
+    let skip = lines.len().saturating_sub(keep);
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .my(u(4.))
+        .px(u(10.))
+        .py(u(8.))
+        .rounded(u(8.))
+        .bg(rgb(theme::RAISED))
+        .font_family(theme::MONO)
+        .text_size(u(11.5))
+        .line_height(u(17.));
+    if skip > 0 {
+        col = col.child(
+            div()
+                .text_color(rgb(theme::DIM))
+                .child(format!("… {skip} earlier lines")),
+        );
+    }
+    for line in &lines[skip..] {
+        let el = div().whitespace_nowrap().child(line.to_string());
+        col = col.child(if !diff {
+            el.text_color(rgb(theme::TEXT_2))
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            el.text_color(rgb(theme::TEXT)).bg(rgba(0xffffff0d))
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            el.text_color(rgb(theme::DIM)).line_through()
+        } else {
+            el.text_color(rgb(theme::DIM))
+        });
+    }
+    col.overflow_x_hidden().into_any_element()
+}
+
+impl Render for ChatPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let empty = self.transcript.messages.is_empty();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::PANE))
+            .text_size(u(13.5))
+            .line_height(u(21.))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Focused)),
+            )
+            // Files dragged in from Finder are attached to the next message.
+            .on_drop(cx.listener(|c, paths: &ExternalPaths, window, cx| {
+                c.attach_paths(paths.paths(), cx);
+                window.focus(&c.composer.read(cx).focus);
+            }))
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme::RAISED)))
+            .when(empty, |d| d.child(self.render_empty(window, cx)))
+            .when(!empty, |d| {
+                d.child(
+                    list(
+                        self.list.clone(),
+                        cx.processor(|c, ix, window, cx| c.render_message(ix, window, cx)),
+                    )
+                    .flex_1()
+                    .pb(u(16.)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .pb(u(12.))
+                        .child(Self::column(self.render_composer(window, cx))),
+                )
+            })
+    }
+}
+
+/// A thread saved mid-turn comes back finished: nothing still streaming, no
+/// step spinning forever, and the last reply closed so the next turn starts
+/// a message of its own.
+fn settle(t: &mut Transcript) {
+    for m in &mut t.messages {
+        for b in &mut m.blocks {
+            match b {
+                Block::Text { open, .. } | Block::Reasoning { open, .. } => *open = false,
+                Block::Tool(tool) if tool.result.is_none() => {
+                    tool.result = Some(ToolOutput::Text("Stopped when deck quit".into()));
+                    tool.is_error = true;
+                }
+                _ => {}
+            }
+        }
+        if m.role == Role::Assistant && m.stop.is_none() {
+            m.stop = Some(StopReason::Interrupted);
+        }
+    }
+}
+
+fn uuid_like() -> String {
+    SessionId::new().0.to_string()
+}
+
+/// Longest edge a pasted image keeps. The model scales anything larger down
+/// to about this anyway, so the extra pixels would only cost upload time.
+const PASTE_MAX_EDGE: u32 = 1568;
+
+/// Keep a pasted image as a file, so every agent can be handed a path.
+/// Big ones are scaled down with `sips`; if that fails the original stays.
+fn save_pasted_image(bytes: &[u8], ext: &str) -> std::io::Result<PathBuf> {
+    let dir = threads::attachments_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("pasted-{}.{ext}", now()));
+    std::fs::write(&path, bytes)?;
+    if bytes.len() > 512 * 1024 && ext != "gif" {
+        let edge = PASTE_MAX_EDGE.to_string();
+        let _ = std::process::Command::new("/usr/bin/sips")
+            .args(["-Z", &edge])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    Ok(path)
+}
+
+/// How long a listing of the project's files is trusted.
+const FILES_STALE: Duration = Duration::from_secs(20);
+
+/// Most files offered to `@`; past this a project is better found by typing.
+const MAX_FILES: usize = 50_000;
+
+/// Paths under `cwd`, relative to it, with each folder listed once (ending
+/// in `/`) so folders can be mentioned too.
+fn project_files(cwd: &std::path::Path) -> Vec<String> {
+    let git = std::process::Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .current_dir(cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success());
+    let mut files: Vec<String> = match git {
+        Some(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .take(MAX_FILES)
+            .map(str::to_string)
+            .collect(),
+        None => walk(cwd),
+    };
+    let mut dirs: HashSet<String> = HashSet::new();
+    for f in &files {
+        let mut p = f.as_str();
+        while let Some(i) = p.rfind('/') {
+            p = &p[..i];
+            if !dirs.insert(format!("{p}/")) {
+                break;
+            }
+        }
+    }
+    files.extend(dirs);
+    files
+}
+
+fn walk(root: &std::path::Path) -> Vec<String> {
+    const SKIP: [&str; 6] = [
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        ".git",
+        "__pycache__",
+    ];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let path = e.path();
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                if depth < 8 {
+                    stack.push((path, depth + 1));
+                }
+            } else if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().into_owned());
+                if out.len() >= MAX_FILES {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The best `n` paths for what was typed after `@`: a match in the file name
+/// beats one in the folders, a contiguous match beats letters scattered
+/// along the path, and shorter names, then paths, win ties.
+fn rank_files(files: &[String], query: &str, n: usize) -> Vec<String> {
+    let q = query.to_lowercase();
+    let mut scored: Vec<(usize, &String)> = files
+        .iter()
+        .filter_map(|f| {
+            let lower = f.to_lowercase();
+            let name = lower
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(&lower);
+            let score = if q.is_empty() {
+                // Nothing typed yet: top-level things first.
+                f.trim_end_matches('/').matches('/').count() * 100
+            } else if name.starts_with(&q) {
+                0
+            } else if name.contains(&q) {
+                100
+            } else if lower.contains(&q) {
+                200
+            } else {
+                1000 + subsequence_gaps(&lower, &q)?
+            };
+            // Among equal matches, the shorter name is the closer one.
+            Some((score + name.len() * 4 + f.len(), f))
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored.into_iter().take(n).map(|(_, f)| f.clone()).collect()
+}
+
+/// How spread out `q`'s letters are along `s`, or `None` if they are not
+/// all there in order.
+fn subsequence_gaps(s: &str, q: &str) -> Option<usize> {
+    let mut gaps = 0;
+    let mut it = s.chars();
+    for qc in q.chars() {
+        let mut skipped = 0;
+        loop {
+            match it.next() {
+                Some(c) if c == qc => break,
+                Some(_) => skipped += 1,
+                None => return None,
+            }
+        }
+        gaps += skipped;
+    }
+    Some(gaps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::ToolId;
+
+    fn tool(name: &str) -> ToolInvocation {
+        ToolInvocation {
+            id: ToolId::new(name),
+            name: name.into(),
+            input: serde_json::Value::Null,
+            title: name.into(),
+            progress: String::new(),
+            result: None,
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn work_logs_name_what_changed_first_and_count_the_rest() {
+        let t: Vec<ToolInvocation> = ["Read", "Read", "Bash", "Edit", "Edit", "Edit", "TodoWrite"]
+            .iter()
+            .map(|n| tool(n))
+            .collect();
+        let refs: Vec<&ToolInvocation> = t.iter().collect();
+        assert_eq!(
+            summarize(&refs),
+            "Ran 1 command and edited 3 files, and 3 other actions"
+        );
+        let reads: Vec<ToolInvocation> = ["Grep", "Glob"].iter().map(|n| tool(n)).collect();
+        assert_eq!(summarize(&reads.iter().collect::<Vec<_>>()), "Read 2 files");
+        assert_eq!(summarize(&[]), "");
+        let odd = [tool("TodoWrite")];
+        assert_eq!(
+            summarize(&odd.iter().collect::<Vec<_>>()),
+            "Performed 1 other action"
+        );
+    }
+
+    #[test]
+    fn mentions_rank_file_names_before_folders_and_scattered_letters() {
+        let files: Vec<String> = [
+            "crates/app/src/chat.rs",
+            "crates/app/src/chat_render_old.rs",
+            "docs/chatting.md",
+            "crates/agent-core/src/transcript.rs",
+            "crates/",
+            "crates/app/",
+            "README.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got = rank_files(&files, "chat", 3);
+        assert_eq!(
+            got,
+            [
+                "crates/app/src/chat.rs",
+                "docs/chatting.md",
+                "crates/app/src/chat_render_old.rs"
+            ]
+        );
+        // Letters in order, spread along the path.
+        assert_eq!(
+            rank_files(&files, "trsc", 1),
+            ["crates/agent-core/src/transcript.rs"]
+        );
+        assert!(rank_files(&files, "zzz", 5).is_empty());
+        // Nothing typed: shallow things first.
+        assert_eq!(rank_files(&files, "", 2), ["crates/", "README.md"]);
+    }
+
+    #[test]
+    fn edits_count_lines_from_their_input() {
+        let mut t = tool("Edit");
+        t.input = serde_json::json!({"file_path": "/a.rs", "old_string": "a\nb", "new_string": "a\nb\nc"});
+        assert_eq!(edit_stats(&t), Some((3, 2)));
+        assert_eq!(edit_diff(&t).as_deref(), Some("-a\n-b\n+a\n+b\n+c\n"));
+        let mut w = tool("Write");
+        w.input = serde_json::json!({"file_path": "/a.rs", "content": "x\ny\n"});
+        assert_eq!(edit_stats(&w), Some((2, 0)));
+        let mut m = tool("MultiEdit");
+        m.input = serde_json::json!({"edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "", "new_string": "c\nd"}]});
+        assert_eq!(edit_stats(&m), Some((3, 1)));
+        assert_eq!(edit_stats(&tool("Bash")), None);
+    }
+
+    #[test]
+    fn counts_and_paths_read_short() {
+        assert_eq!(compact_count(950), "950");
+        assert_eq!(compact_count(1000), "1k");
+        assert_eq!(compact_count(495_400), "495.4k");
+        assert_eq!(compact_count(2_000_000), "2M");
+        let cwd = std::path::Path::new("/w/proj");
+        assert_eq!(relative_to("/w/proj/src/a.rs", cwd), "src/a.rs");
+        assert_eq!(relative_to("cat /w/proj/x && ls", cwd), "cat x && ls");
+    }
+
+    #[test]
+    fn inline_styles_become_runs_that_cover_the_text() {
+        let doc = markdown::parse("a `code` and **b** [l](https://x.dev)");
+        let MdBlock::Paragraph(s) = &doc.blocks[0] else {
+            panic!()
+        };
+        let runs = text_runs(s, theme::TEXT, FontWeight::NORMAL);
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), s.text.len());
+        let code = runs
+            .iter()
+            .find(|r| r.font.family.as_ref() == theme::MONO)
+            .unwrap();
+        assert_eq!(code.len, "code".len());
+        assert!(runs.iter().any(|r| r.underline.is_some()));
+    }
+
+    #[test]
+    fn a_thread_saved_mid_turn_comes_back_settled() {
+        let mut t = Transcript::default();
+        t.push_user("go".into(), vec![], 1);
+        let agent = AgentId::new("claude");
+        t.apply(
+            &agent,
+            &AgentEvent::Text {
+                delta: "half".into(),
+            },
+            2,
+        );
+        let mut open = tool("Bash");
+        open.result = None;
+        t.messages[1].blocks.push(Block::Tool(open));
+        settle(&mut t);
+        let m = &t.messages[1];
+        assert_eq!(m.stop, Some(StopReason::Interrupted));
+        assert!(m.blocks.iter().all(|b| !b.is_open()));
+    }
+
+    #[test]
+    fn steps_read_as_what_they_did() {
+        let cwd = std::path::Path::new("/w/p");
+        let mut bash = tool("Bash");
+        bash.input = serde_json::json!({"command": "cargo test -p app"});
+        assert_eq!(
+            step_phrase(&bash, true, cwd),
+            ("Running", "cargo test -p app".to_string())
+        );
+        assert_eq!(step_phrase(&bash, false, cwd).0, "Ran");
+        let mut edit = tool("Edit");
+        edit.input =
+            serde_json::json!({"file_path": "/w/p/src/a.rs", "old_string": "a", "new_string": "b"});
+        assert_eq!(
+            step_phrase(&edit, false, cwd),
+            ("Edited", "src/a.rs".to_string())
+        );
+        let mut grep = tool("Grep");
+        grep.input = serde_json::json!({"pattern": "fn main"});
+        assert_eq!(
+            step_phrase(&grep, false, cwd),
+            ("Searched", "fn main".to_string())
+        );
+        assert_eq!(
+            step_phrase(&tool("TodoWrite"), false, cwd).0,
+            "Updated the plan"
+        );
+    }
+
+    #[test]
+    fn plans_and_changed_files_come_out_of_tool_inputs() {
+        let mut plan = tool("TodoWrite");
+        plan.input = serde_json::json!({"todos": [
+            {"content": "a", "status": "completed"},
+            {"content": "b", "status": "in_progress"},
+            {"content": "c", "status": "pending"}]});
+        let items = plan_items(&plan).unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.1).collect::<Vec<_>>(),
+            [PlanState::Done, PlanState::Doing, PlanState::Todo]
+        );
+        assert!(plan_items(&tool("Bash")).is_none());
+
+        let edit = |path: &str, old: &str, new: &str| {
+            let mut t = tool("Edit");
+            t.id = agent_core::ToolId::new(format!("{path}{old}"));
+            t.input = serde_json::json!({"file_path": path, "old_string": old, "new_string": new});
+            t.result = Some(ToolOutput::Text("ok".into()));
+            Block::Tool(t)
+        };
+        let blocks = vec![
+            edit("/w/p/a.rs", "x", "y\nz"),
+            edit("/w/p/b.rs", "", "q"),
+            edit("/w/p/a.rs", "m", "n"),
+        ];
+        let files = changed_files(&blocks, std::path::Path::new("/w/p"));
+        let got: Vec<(&str, usize, usize)> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.added, f.removed))
+            .collect();
+        assert_eq!(got, [("a.rs", 3, 2), ("b.rs", 1, 0)]);
+    }
+
+    #[test]
+    fn step_durations_stay_short() {
+        assert_eq!(step_duration(Duration::from_millis(850)), "0.8s");
+        assert_eq!(step_duration(Duration::from_millis(12_400)), "12s");
+        assert_eq!(step_duration(Duration::from_secs(125)), "2m 5s");
+    }
+
+    #[test]
+    fn durations_read_like_people_say_them() {
+        assert_eq!(human_duration(Duration::from_millis(400)), "under a second");
+        assert_eq!(human_duration(Duration::from_secs(14)), "14s");
+        assert_eq!(human_duration(Duration::from_secs(133)), "2m 13s");
+    }
+}

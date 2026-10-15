@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/term",
+    "crates/app",
+    "crates/agent-core",
+    "crates/agent-claude",
+    "crates/agent-cli",
+    "crates/session",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+term = { path = "crates/term" }
+agent-core = { path = "crates/agent-core" }
+agent-claude = { path = "crates/agent-claude" }
+agent-cli = { path = "crates/agent-cli" }
+session = { path = "crates/session" }
+
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "fs"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+smol_str = { version = "0.3", features = ["serde"] }
+# Shaders compiled at launch by Metal.framework, so building needs no Xcode
+# Metal toolchain. phobos: switch to precompiled for release builds if launch
+# time ever shows it.
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+wry = "0.57"
+raw-window-handle = "0.6"
+objc2-app-kit = "0.3"
+
+[profile.dev]
+# gpui pulls ~700 crates; keep our own crates fast to rebuild and let
+# dependencies be optimised once.
+opt-level = 0
+debug = 1
+
+# Our own crates too: the terminal's per-frame work is ours, and at opt-level
+# 0 it is several times slower than release. They are small enough that this
+# costs seconds of rebuild, not minutes.
+[profile.dev.package.app]
+opt-level = 2
+
+[profile.dev.package.term]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
