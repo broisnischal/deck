@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 const HELP: &str = "\
 deck: drive the deck window you are running in.
 
+  deck doctor                       show the PATH and which agent CLIs deck can find
   deck open URL                     open URL in a browser beside this terminal
   deck pane list
   deck pane split [--dir right|down] [--kind terminal|browser] [--cmd CMD] [--url URL] [--pane N]
@@ -24,6 +25,9 @@ Output is JSON on stdout; errors go to stderr with exit code 1.
 ";
 
 pub fn run(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("doctor") {
+        return doctor();
+    }
     match parse(args) {
         Ok(None) => {
             print!("{HELP}");
@@ -44,6 +48,30 @@ pub fn run(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// `deck doctor`: what the app would see at launch. The PATH is the one a
+/// Finder or Dock launch ends up with, and each agent CLI says whether it
+/// is reachable on it.
+fn doctor() -> i32 {
+    crate::adopt_shell_path();
+    let path = std::env::var("PATH").unwrap_or_default();
+    println!("PATH {path}");
+    let mut found = 0;
+    for agent in crate::workspace::AGENTS {
+        match term::which(agent.cmd) {
+            Some(p) => {
+                found += 1;
+                println!("  {:<13} {}", agent.cmd, p.display());
+            }
+            None => println!("  {:<13} not found", agent.cmd),
+        }
+    }
+    if found == 0 {
+        eprintln!("deck: no agent CLI is reachable; chats will not start");
+        return 1;
+    }
+    0
 }
 
 fn parse(args: &[String]) -> Result<Option<(String, Value)>, String> {

@@ -31,6 +31,7 @@ fn main() {
     if !args.is_empty() {
         std::process::exit(cli::run(&args));
     }
+    adopt_shell_path();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -80,4 +81,69 @@ fn main() {
                 cx.activate(true);
             }
         });
+}
+
+/// Apps started from Finder or the Dock get launchd's bare `PATH`
+/// (`/usr/bin:/bin:…`), not the one your shell builds, so agent CLIs in
+/// Homebrew or `~/.local/bin` would look uninstalled. Borrow the login
+/// shell's `PATH` before anything else runs (and before any thread exists,
+/// which is what makes setting it sound). From a terminal it is already
+/// right, so this only runs without one. A slow shell is given 3 seconds.
+pub(crate) fn adopt_shell_path() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    if std::env::var_os("TERM").is_some() {
+        return;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let Ok(mut child) = Command::new(&shell)
+        .args(["-ilc", "printf '\\n__DECK_PATH__%s\\n' \"$PATH\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                return;
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    if let Some(path) = shell_path(&out) {
+        std::env::set_var("PATH", path);
+    }
+}
+
+/// The `PATH` line from the shell's output, skipping whatever its startup
+/// files printed first.
+fn shell_path(out: &str) -> Option<&str> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("__DECK_PATH__"))
+        .filter(|p| p.contains('/'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_path;
+
+    #[test]
+    fn the_path_line_is_found_among_shell_noise() {
+        let out = "Last login: today\nwelcome!\n__DECK_PATH__/opt/homebrew/bin:/usr/bin\n";
+        assert_eq!(shell_path(out), Some("/opt/homebrew/bin:/usr/bin"));
+        assert_eq!(shell_path("no marker here"), None);
+        assert_eq!(shell_path("__DECK_PATH__\n"), None);
+    }
 }
