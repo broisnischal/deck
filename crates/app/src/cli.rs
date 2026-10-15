@@ -19,6 +19,14 @@ deck: drive the deck window you are running in.
       --chat starts a structured chat with that agent; --agent runs its TUI in a terminal
   deck browser open [--pane N] URL
   deck browser eval --pane N JS
+  deck task new [--agent claude|codex|…] [--cwd DIR] BRIEF
+      a sub-agent on its own branch and worktree of this project
+  deck task list
+  deck task show    --task ID       status, changes and its last reply
+  deck task wait    --task ID [--timeout SECS]   until its agent stops working
+  deck task diff    --task ID
+  deck task send    --task ID TEXT  a follow-up for its agent
+  deck task merge   --task ID       squash into the base branch (or: pr, discard)
 
 Run it from a terminal inside deck; it reads DECK_SOCKET and DECK_TOKEN.
 Output is JSON on stdout; errors go to stderr with exit code 1.
@@ -27,6 +35,9 @@ Output is JSON on stdout; errors go to stderr with exit code 1.
 pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("doctor") {
         return doctor();
+    }
+    if args.len() >= 2 && args[0] == "task" && args[1] == "wait" {
+        return wait(&args[2..]);
     }
     match parse(args) {
         Ok(None) => {
@@ -72,6 +83,47 @@ fn doctor() -> i32 {
         return 1;
     }
     0
+}
+
+/// `deck task wait --task ID`: ask every two seconds until the task's agent
+/// has worked and stopped (finished, or waiting on you), then print it.
+fn wait(args: &[String]) -> i32 {
+    let mut task = None;
+    let mut timeout = 30 * 60u64;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--task" => task = it.next().cloned(),
+            "--timeout" => timeout = it.next().and_then(|t| t.parse().ok()).unwrap_or(timeout),
+            other => task = task.or(Some(other.to_string())),
+        }
+    }
+    let Some(task) = task else {
+        eprintln!("deck: task wait needs --task ID");
+        return 2;
+    };
+    let start = std::time::Instant::now();
+    let mut seen_working = false;
+    loop {
+        let v = match control::call("task.show", serde_json::json!({ "task": task })) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("deck: {e}");
+                return 1;
+            }
+        };
+        let status = v.get("status").and_then(Value::as_str).unwrap_or("");
+        seen_working |= status == "working";
+        // An agent that has not picked the brief up yet is not done; give
+        // it twenty seconds to start before taking idle at its word.
+        let settled = status != "working"
+            && (seen_working || start.elapsed().as_secs() > 20 || status == "closed");
+        if settled || start.elapsed().as_secs() >= timeout {
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            return if settled { 0 } else { 1 };
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
 }
 
 fn parse(args: &[String]) -> Result<Option<(String, Value)>, String> {
@@ -122,7 +174,7 @@ fn parse(args: &[String]) -> Result<Option<(String, Value)>, String> {
     }
     if !positional.is_empty() {
         let key = match method.as_str() {
-            "pane.send" => "text",
+            "pane.send" | "task.new" | "task.send" => "text",
             "browser.open" => "url",
             "browser.eval" => "js",
             m => return Err(format!("{m} takes no positional arguments")),
@@ -179,6 +231,17 @@ mod tests {
         assert_eq!(
             p("tab new --agent claude").unwrap(),
             Some(("tab.new".into(), json!({"agent": "claude"})))
+        );
+        assert_eq!(
+            p("task new --agent codex fix the flaky test").unwrap(),
+            Some((
+                "task.new".into(),
+                json!({"agent": "codex", "text": "fix the flaky test"})
+            ))
+        );
+        assert_eq!(
+            p("task merge --task add-x-1f").unwrap(),
+            Some(("task.merge".into(), json!({"task": "add-x-1f"})))
         );
     }
 }

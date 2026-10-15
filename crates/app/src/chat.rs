@@ -48,6 +48,14 @@ servers in your own shell, which would block you.
 - `deck pane send --pane N 'text'`: type into a terminal.
 - `deck open http://localhost:3000`: open a page in deck's browser beside this chat.
 - `deck browser eval --pane N 'document.title'`: inspect a page.
+- `deck task new 'a self-contained brief'`: hand a piece of work to a sub-agent \
+on its own branch and git worktree of this project. It works in parallel; you \
+get a message here when it finishes. Use it to split big jobs or try things \
+side by side.
+- `deck task list`, `deck task show --task ID`, `deck task diff --task ID`: \
+follow sub-agents and read what they changed; `deck task send --task ID 'text'` \
+to steer one.
+- `deck task merge --task ID` (or `pr`, `discard`): finish one once it is good.
 Use these whenever the user asks to run, serve, preview or check something. \
 Keep answers short; say what you ran and what you saw.";
 
@@ -249,6 +257,22 @@ pub struct ChatPane {
     copied: Option<String>,
     /// The right-click menu on a message, while open.
     menu: Option<menu::Open>,
+    /// A prompt rewrite in flight: its number, and whether it sends after.
+    refining: Option<(u64, bool)>,
+    refine_seq: u64,
+    _refine: Option<Task<()>>,
+    /// Your own words, kept while a rewrite stands in for them (⌃Z).
+    mine: Option<String>,
+    /// The next ⏎ sends the text as it is (a rewrite failed, or ⌃Z put your
+    /// words back).
+    as_typed: bool,
+    /// A line about the last rewrite, shown under the composer.
+    refine_note: Option<SharedString>,
+    /// Auto-retry after a failed turn: the try it is on, when, and why.
+    retry: Option<(u32, Instant, String)>,
+    /// Tries in a row since the last turn that went through.
+    retries: u32,
+    _retry: Option<Task<()>>,
     /// Files and images going out with the next message.
     attachments: Vec<PathBuf>,
     /// Files under `cwd` for `@`, listed on first use and again when stale.
@@ -336,6 +360,11 @@ impl ChatPane {
             FieldEvent::Cancel => chat.interrupt(cx),
             FieldEvent::Attach(p) => chat.paste(p, cx),
             FieldEvent::Changed => {
+                if chat.composer.read(cx).text().trim().is_empty() {
+                    chat.mine = None;
+                    chat.as_typed = false;
+                    chat.refine_note = None;
+                }
                 chat.update_mention(cx);
                 chat.sync_popup(cx);
                 chat.schedule_save(cx);
@@ -384,6 +413,15 @@ impl ChatPane {
             log_open: HashMap::new(),
             copied: None,
             menu: None,
+            refining: None,
+            refine_seq: 0,
+            _refine: None,
+            mine: None,
+            as_typed: false,
+            refine_note: None,
+            retry: None,
+            retries: 0,
+            _retry: None,
             attachments: Vec::new(),
             files: None,
             files_at: None,
@@ -451,6 +489,11 @@ impl ChatPane {
     }
 
     /// The thread as saved to disk.
+    /// The thread as it stands, to reopen it with a fresh agent process.
+    pub fn saved(&self, cx: &gpui::App) -> threads::Saved {
+        self.snapshot(cx)
+    }
+
     fn snapshot(&self, cx: &gpui::App) -> threads::Saved {
         let f = self.composer.read(cx);
         threads::Saved {
@@ -533,6 +576,188 @@ impl ChatPane {
     /// How long the current turn has been running.
     pub fn working_for(&self) -> Option<Duration> {
         self.turn_started.map(|t| t.elapsed())
+    }
+
+    /// Rewrite what is in the composer into a clear prompt, from your own
+    /// words if a rewrite already stands in for them; then send it, or leave
+    /// it in the box to look at.
+    pub fn rewrite(&mut self, send: bool, cx: &mut Context<Self>) {
+        let from = self.composer.read(cx).text().to_string();
+        if from.trim().is_empty() || self.refining.is_some() {
+            return;
+        }
+        let src = self.mine.clone().unwrap_or_else(|| from.clone());
+        self.refine_seq += 1;
+        let seq = self.refine_seq;
+        self.refining = Some((seq, send));
+        self.refine_note = None;
+        let ctx = crate::refine::Context {
+            agent: self.agent_name().to_string(),
+            folder: self.cwd.display().to_string(),
+            task: self.title.to_string(),
+            last_reply: self.last_reply_text(),
+        };
+        let model = crate::refine::model();
+        let cwd = self.cwd.clone();
+        let text = src.clone();
+        self._refine = Some(cx.spawn(async move |this, cx| {
+            let out = cx
+                .background_executor()
+                .spawn(async move { crate::refine::rewrite(&text, &ctx, &model, &cwd) })
+                .await;
+            let _ = this.update(cx, |c, cx| c.rewritten(seq, from, src, out, cx));
+        }));
+        cx.notify();
+    }
+
+    fn rewritten(
+        &mut self,
+        seq: u64,
+        from: String,
+        src: String,
+        out: Result<String, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((at, send)) = self.refining else {
+            return;
+        };
+        if at != seq {
+            return;
+        }
+        self.refining = None;
+        match out {
+            Err(e) => {
+                self.as_typed = true;
+                self.refine_note = Some(format!("{e} · ⏎ sends it as typed").into());
+            }
+            Ok(_) if self.composer.read(cx).text() != from => {
+                self.refine_note =
+                    Some("the message changed during the rewrite · ⌃O rewrites it again".into());
+            }
+            Ok(text) => {
+                if self.mine.is_none() {
+                    self.mine = Some(src);
+                }
+                self.as_typed = false;
+                self.composer.update(cx, |f, cx| f.set_text(&text, cx));
+                if send {
+                    self.submit(false, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// ⌃Z after a rewrite: your own words back, to send as they are.
+    pub fn my_words(&mut self, cx: &mut Context<Self>) {
+        if let Some(mine) = self.mine.take() {
+            self.composer.update(cx, |f, cx| f.set_text(&mine, cx));
+            self.as_typed = true;
+            self.refine_note = None;
+            cx.notify();
+        }
+    }
+
+    /// The whole of the last reply's text.
+    fn last_reply_text(&self) -> String {
+        self.transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| {
+                m.blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        Block::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    /// A turn just failed: if a retry can fix it, line one up after the
+    /// backoff (or the usage limit's reset); otherwise say why not.
+    fn maybe_retry(&mut self, cx: &mut Context<Self>) {
+        if !crate::retry::enabled() {
+            return;
+        }
+        let said = self
+            .error
+            .as_ref()
+            .map(|e| e.to_string())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| self.last_reply_text());
+        let (epoch, clock) = crate::retry::now();
+        match crate::retry::classify(&said, epoch, clock) {
+            crate::retry::Verdict::Blocked(why) => {
+                self.retries = 0;
+                self.retry = None;
+                self.error = Some(format!("{why}. A retry would not fix this.").into());
+            }
+            crate::retry::Verdict::Retry { wait, reason } => {
+                if self.retries >= crate::retry::MAX_TRIES {
+                    self.error = Some(
+                        format!(
+                            "{reason}: gave up after {} tries. Send anything to try again.",
+                            crate::retry::MAX_TRIES
+                        )
+                        .into(),
+                    );
+                    self.retries = 0;
+                    return;
+                }
+                self.retries += 1;
+                let wait = wait.unwrap_or_else(|| crate::retry::backoff(self.retries));
+                self.retry = Some((self.retries, Instant::now() + wait, reason));
+                // Tick each second, so the countdown under the composer moves.
+                self._retry = Some(cx.spawn(async move |this, cx| loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let due = this.update(cx, |c, cx| {
+                        cx.notify();
+                        c.retry
+                            .as_ref()
+                            .is_none_or(|(_, at, _)| Instant::now() >= *at)
+                    });
+                    match due {
+                        Ok(true) => {
+                            let _ = this.update(cx, |c, cx| c.retry_now(cx));
+                            return;
+                        }
+                        Ok(false) => {}
+                        Err(_) => return,
+                    }
+                }));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Say "continue", as you would after the error, unless something else
+    /// already got the agent going again.
+    fn retry_now(&mut self, cx: &mut Context<Self>) {
+        if self.retry.take().is_none() || self.busy() {
+            return;
+        }
+        self._retry = None;
+        self.error = None;
+        self.send_turn(
+            Outgoing {
+                text: "continue".into(),
+                attachments: Vec::new(),
+                now: false,
+            },
+            cx,
+        );
+    }
+
+    fn cancel_retry(&mut self, cx: &mut Context<Self>) {
+        self.retry = None;
+        self._retry = None;
+        self.retries = 0;
+        cx.notify();
     }
 
     /// What the agent is doing this moment, in a line ("Running cargo
@@ -756,6 +981,26 @@ impl ChatPane {
             self.composer.update(cx, |f, cx| f.set_text("", cx));
             return;
         }
+        if self.refining.is_some() {
+            return;
+        }
+        let mode = crate::refine::mode();
+        if mode != crate::refine::Mode::Off
+            && self.mine.is_none()
+            && !self.as_typed
+            && crate::refine::needed(&text)
+        {
+            self.rewrite(mode == crate::refine::Mode::Auto, cx);
+            return;
+        }
+        // You are sending something yourself: any retry deck had lined up
+        // gives way to it.
+        self.retry = None;
+        self._retry = None;
+        self.retries = 0;
+        self.mine = None;
+        self.as_typed = false;
+        self.refine_note = None;
         let attachments = std::mem::take(&mut self.attachments);
         self.mention = None;
         self.composer.update(cx, |f, cx| {
@@ -860,6 +1105,11 @@ impl ChatPane {
     pub fn interrupt(&mut self, cx: &mut Context<Self>) {
         if self.mention.is_some() {
             self.close_mention(cx);
+            return;
+        }
+        // Esc while a retry is lined up calls it off.
+        if self.retry.is_some() {
+            self.cancel_retry(cx);
             return;
         }
         if let (Some(conn), ChatStatus::Working | ChatStatus::Waiting) = (&self.conn, self.status) {
@@ -1430,6 +1680,7 @@ impl ChatPane {
         if sid != self.session_id {
             return;
         }
+        let was = self.status;
         let before = self.transcript.messages.len();
         let mut touched = Vec::new();
         let mut failed_resume = false;
@@ -1592,6 +1843,14 @@ impl ChatPane {
                     self.conn = None;
                 }
             }
+        }
+        // A turn that went through resets the retries; one that just died
+        // may get one.
+        if self.status == ChatStatus::Idle && was != ChatStatus::Idle {
+            self.retries = 0;
+        }
+        if self.status == ChatStatus::Failed && was != ChatStatus::Failed && !failed_resume {
+            self.maybe_retry(cx);
         }
         // The saved session could not be resumed (expired, or made on another
         // machine): replay the thread into a fresh one and send the turn again.
@@ -2819,22 +3078,62 @@ impl ChatPane {
         }
         let focus = self.composer.read(cx).focus.clone();
         let focused = focus.contains_focused(window, cx);
-        let hint = if !self.asks.is_empty() {
-            "↑↓ choose · ⏎ confirm · esc no · or type a reply"
+        let refine_mode = crate::refine::mode();
+        let retry_line = self.retry.as_ref().map(|(n, at, why)| {
+            let left = at.saturating_duration_since(Instant::now()).as_secs();
+            let left = if left >= 120 {
+                format!("{}m", left.div_ceil(60))
+            } else {
+                format!("{left}s")
+            };
+            format!(
+                "{why} · trying again in {left} ({n}/{}) · esc cancels",
+                crate::retry::MAX_TRIES
+            )
+        });
+        let hint: SharedString = if let Some(r) = retry_line {
+            r.into()
+        } else if self.refining.is_some() {
+            format!("Rewriting with {}…", crate::refine::model()).into()
+        } else if let Some(note) = &self.refine_note {
+            note.clone()
+        } else if self.mine.is_some() {
+            "✦ rewritten · ⏎ send · ⌃Z my words · ⌃O again".into()
+        } else if !self.asks.is_empty() {
+            "↑↓ choose · ⏎ confirm · esc no · or type a reply".into()
         } else if working && self.queues_input() {
-            "esc to stop · ⏎ queue for after this step · ⌘⏎ send now"
+            "esc to stop · ⏎ queue for after this step · ⌘⏎ send now".into()
         } else if working {
-            "esc to stop · messages you send now wait for the turn to end"
+            "esc to stop · messages you send now wait for the turn to end".into()
         } else if self.mention.as_ref().is_some_and(|m| !m.matches.is_empty()) {
-            "↑↓ choose · ⏎ or ⇥ insert · esc close"
+            "↑↓ choose · ⏎ or ⇥ insert · esc close".into()
+        } else if refine_mode == crate::refine::Mode::Off {
+            "⏎ send · ⇧⏎ new line · ↑ last message · @ file · ⌘V image".into()
         } else {
-            "⏎ send · ⇧⏎ new line · ↑ last message · @ file · ⌘V image"
+            format!(
+                "⏎ {} · ⌃O rewrite · ⇧⏎ new line · @ file · ⌘V image",
+                if refine_mode == crate::refine::Mode::Auto {
+                    "rewrite and send"
+                } else {
+                    "rewrite, again to send"
+                }
+            )
+            .into()
         };
         // Concentric: 8px chips sit 8px inside the composer's 16px card.
         stack
             .child(
                 div()
                     .id("composer")
+                    .key_context("Composer")
+                    .on_action(
+                        cx.listener(|c, _: &crate::workspace::RewritePrompt, _, cx| {
+                            c.rewrite(false, cx)
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|c, _: &crate::workspace::MyWords, _, cx| c.my_words(cx)),
+                    )
                     .relative()
                     .flex()
                     .flex_col()
@@ -2871,7 +3170,11 @@ impl ChatPane {
                     .justify_center()
                     .text_size(u(11.))
                     .text_color(rgb(theme::dim()))
-                    .child(hint),
+                    .child(if self.refining.is_some() {
+                        crate::icon::shimmer("refining", hint)
+                    } else {
+                        hint.into_any_element()
+                    }),
             )
             .into_any_element()
     }

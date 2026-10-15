@@ -90,6 +90,10 @@ pub struct Palette {
     /// (item index, matched byte positions), best first.
     shown: Vec<(Ref, Vec<usize>)>,
     selected: usize,
+    /// Each row's place among the list's children, which section labels
+    /// share, so the selection can be scrolled into view.
+    child_of: Vec<usize>,
+    scroll: gpui::ScrollHandle,
     _sub: Subscription,
 }
 
@@ -136,6 +140,8 @@ impl Palette {
             tasks,
             shown: Vec::new(),
             selected: 0,
+            child_of: Vec::new(),
+            scroll: gpui::ScrollHandle::new(),
             _sub: sub,
         };
         p.refilter(cx);
@@ -223,7 +229,22 @@ impl Palette {
         if self.tasks && !q.is_empty() {
             self.shown.push((Ref::NewTask, Vec::new()));
         }
+        // Labels sit between kinds only while nothing is typed.
+        self.child_of.clear();
+        let mut last: Option<Kind> = None;
+        let mut child = 0;
+        for (r, _) in &self.shown {
+            let kind = self.item(*r).map(|it| it.kind);
+            if q.is_empty() && kind.is_some() && kind != last {
+                child += 1;
+                last = kind;
+            }
+            self.child_of.push(child);
+            child += 1;
+        }
         self.selected = 0;
+        self.scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
         cx.notify();
     }
 
@@ -231,6 +252,9 @@ impl Palette {
         let n = self.shown.len() as isize;
         if n > 0 {
             self.selected = (self.selected as isize + dir).rem_euclid(n) as usize;
+            if let Some(&child) = self.child_of.get(self.selected) {
+                self.scroll.scroll_to_item(child);
+            }
             cx.notify();
         }
     }
@@ -283,6 +307,7 @@ impl Render for Palette {
             .flex_col()
             .max_h(u(420.))
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .p(u(6.));
         let mut last_kind: Option<Kind> = None;
         for (row, (r, at)) in self.shown.iter().enumerate() {
@@ -339,8 +364,10 @@ impl Render for Palette {
                     .rounded(u(8.))
                     .text_size(u(13.))
                     .cursor_pointer()
-                    .when(selected, |d| d.bg(rgb(theme::surface())))
-                    .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+                    // On the palette's own surface: hover a step up from it,
+                    // the selection a step more.
+                    .when(selected, |d| d.bg(rgb(theme::surface_hover())))
+                    .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::surface()))))
                     .child(icon(
                         glyph,
                         15.,

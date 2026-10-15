@@ -994,6 +994,58 @@ impl SettingsPane {
                 ),
             ),
             group(
+                Some("Prompt rewriting"),
+                vec![
+                    row(
+                        "When you press ⏎",
+                        self.segmented(
+                            "refine",
+                            &crate::refine::Mode::ALL
+                                .iter()
+                                .map(|m| (*m, m.name()))
+                                .collect::<Vec<_>>(),
+                            self.settings.refine,
+                            |s, m| s.refine = m,
+                            cx,
+                        ),
+                    ),
+                    row(
+                        "Model",
+                        self.segmented(
+                            "refine-model",
+                            &crate::refine::MODELS,
+                            crate::refine::MODELS
+                                .iter()
+                                .map(|(id, _)| *id)
+                                .find(|id| *id == self.settings.refine_model)
+                                .unwrap_or("haiku"),
+                            |s, m| s.refine_model = m.to_string(),
+                            cx,
+                        ),
+                    ),
+                ],
+                Some(
+                    "A quick Claude run turns what you typed or dictated into a clear, complete prompt, using the thread's task and the agent's last reply to work out what \"it\" and \"that\" mean. ⌃O rewrites into the box without sending, ⌃Z brings back your words. Short replies, / commands and ! commands go as typed."
+                        .into(),
+                ),
+            ),
+            group(
+                Some("Recovery"),
+                vec![row(
+                    "Retry when a turn fails",
+                    self.toggle(
+                        "auto-retry",
+                        self.settings.auto_retry,
+                        |s, on| s.auto_retry = on,
+                        cx,
+                    ),
+                )],
+                Some(
+                    "On an API or network error deck says \"continue\" after 5 s, 10 s, 20 s… up to five minutes, eight tries; a usage limit waits until it resets. Login and billing problems are shown to you instead. Claude Code stuck in its own retry wait in a terminal is nudged the same way."
+                        .into(),
+                ),
+            ),
+            group(
                 Some("Notifications"),
                 vec![
                     row(

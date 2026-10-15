@@ -36,6 +36,10 @@ pub struct Task {
     /// The chat thread doing the work.
     #[serde(default)]
     pub thread: Option<String>,
+    /// The chat thread that handed this task out, if an agent did: it is
+    /// told when the task's agent finishes.
+    #[serde(default)]
+    pub parent: Option<String>,
     #[serde(default)]
     pub created: i64,
     #[serde(default)]
@@ -180,6 +184,7 @@ fn create_in(dir: &Path, brief: &str, worktrees: &Path) -> Result<Task, String> 
         branch,
         worktree,
         thread: None,
+        parent: None,
         created: stamp,
         state: State::Open,
     })

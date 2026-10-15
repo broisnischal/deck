@@ -48,6 +48,10 @@ actions!(
         Reload,
         ToggleDevTools,
         CommandPalette,
+        RewritePrompt,
+        MyWords,
+        NewControl,
+        RestartControl,
         ToggleSidebar,
         ToggleInspector,
         Quit,
@@ -106,6 +110,9 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-0", ZoomReset, None),
         // ⌘K is the palette everywhere; clearing a terminal moves to ⇧⌘K.
         KeyBinding::new("cmd-k", CommandPalette, None),
+        // In a chat's composer: rewrite into the box, or bring my words back.
+        KeyBinding::new("ctrl-o", RewritePrompt, Some("Composer")),
+        KeyBinding::new("ctrl-z", MyWords, Some("Composer")),
         KeyBinding::new("cmd-shift-k", ClearTerminal, Some("Terminal")),
         KeyBinding::new("cmd-f", Find, Some("Terminal")),
         KeyBinding::new("cmd-g", FindNext, Some("Terminal")),
@@ -512,6 +519,9 @@ pub struct Workspace {
     busy: std::collections::HashSet<PaneId>,
     /// A divider being dragged.
     resizing: Option<Resize>,
+    /// Claude Code terminals deck has unstuck from an API wait: how many
+    /// times in a row, and when last.
+    stalls: HashMap<PaneId, (u32, Instant)>,
     /// When each agent started its current stretch of work, so finishing a
     /// long one can say so.
     working_since: HashMap<PaneId, Instant>,
@@ -578,6 +588,8 @@ impl Workspace {
             settings: {
                 let s = crate::settings::load();
                 crate::browser::set_search_engine(s.search);
+                crate::refine::set(s.refine, &s.refine_model);
+                crate::retry::set_enabled(s.auto_retry);
                 wear(s.theme, window);
                 s
             },
@@ -588,6 +600,7 @@ impl Workspace {
             busy: Default::default(),
             resizing: None,
             working_since: HashMap::new(),
+            stalls: HashMap::new(),
             cells: Default::default(),
             alerted: HashMap::new(),
             badge: 0,
@@ -1191,6 +1204,98 @@ impl Workspace {
         }
     }
 
+    /// Start the control chat over: its conversation is filed away like a
+    /// closed thread, and a fresh one opens in its place.
+    fn new_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.control_tab() {
+            self.close_tab(ix, window, cx);
+        }
+        self.open_control(Vec::new(), window, cx);
+        if let Some(ix) = self.control_tab() {
+            self.activate(ix, window, cx);
+        }
+    }
+
+    /// Restart the control chat's agent: the same conversation, a new
+    /// process (Claude resumes its own session).
+    fn restart_control(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.control_tab() else {
+            return self.open_control(Vec::new(), window, cx);
+        };
+        let old = self.tabs[ix].root.first();
+        let Some(PaneKind::Chat(c)) = self.panes.get(&old).map(|p| &p.kind) else {
+            return;
+        };
+        let mut saved = c.read(cx).saved(cx);
+        saved.control = true;
+        let new = match self.make_pane(Open::Thread(Box::new(saved)), None, window, cx) {
+            Ok(id) => id,
+            Err(e) => return self.flash(format!("Could not restart the agent: {e}"), cx),
+        };
+        if let Some(PaneKind::Chat(c)) = self.panes.get(&new).map(|p| &p.kind) {
+            c.update(cx, |c, _| c.control = true);
+        }
+        let tab = &mut self.tabs[ix];
+        tab.root.replace(old, new);
+        if tab.focused == old {
+            tab.focused = new;
+        }
+        // Not archived: the new pane carries the same thread on.
+        self.panes.remove(&old);
+        self.focus_pane(new, window, cx);
+        self.flash("Agent restarted", cx);
+    }
+
+    fn open_control_menu(
+        &mut self,
+        at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::menu::{Entry, Item};
+        let ws = cx.entity().downgrade();
+        let open = self.control_tab().is_some();
+        let (fresh, again, close) = (ws.clone(), ws.clone(), ws);
+        let entries: Vec<Entry> = vec![
+            Item::new("New Conversation", move |window, cx| {
+                let _ = fresh.update(cx, |ws, cx| ws.new_control(window, cx));
+            })
+            .icon(Icon::Plus)
+            .into(),
+            Item::new("Restart Agent", move |window, cx| {
+                let _ = again.update(cx, |ws, cx| ws.restart_control(window, cx));
+            })
+            .icon(Icon::Refresh)
+            .disabled(!open)
+            .into(),
+            Entry::Separator,
+            Item::new("Close", move |window, cx| {
+                let _ = close.update(cx, |ws, cx| {
+                    if let Some(ix) = ws.control_tab() {
+                        ws.close_tab(ix, window, cx);
+                    }
+                });
+            })
+            .icon(Icon::Close)
+            .shortcut("⌘W")
+            .disabled(!open)
+            .into(),
+        ];
+        let restore = window.focused(cx);
+        self.menu = Some(crate::menu::open(
+            entries,
+            at,
+            restore,
+            window,
+            cx,
+            |ws: &mut Self, _, cx| {
+                ws.menu = None;
+                cx.notify();
+            },
+        ));
+        cx.notify();
+    }
+
     fn control_tab(&self) -> Option<usize> {
         self.tabs.iter().position(|t| t.pinned)
     }
@@ -1349,10 +1454,6 @@ impl Workspace {
             self.discard(id, cx);
             return;
         };
-        // The control chat stays; panes split beside it still close.
-        if self.tabs[ix].pinned && self.tabs[ix].root == Node::Leaf(id) {
-            return;
-        }
         self.discard(id, cx);
         let tab = &mut self.tabs[ix];
         if tab.root == Node::Leaf(id) {
@@ -1376,9 +1477,6 @@ impl Workspace {
         let Some(tab) = self.tabs.get(ix) else {
             return;
         };
-        if tab.pinned {
-            return;
-        }
         for id in tab.leaves() {
             self.discard(id, cx);
         }
@@ -1460,7 +1558,6 @@ impl Workspace {
                 },
             )
             .icon(Icon::Close)
-            .disabled(tab.pinned)
             .into(),
         );
         entries.push(
@@ -1675,6 +1772,12 @@ impl Workspace {
                 }
             }
         }
+        for (id, now) in &sorted {
+            let was = self.statuses.iter().find(|(p, _)| p == id).map(|(_, s)| *s);
+            if was == Some(Status::Working) && *now == Status::Idle {
+                self.report_to_parent(*id, cx);
+            }
+        }
         if self.settings.notify_attention {
             for (id, body) in ask {
                 self.post(id, body, cx);
@@ -1708,6 +1811,7 @@ impl Workspace {
         self.save_session(cx);
         if self.ticks.is_multiple_of(3) {
             self.refresh_task_changes(cx);
+            self.unstick_agents(cx);
         }
     }
 
@@ -1916,6 +2020,8 @@ impl Workspace {
         let zoomed = next.zoom != self.settings.zoom;
         let themed = next.theme != self.settings.theme;
         crate::browser::set_search_engine(next.search);
+        crate::refine::set(next.refine, &next.refine_model);
+        crate::retry::set_enabled(next.auto_retry);
         if themed {
             wear(next.theme, window);
         }
@@ -2177,6 +2283,20 @@ impl Workspace {
                 Box::new(NewChat),
             ),
             action(
+                "New Control Conversation",
+                "Start the control chat over",
+                Icon::Plus,
+                None,
+                Box::new(NewControl),
+            ),
+            action(
+                "Restart Control Agent",
+                "The same conversation, a fresh agent",
+                Icon::Refresh,
+                None,
+                Box::new(RestartControl),
+            ),
+            action(
                 "New Browser Tab",
                 "",
                 Icon::Globe,
@@ -2329,6 +2449,23 @@ impl Workspace {
     /// are in, and a chat with the default agent working in it.
     fn start_task(&mut self, brief: String, window: &mut Window, cx: &mut Context<Self>) {
         let dir = self.focused_cwd(cx).unwrap_or_else(|| self.cwd.clone());
+        self.spawn_task(brief, dir, None, None, None, window, cx);
+    }
+
+    /// Start a task in the repository `dir` is in. `agent` picks who works
+    /// on it (the default when `None`), `parent` is the chat thread that
+    /// asked for it, and `reply` answers a `deck task new` once it runs.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_task(
+        &mut self,
+        brief: String,
+        dir: PathBuf,
+        agent: Option<String>,
+        parent: Option<String>,
+        reply: Option<Reply>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.flash("Starting a task…", cx);
         cx.spawn_in(window, async move |this, cx| {
             let made = cx
@@ -2340,7 +2477,9 @@ impl Workspace {
                 .await;
             let _ = this.update_in(cx, |ws, window, cx| match made {
                 Ok(mut task) => {
-                    let agent = ws.default_agent().map(|a| a.as_str().to_string());
+                    task.parent = parent;
+                    let agent =
+                        agent.or_else(|| ws.default_agent().map(|a| a.as_str().to_string()));
                     let opened = ws.new_tab(
                         Open::Chat {
                             agent,
@@ -2374,14 +2513,148 @@ impl Workspace {
                         }
                     }
                     ws.flash(format!("Working on {} in {}", task.title, task.branch), cx);
+                    let answer = ws.task_json(&task, cx);
                     ws.tasks.push(task);
                     crate::tasks::save_all(&ws.tasks);
                     ws.refresh_task_changes(cx);
+                    if let Some(r) = reply {
+                        r.send(Ok(answer));
+                    }
                 }
-                Err(e) => ws.flash(format!("Could not start the task: {e}"), cx),
+                Err(e) => {
+                    ws.flash(format!("Could not start the task: {e}"), cx);
+                    if let Some(r) = reply {
+                        r.send(Err(e));
+                    }
+                }
             });
         })
         .detach();
+    }
+
+    /// `deck task new BRIEF`: a task in the project the caller works in,
+    /// told back to the caller's chat when it finishes.
+    fn rpc_task_new(
+        &mut self,
+        p: &Value,
+        caller: PaneId,
+        reply: Reply,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(brief) = str_param(p, "text").filter(|b| !b.trim().is_empty()) else {
+            return reply.send(Err("say what the task is: deck task new 'brief'".into()));
+        };
+        let brief = brief.to_string();
+        let dir = str_param(p, "cwd")
+            .map(PathBuf::from)
+            .or_else(|| self.cwd_of(caller, cx))
+            .unwrap_or_else(|| self.cwd.clone());
+        let agent = str_param(p, "agent").map(str::to_string);
+        let parent = match self.panes.get(&caller).map(|p| &p.kind) {
+            Some(PaneKind::Chat(c)) => Some(c.read(cx).thread_id().to_string()),
+            _ => None,
+        };
+        self.spawn_task(brief, dir, agent, parent, Some(reply), window, cx);
+    }
+
+    /// Where a pane works: a terminal's current folder, a chat's.
+    fn cwd_of(&self, id: PaneId, cx: &App) -> Option<PathBuf> {
+        match &self.panes.get(&id)?.kind {
+            PaneKind::Chat(c) => Some(c.read(cx).cwd().to_path_buf()),
+            PaneKind::Terminal(t) => self.places.get(&id).map(|p| p.cwd.clone()).or_else(|| {
+                let procs = inspect::descendants(t.read(cx).pid());
+                procs.iter().rev().find_map(|p| inspect::cwd(p.pid))
+            }),
+            _ => None,
+        }
+    }
+
+    /// The task a call names with `--task ID` (a unique prefix will do).
+    fn task_param(&self, p: &Value) -> Result<crate::tasks::Task, String> {
+        let id = str_param(p, "task").ok_or("missing --task ID (see deck task list)")?;
+        let open = self
+            .tasks
+            .iter()
+            .filter(|t| t.state == crate::tasks::State::Open);
+        let hits: Vec<&crate::tasks::Task> = open
+            .clone()
+            .filter(|t| t.id == id)
+            .chain(open.filter(|t| t.id != id && t.id.starts_with(id)))
+            .collect();
+        match hits.as_slice() {
+            [one, ..] if one.id == id => Ok((*one).clone()),
+            [one] => Ok((*one).clone()),
+            [] => Err(format!("no open task {id:?}")),
+            _ => Err(format!("{id:?} names more than one task")),
+        }
+    }
+
+    fn task_json(&self, t: &crate::tasks::Task, cx: &App) -> Value {
+        let pane = self.task_pane(t, cx);
+        let status = match pane.and_then(|p| self.status(p, cx)) {
+            Some(Status::Working) => "working",
+            Some(Status::Attention) => "needs-you",
+            Some(Status::Idle) => "idle",
+            None if pane.is_some() => "idle",
+            None => "closed",
+        };
+        let c = self.task_changes.get(&t.id).cloned().unwrap_or_default();
+        json!({
+            "task": t.id,
+            "title": t.title,
+            "branch": t.branch,
+            "base": t.base,
+            "worktree": t.worktree,
+            "status": status,
+            "pane": pane,
+            "files": c.files,
+            "added": c.added,
+            "removed": c.removed,
+        })
+    }
+
+    /// A task's agent finished a stretch of work: tell the chat that handed
+    /// it out, which reads it as soon as it is free.
+    fn report_to_parent(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let Some(task) = self
+            .tasks
+            .iter()
+            .find(|t| t.state == crate::tasks::State::Open && self.task_pane(t, cx) == Some(pane))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(parent) = task.parent.as_deref() else {
+            return;
+        };
+        let Some(PaneKind::Chat(c)) = self
+            .panes
+            .values()
+            .map(|p| &p.kind)
+            .find(|k| matches!(k, PaneKind::Chat(c) if c.read(cx).thread_id() == parent))
+        else {
+            return;
+        };
+        let said = match self.panes.get(&pane).map(|p| &p.kind) {
+            Some(PaneKind::Chat(w)) => w.read(cx).last_reply(),
+            _ => None,
+        };
+        let ch = self.task_changes.get(&task.id).cloned().unwrap_or_default();
+        let msg = format!(
+            "[deck] Sub-task \"{}\" ({}) finished: {}. It changed {} file(s), +{} -{}. \
+             Review with `deck task diff --task {id}`, follow up with `deck task send --task {id} '…'`, \
+             then `deck task merge --task {id}` (or `pr` / `discard`).",
+            task.title,
+            task.id,
+            said.unwrap_or_else(|| "no reply text".into()),
+            ch.files,
+            ch.added,
+            ch.removed,
+            id = task.id,
+        );
+        let c = c.clone();
+        c.update(cx, |c, cx| c.send(msg, cx));
     }
 
     fn task(&self, id: &str) -> Option<&crate::tasks::Task> {
@@ -2514,7 +2787,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(PaneKind::Review(r)) = self.panes.get(&review).map(|p| &p.kind) {
+        self.finish_task_with(Some(review), task, how, None, window, cx);
+    }
+
+    fn finish_task_with(
+        &mut self,
+        review: Option<PaneId>,
+        task: crate::tasks::Task,
+        how: Finish,
+        reply: Option<Reply>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(PaneKind::Review(r)) = review.and_then(|r| self.panes.get(&r)).map(|p| &p.kind)
+        {
             r.update(cx, |r, cx| {
                 r.set_working(
                     Some(match how {
@@ -2541,22 +2827,38 @@ impl Workspace {
                 })
                 .await;
             let _ = this.update_in(cx, |ws, window, cx| {
-                let review_pane = ws.panes.get(&review).and_then(|p| match &p.kind {
-                    PaneKind::Review(r) => Some(r.clone()),
-                    _ => None,
-                });
+                let review_pane =
+                    review
+                        .and_then(|r| ws.panes.get(&r))
+                        .and_then(|p| match &p.kind {
+                            PaneKind::Review(r) => Some(r.clone()),
+                            _ => None,
+                        });
                 match done {
                     Err(e) => {
                         if let Some(r) = review_pane {
+                            let e = e.clone();
                             r.update(cx, |r, cx| r.fail(e, cx));
+                        }
+                        if let Some(r) = reply {
+                            r.send(Err(e));
                         }
                     }
                     Ok(Some(url)) => {
                         if let Some(r) = review_pane {
                             r.update(cx, |r, cx| r.set_working(None, cx));
                         }
-                        ws.open_url_near(review, &url, window, cx);
+                        let near = review.or_else(|| ws.task_pane(&task, cx));
+                        match near {
+                            Some(p) => {
+                                ws.open_url_near(p, &url, window, cx);
+                            }
+                            None => ws.open_url_beside(&url, window, cx),
+                        }
                         ws.flash("Pull request opened", cx);
+                        if let Some(r) = reply {
+                            r.send(Ok(json!({ "task": task.id, "pr": url })));
+                        }
                     }
                     Ok(None) => {
                         let worker = ws.task_pane(&task, cx);
@@ -2568,9 +2870,17 @@ impl Workspace {
                             };
                         }
                         crate::tasks::save_all(&ws.tasks);
-                        ws.close_pane(review, window, cx);
+                        if let Some(review) = review {
+                            ws.close_pane(review, window, cx);
+                        }
                         if let Some(w) = worker {
                             ws.close_pane(w, window, cx);
+                        }
+                        if let Some(r) = reply {
+                            r.send(Ok(json!({
+                                "task": task.id,
+                                "state": if how == Finish::Merge { "merged" } else { "discarded" },
+                            })));
                         }
                         ws.flash(
                             if how == Finish::Merge {
@@ -2937,6 +3247,73 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Claude Code in a terminal waits out API errors itself ("Retrying in
+    /// 18s · attempt 4/10") and can sit there a long time, or get no answer
+    /// at all. Deck presses Esc and, five seconds later, Enter (if Esc put
+    /// the message back in the box) or "continue". One Esc per stall: a
+    /// second would open Claude Code's rewind menu.
+    fn unstick_agents(&mut self, cx: &mut Context<Self>) {
+        if !crate::retry::enabled() {
+            return;
+        }
+        let now = Instant::now();
+        let claude: Vec<(PaneId, Entity<TerminalPane>)> = self
+            .panes
+            .iter()
+            .filter(|(id, _)| {
+                matches!(
+                    self.places.get(id).and_then(|p| p.agent.as_ref()),
+                    Some(("claude", _))
+                )
+            })
+            .filter_map(|(id, p)| match &p.kind {
+                PaneKind::Terminal(t) => Some((*id, t.clone())),
+                _ => None,
+            })
+            .collect();
+        for (id, t) in claude {
+            let screen = t.update(cx, |t, _| t.read_text());
+            if crate::retry::stall_line(&screen).is_none() {
+                // A quiet minute ends a streak.
+                if self
+                    .stalls
+                    .get(&id)
+                    .is_some_and(|(_, at)| now - *at > Duration::from_secs(60))
+                {
+                    self.stalls.remove(&id);
+                }
+                continue;
+            }
+            let (n, last) = self
+                .stalls
+                .get(&id)
+                .copied()
+                .unwrap_or((0, now - Duration::from_secs(3600)));
+            if now - last < Duration::from_secs(30) || n >= crate::retry::MAX_TRIES {
+                continue;
+            }
+            self.stalls.insert(id, (n + 1, now));
+            t.update(cx, |t, cx| t.send("\x1b", false, cx));
+            let weak = t.downgrade();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let _ = weak.update(cx, |t, cx| {
+                    if crate::retry::input_has_text(&t.read_text()) {
+                        t.send("", true, cx);
+                    } else {
+                        t.send("continue", true, cx);
+                    }
+                });
+            })
+            .detach();
+            tracing::info!(
+                pane = id,
+                try_ = n + 1,
+                "unstuck Claude Code from an API wait"
+            );
+        }
+    }
+
     /// "Claude finished: <the opening of its reply>", or of its task.
     fn finished_line(&self, id: PaneId, cx: &App) -> String {
         match self.panes.get(&id).map(|p| &p.kind) {
@@ -3124,6 +3501,74 @@ impl Workspace {
             }),
             "browser.open" => self.rpc_open(p, caller, window, cx),
             "browser.eval" => return self.rpc_eval(p, reply, cx),
+            "task.new" => return self.rpc_task_new(p, caller, reply, window, cx),
+            "task.list" => Ok(json!({
+                "tasks": self
+                    .tasks
+                    .iter()
+                    .filter(|t| t.state == crate::tasks::State::Open)
+                    .map(|t| self.task_json(t, cx))
+                    .collect::<Vec<_>>()
+            })),
+            "task.show" => self.task_param(p).map(|t| {
+                let mut v = self.task_json(&t, cx);
+                if let Some(PaneKind::Chat(c)) = self
+                    .task_pane(&t, cx)
+                    .and_then(|id| self.panes.get(&id))
+                    .map(|p| &p.kind)
+                {
+                    v["last_reply"] = json!(c.read(cx).last_reply());
+                    v["waiting_for"] = json!(c.read(cx).waiting_for());
+                }
+                v
+            }),
+            "task.diff" => match self.task_param(p) {
+                Ok(t) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            reply.send(
+                                crate::tasks::diff(&t).map(|d| json!({ "task": t.id, "diff": d })),
+                            )
+                        })
+                        .detach();
+                    return;
+                }
+                Err(e) => Err(e),
+            },
+            "task.send" => self.task_param(p).and_then(|t| {
+                let text = str_param(p, "text")
+                    .ok_or("missing the message")?
+                    .to_string();
+                let pane = self
+                    .task_pane(&t, cx)
+                    .ok_or("the task's agent is not open; open it from the sidebar")?;
+                match &self.panes[&pane].kind {
+                    PaneKind::Chat(c) => {
+                        c.update(cx, |c, cx| c.send(text, cx));
+                        Ok(json!({ "task": t.id, "pane": pane }))
+                    }
+                    PaneKind::Terminal(term) => {
+                        term.update(cx, |term, cx| term.send(&text, true, cx));
+                        Ok(json!({ "task": t.id, "pane": pane }))
+                    }
+                    _ => Err("the task's agent cannot take messages".into()),
+                }
+            }),
+            "task.merge" | "task.discard" | "task.pr" => match self.task_param(p) {
+                Ok(t) => {
+                    let how = match req.method.as_str() {
+                        "task.merge" => Finish::Merge,
+                        "task.discard" => Finish::Discard,
+                        _ => Finish::Pr,
+                    };
+                    let review = self.panes.iter().find_map(|(id, pane)| match &pane.kind {
+                        PaneKind::Review(r) if r.read(cx).task.id == t.id => Some(*id),
+                        _ => None,
+                    });
+                    return self.finish_task_with(review, t, how, Some(reply), window, cx);
+                }
+                Err(e) => Err(e),
+            },
             m => Err(format!("unknown method {m:?}; run `deck help`")),
         };
         reply.send(r);
@@ -3874,8 +4319,15 @@ impl Workspace {
         let state = pane.map(|id| self.thread_state(id, cx));
         let working = pane.and_then(|id| self.status(id, cx)) == Some(Status::Working);
         let wants = pane.and_then(|id| self.status(id, cx)) == Some(Status::Attention);
+        // Closed: the row stays, and a click starts a fresh conversation.
+        let subtitle: SharedString = if ix.is_none() && self.probed {
+            "Closed · click to start a new conversation".into()
+        } else {
+            subtitle
+        };
         div()
             .id("control")
+            .group("control-row")
             .flex()
             .items_center()
             .gap(u(ROW_GAP))
@@ -3925,10 +4377,36 @@ impl Workspace {
                     pill(label).into_any_element()
                 })
             })
+            // Close, as on every other row, while hovered.
+            .when(ix.is_some(), |d| {
+                d.child(
+                    icon_button("close-control", Icon::Close)
+                        .size(u(22.))
+                        .opacity(0.)
+                        .group_hover("control-row", |s| s.opacity(1.))
+                        .on_click(cx.listener(|ws, _, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(ix) = ws.control_tab() {
+                                ws.close_tab(ix, window, cx);
+                            }
+                        })),
+                )
+            })
             .on_click(
                 cx.listener(move |ws, _, window, cx| match ws.control_tab() {
                     Some(i) => ws.activate(i, window, cx),
-                    None => ws.open_control(Vec::new(), window, cx),
+                    None => {
+                        ws.open_control(Vec::new(), window, cx);
+                        if let Some(i) = ws.control_tab() {
+                            ws.activate(i, window, cx);
+                        }
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
+                    ws.open_control_menu(ev.position, window, cx)
                 }),
             )
             .into_any_element()
@@ -4728,6 +5206,8 @@ impl Render for Workspace {
             )
             .text_color(rgb(theme::text()))
             .on_action(cx.listener(|ws, _: &CommandPalette, w, cx| ws.toggle_palette(w, cx)))
+            .on_action(cx.listener(|ws, _: &NewControl, w, cx| ws.new_control(w, cx)))
+            .on_action(cx.listener(|ws, _: &RestartControl, w, cx| ws.restart_control(w, cx)))
             .on_action(cx.listener(|ws, _: &NewTab, w, cx| {
                 let _ = ws.new_tab(Open::Launcher, None, w, cx);
             }))

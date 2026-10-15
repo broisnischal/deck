@@ -31,6 +31,8 @@ Agents can drive Deck too. From any chat or terminal they can open terminals, st
 - **Approvals where you are typing.** When an agent asks to run a command or edit a file, the request appears above the composer. Answer with a click or ↑↓⏎, or just type what it should do instead. Questions from the agent show their options the same way.
 - **Choose how much it may do:** Ask first, Accept edits, or Full access, per thread.
 - **Talk while it works.** Messages you send mid-turn reach the agent as soon as its current step finishes. ⌘⏎ sends one right away. Esc stops the turn.
+- **Prompt rewriting.** A quick Claude run (Haiku by default) turns what you typed or dictated into a clear, complete prompt, using the thread's task and the agent's last reply to work out what "it" and "that" mean. ⏎ rewrites and sends, ⌃O rewrites into the box without sending, ⌃Z brings back your own words. Short replies, `/` commands and `!` commands go as typed. In Settings you can have it show the rewrite first, pick the model, or turn it off.
+- **Turns that fail come back by themselves.** On an API or network error Deck says "continue" after 5s, 10s, 20s… up to five minutes, eight tries; a usage limit waits until it resets; a login or billing problem is shown to you instead. Claude Code stuck in its own retry wait in a terminal gets the same nudge.
 - **Attach anything.** Paste a screenshot, drop files in, or `@` a file from the project.
 - **Threads last.** Transcripts, drafts and attachments survive a restart, and Claude resumes its own session.
 
@@ -38,6 +40,7 @@ Agents can drive Deck too. From any chat or terminal they can open terminals, st
 
 - **Start a task from ⌘K.** Describe what you want ("add dark mode to settings") and pick *Start a task*. Deck makes a fresh branch and a separate checkout for it, then starts an agent working on it there.
 - **Run several at once.** Each task has its own folder and branch, so agents never step on each other or on the checkout you're working in.
+- **Agents can hand out tasks too.** An agent working on a big job can split it into sub-tasks, each with its own agent on its own branch. Deck tells it when each one finishes, so it can review the changes and merge them. Ask the control chat to "split this into tasks" and watch them run in parallel.
 - **Watch them in the sidebar.** Each task shows what its agent is doing right now, or how many files and lines it has changed.
 - **Review, then decide.** The review shows every change file by file. Then:
   - **Merge** squashes it into your branch as one commit.
@@ -124,6 +127,12 @@ deck open http://localhost:3000         # the page, in Deck's browser, beside yo
 deck pane read --pane 3                 # read a terminal's screen
 deck pane send --pane 5 'run the tests' # message another agent's chat
 deck browser eval --pane 4 'document.title'
+
+deck task new 'add a dark mode toggle to settings'   # a sub-agent on its own branch
+deck task list                                       # what every task is doing
+deck task wait --task add-a-dark-mode                # until its agent is done
+deck task diff --task add-a-dark-mode                # what it changed
+deck task merge --task add-a-dark-mode               # squash it into your branch
 ```
 
 Output is JSON. Run `deck` with no arguments for everything it can do.

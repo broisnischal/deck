@@ -21,6 +21,8 @@ mod net;
 mod notify;
 mod palette;
 mod pasteboard;
+mod refine;
+mod retry;
 mod review;
 mod session;
 mod settings;

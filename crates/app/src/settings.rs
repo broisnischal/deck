@@ -39,6 +39,12 @@ pub struct Settings {
     pub notify_attention: bool,
     /// A notification when an agent finishes a long piece of work.
     pub notify_done: bool,
+    /// Rewrite chat messages into clear prompts before they are sent.
+    pub refine: crate::refine::Mode,
+    /// The model that rewrites them, by Claude Code's alias.
+    pub refine_model: String,
+    /// Say "continue" when a turn dies on an API or network error.
+    pub auto_retry: bool,
 }
 
 impl Default for Settings {
@@ -57,6 +63,9 @@ impl Default for Settings {
             default_agent: None,
             notify_attention: true,
             notify_done: true,
+            refine: crate::refine::Mode::default(),
+            refine_model: "haiku".into(),
+            auto_retry: true,
             access: Access::default(),
         }
     }
@@ -375,6 +384,12 @@ struct Stored {
     notify_attention: Option<bool>,
     #[serde(deserialize_with = "lenient")]
     notify_done: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    refine: Option<crate::refine::Mode>,
+    #[serde(deserialize_with = "lenient")]
+    refine_model: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    auto_retry: Option<bool>,
 }
 
 /// A value that does not parse (a scheme a newer build added, a string
@@ -423,6 +438,12 @@ fn from_stored(s: Stored) -> Settings {
         access: s.access.unwrap_or(d.access),
         notify_attention: s.notify_attention.unwrap_or(d.notify_attention),
         notify_done: s.notify_done.unwrap_or(d.notify_done),
+        refine: s.refine.unwrap_or(d.refine),
+        refine_model: s
+            .refine_model
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(d.refine_model),
+        auto_retry: s.auto_retry.unwrap_or(d.auto_retry),
     }
 }
 
@@ -501,6 +522,9 @@ mod tests {
             access: Access::Full,
             notify_attention: false,
             notify_done: true,
+            refine: crate::refine::Mode::Review,
+            refine_model: "sonnet".into(),
+            auto_retry: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(parse(&json), s);
