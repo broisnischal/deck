@@ -27,6 +27,7 @@ mod review;
 mod session;
 mod settings;
 mod settings_pane;
+mod snippets;
 mod tasks;
 mod terminal;
 mod textbuf;

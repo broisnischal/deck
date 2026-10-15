@@ -2,15 +2,18 @@
 //! changes. The pane edits its own copy and hands each change to the
 //! workspace, which saves it and pushes it to every pane.
 
+use crate::field::{Field, FieldEvent};
 use crate::icon::{icon, Icon};
 use crate::settings::{
     self, Access, Cursor, Scheme, Search, Settings, FONT_PX_RANGE, LINE_HEIGHT_RANGE, ZOOMS,
 };
+use crate::snippets::{self, Snippet};
 use crate::theme::{self, u};
 use gpui::prelude::*;
 use gpui::{
     div, ease_in_out, relative, rgb, rgba, Animation, AnimationExt, AnyElement, ClickEvent,
-    Context, Div, ElementId, EventEmitter, FocusHandle, FontWeight, SharedString, Stateful, Window,
+    Context, Div, ElementId, Entity, EventEmitter, FocusHandle, FontWeight, SharedString, Stateful,
+    Subscription, Window,
 };
 use std::time::Duration;
 
@@ -31,6 +34,21 @@ pub struct SettingsPane {
     /// The page the sidebar has open.
     page: Page,
     scroll: gpui::ScrollHandle,
+    /// The saved snippets, read again whenever their page opens.
+    snippets: Vec<Snippet>,
+    /// The snippet open for editing.
+    editing: Option<Editing>,
+}
+
+/// A snippet being edited: every keystroke is saved.
+struct Editing {
+    /// Its place in `snippets`.
+    ix: usize,
+    name: Entity<Field>,
+    body: Entity<Field>,
+    /// Delete was clicked once; the second click removes it.
+    confirm: bool,
+    _subs: [Subscription; 2],
 }
 
 impl EventEmitter<SettingsEvent> for SettingsPane {}
@@ -106,7 +124,127 @@ impl SettingsPane {
             flip: None,
             page: Page::Appearance,
             scroll: gpui::ScrollHandle::new(),
+            snippets: Vec::new(),
+            editing: None,
         }
+    }
+
+    /// Open `page`, at its top.
+    pub fn show(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.page = page;
+        self.editing = None;
+        if page == Page::Snippets {
+            self.snippets = snippets::load();
+        }
+        self.scroll
+            .set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        cx.notify();
+    }
+
+    // -- snippets -------------------------------------------------------------
+
+    fn edit_snippet(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(s) = self.snippets.get(ix).cloned() else {
+            return;
+        };
+        let name = cx.new(|cx| {
+            let mut f = Field::new("Name", cx);
+            f.set_text(&s.name, cx);
+            f.forget_undo();
+            f
+        });
+        let body = cx.new(|cx| {
+            let mut f = Field::multiline("The message to put in", cx);
+            f.editor = true;
+            f.set_text(&s.body, cx);
+            f.forget_undo();
+            f
+        });
+        let subs = [
+            cx.subscribe(&name, |p, f, ev: &FieldEvent, cx| {
+                if matches!(ev, FieldEvent::Changed) {
+                    let t = f.read(cx).text().to_string();
+                    p.update_snippet(|s| s.name = t, cx);
+                }
+            }),
+            cx.subscribe(&body, |p, f, ev: &FieldEvent, cx| {
+                if matches!(ev, FieldEvent::Changed) {
+                    let t = f.read(cx).text().to_string();
+                    p.update_snippet(|s| s.body = t, cx);
+                }
+            }),
+        ];
+        // A new one starts at its message; an old one is opened to change.
+        let first = if s.body.is_empty() { &body } else { &name };
+        window.focus(&first.read(cx).focus.clone());
+        self.editing = Some(Editing {
+            ix,
+            name,
+            body,
+            confirm: false,
+            _subs: subs,
+        });
+        cx.notify();
+    }
+
+    fn update_snippet(&mut self, f: impl FnOnce(&mut Snippet), cx: &mut Context<Self>) {
+        let Some(ix) = self.editing.as_ref().map(|e| e.ix) else {
+            return;
+        };
+        if let Some(s) = self.snippets.get_mut(ix) {
+            f(s);
+            snippets::save(&self.snippets);
+            cx.notify();
+        }
+    }
+
+    fn new_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.snippets = snippets::load();
+        let mut name = "New snippet".to_string();
+        let mut n = 2;
+        while self.snippets.iter().any(|s| s.name == name) {
+            name = format!("New snippet {n}");
+            n += 1;
+        }
+        self.snippets.push(Snippet {
+            name,
+            body: String::new(),
+        });
+        snippets::save(&self.snippets);
+        self.edit_snippet(self.snippets.len() - 1, window, cx);
+    }
+
+    /// Back to the list. One left with no message is dropped.
+    fn done_editing(&mut self, cx: &mut Context<Self>) {
+        if let Some(e) = self.editing.take() {
+            if self
+                .snippets
+                .get(e.ix)
+                .is_some_and(|s| s.body.trim().is_empty())
+            {
+                self.snippets.remove(e.ix);
+                snippets::save(&self.snippets);
+            }
+        }
+        cx.notify();
+    }
+
+    fn delete_snippet(&mut self, cx: &mut Context<Self>) {
+        let Some(e) = self.editing.as_mut() else {
+            return;
+        };
+        if !e.confirm {
+            e.confirm = true;
+            cx.notify();
+            return;
+        }
+        let ix = e.ix;
+        self.editing = None;
+        if ix < self.snippets.len() {
+            self.snippets.remove(ix);
+            snippets::save(&self.snippets);
+        }
+        cx.notify();
     }
 
     /// The workspace changed something itself (⌘+, ⌘−), or agents finished
@@ -417,15 +555,17 @@ pub enum Page {
     Terminal,
     Browser,
     Agents,
+    Snippets,
 }
 
 impl Page {
-    const ALL: [Page; 5] = [
+    const ALL: [Page; 6] = [
         Page::General,
         Page::Appearance,
         Page::Terminal,
         Page::Browser,
         Page::Agents,
+        Page::Snippets,
     ];
 
     fn name(self) -> &'static str {
@@ -435,6 +575,7 @@ impl Page {
             Page::Terminal => "Terminal",
             Page::Browser => "Browser",
             Page::Agents => "Agents",
+            Page::Snippets => "Snippets",
         }
     }
 
@@ -445,6 +586,7 @@ impl Page {
             Page::Terminal => Icon::Terminal,
             Page::Browser => Icon::Globe,
             Page::Agents => Icon::Claude,
+            Page::Snippets => Icon::Snippet,
         }
     }
 }
@@ -769,14 +911,97 @@ impl SettingsPane {
                             )),
                     )
                     .child(page.name())
-                    .on_click(cx.listener(move |p, _, _, cx| {
-                        p.page = page;
-                        p.scroll.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(move |p, _, _, cx| p.show(page, cx))),
             );
         }
         col.into_any_element()
+    }
+
+    fn page_snippets(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        if let Some(e) = &self.editing {
+            let delete = button(
+                "snippet-delete",
+                if e.confirm {
+                    "Click Again to Delete"
+                } else {
+                    "Delete Snippet"
+                },
+            )
+            .on_click(cx.listener(|p, _, _, cx| p.delete_snippet(cx)));
+            let done = button("snippet-done", "Done")
+                .on_click(cx.listener(|p, _, _, cx| p.done_editing(cx)));
+            return vec![
+                group(
+                    None,
+                    vec![
+                        wide("Name", e.name.clone().into_any_element()),
+                        wide("Message", e.body.clone().into_any_element()),
+                    ],
+                    Some("Saved as you type. ⏎ starts a new line. {clipboard} is replaced by what is on the clipboard when the snippet goes in.".into()),
+                ),
+                div()
+                    .flex()
+                    .justify_between()
+                    .px(u(2.))
+                    .child(delete)
+                    .child(done),
+            ];
+        }
+        let add = button("snippet-new", "New Snippet")
+            .on_click(cx.listener(|p, _, w, cx| p.new_snippet(w, cx)));
+        let note: SharedString = "⌘; lists these anywhere. The one you pick goes into the chat composer or terminal you are in without being sent, so you can add to it first. Save as Snippet in ⌘K or the Edit menu keeps what you have typed, or what is selected in a terminal.".into();
+        if self.snippets.is_empty() {
+            return vec![group(
+                None,
+                vec![row("No snippets yet", add.into_any_element())],
+                Some(note),
+            )];
+        }
+        let rows = self
+            .snippets
+            .iter()
+            .enumerate()
+            .map(|(ix, s)| {
+                div()
+                    .id(ElementId::NamedInteger("snippet".into(), ix as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(12.))
+                    .min_h(u(52.))
+                    .px(u(ROW_X))
+                    .py(u(8.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(theme::row_hover())))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(u(2.))
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(u(13.))
+                                    .text_color(rgb(theme::text()))
+                                    .child(s.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(snippets::preview(&s.body)),
+                            ),
+                    )
+                    .child(icon(Icon::ChevronRight, 13., theme::dim()))
+                    .on_click(cx.listener(move |p, _, w, cx| p.edit_snippet(ix, w, cx)))
+            })
+            .collect();
+        vec![
+            choices(None, rows, Some(note)),
+            div().flex().justify_end().px(u(2.)).child(add),
+        ]
     }
 
     fn page_general(&self, cx: &mut Context<Self>) -> Vec<Div> {
@@ -1104,6 +1329,7 @@ impl Render for SettingsPane {
             Page::Terminal => self.page_terminal(cx),
             Page::Browser => self.page_browser(cx),
             Page::Agents => self.page_agents(cx),
+            Page::Snippets => self.page_snippets(cx),
         };
         let mut column = div()
             .flex()

@@ -778,7 +778,14 @@ impl TerminalPane {
         }
     }
 
-    fn paste_text(&mut self, text: &str) {
+    /// What is selected, if anything.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_text()
+    }
+
+    /// Type `text` in as a paste: a shell or TUI takes it whole, and a
+    /// newline in it does not run anything.
+    pub fn paste_text(&mut self, text: &str) {
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let bytes = if self.term.bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~")

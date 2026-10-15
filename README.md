@@ -70,7 +70,8 @@ Agents can drive Deck too. From any chat or terminal they can open terminals, st
 
 ### A workspace that stays out of the way
 
-- **⌘K command palette:** jump to any tab, action, file or recent page from one box.
+- **⌘K command palette:** jump to any tab, action, snippet, file or recent page from one box.
+- **Snippets** for the messages you send again and again ("review my changes", "run the tests and fix what fails"). ⌘; lists them, and the one you pick goes into the chat composer or the terminal you are in, ready to add to and send. Save as Snippet keeps what you've typed, or a terminal selection; `{clipboard}` in a snippet puts in what you copied. Edit them in Settings › Snippets.
 - **⌘N new tab page:** a terminal, a browser, or any agent, as a chat or in its own terminal.
 - **Splits** you can drag to resize, with the focused pane clearly marked.
 - **An inspector** for the focused pane: its processes, listening ports, project files and git status.
@@ -100,6 +101,7 @@ Deck works with whichever agent CLIs you already have on your `PATH`: `claude`, 
 | Shortcut | Does |
 | --- | --- |
 | ⌘K | Command palette |
+| ⌘; | Insert a snippet |
 | ⌘N | New tab page |
 | ⌘T | New terminal |
 | ⇧⌘N | New chat |

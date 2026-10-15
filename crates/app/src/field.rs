@@ -69,6 +69,9 @@ pub struct Field {
     selecting: bool,
     /// No frame of its own: the composer draws the card around it.
     pub bare: bool,
+    /// A multi-line field where ⏎ types a newline, for writing text to keep
+    /// rather than a message to send.
+    pub editor: bool,
     /// ⌘V takes files and images (as `FieldEvent::Attach`), not just text.
     pub attachments: bool,
     /// The owner shows a popup (completions) that takes the arrow keys,
@@ -108,6 +111,7 @@ impl Field {
             scroll_x: px(0.),
             selecting: false,
             bare: false,
+            editor: false,
             attachments: false,
             popup: false,
             undo: Vec::new(),
@@ -142,6 +146,17 @@ impl Field {
             self.marked = None;
             self.hist_ix = None;
         }
+    }
+
+    /// Put `text` in at the caret, over any selection. One undo step.
+    pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
+        let text = if self.multiline {
+            text.to_string()
+        } else {
+            text.replace(['\r', '\n'], " ")
+        };
+        self.edit(Run::Other, cx, |b| b.insert(&text));
+        self.marked = None;
     }
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
@@ -353,7 +368,7 @@ impl Field {
         };
         let vertical = matches!(ks.key.as_str(), "up" | "down");
         match ks.key.as_str() {
-            "enter" if self.multiline && (m.shift || m.alt) => {
+            "enter" if self.multiline && (self.editor || m.shift || m.alt) => {
                 self.edit(Run::Other, cx, |b| b.insert("\n"))
             }
             "enter" if self.multiline && (m.platform || m.control) => {
@@ -824,6 +839,7 @@ impl Render for Field {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll)
             })
+            .when(self.editor, |d| d.min_h(u(132.)).px(u(10.)).py(u(8.)))
             .when(!self.bare, |d| {
                 d.rounded(u(8.))
                     .bg(rgb(if focused {

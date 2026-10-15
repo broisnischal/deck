@@ -48,6 +48,9 @@ actions!(
         Reload,
         ToggleDevTools,
         CommandPalette,
+        InsertSnippet,
+        SaveSnippet,
+        EditSnippets,
         RewritePrompt,
         MyWords,
         NewControl,
@@ -110,6 +113,8 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-0", ZoomReset, None),
         // ⌘K is the palette everywhere; clearing a terminal moves to ⇧⌘K.
         KeyBinding::new("cmd-k", CommandPalette, None),
+        // Saved messages, into the composer or the terminal you are in.
+        KeyBinding::new("cmd-;", InsertSnippet, None),
         // In a chat's composer: rewrite into the box, or bring my words back.
         KeyBinding::new("ctrl-o", RewritePrompt, Some("Composer")),
         KeyBinding::new("ctrl-z", MyWords, Some("Composer")),
@@ -182,6 +187,10 @@ pub fn install(cx: &mut App) {
                 MenuItem::action("Find…", Find),
                 MenuItem::action("Find Next", FindNext),
                 MenuItem::action("Find Previous", FindPrevious),
+                MenuItem::separator(),
+                MenuItem::action("Insert Snippet…", InsertSnippet),
+                MenuItem::action("Save as Snippet", SaveSnippet),
+                MenuItem::action("Edit Snippets…", EditSnippets),
             ],
         },
         Menu {
@@ -2115,7 +2124,8 @@ impl Workspace {
 
     /// ⌘K: open the palette over everything (pages step aside, since a
     /// native view would cover it), or close it if it is open.
-    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// ⌘K, or with `snippets_only` ⌘;: the snippets alone.
+    fn toggle_palette(&mut self, snippets_only: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
             return;
@@ -2123,18 +2133,24 @@ impl Workspace {
         let from = self.focused();
         let cwd = self.focused_cwd(cx).unwrap_or_else(|| self.cwd.clone());
         let in_repo = cwd.ancestors().any(|d| d.join(".git").exists());
-        let items = self.palette_items(cx);
-        let palette = cx.new(|cx| Palette::new(items, in_repo, cx));
+        let palette = if snippets_only {
+            let items = snippet_items();
+            cx.new(|cx| Palette::snippets(items, cx))
+        } else {
+            let items = self.palette_items(cx);
+            cx.new(|cx| Palette::new(items, in_repo, cx))
+        };
         let sub = cx.subscribe_in(
             &palette,
             window,
-            |ws, _, ev: &PaletteEvent, window, cx| match ev {
+            move |ws, _, ev: &PaletteEvent, window, cx| match ev {
                 PaletteEvent::Close => ws.close_palette(window, cx),
                 PaletteEvent::Run(pick) => {
                     let pick = pick.clone();
                     ws.close_palette(window, cx);
                     ws.run_pick(pick, window, cx);
                 }
+                PaletteEvent::Query(_) if snippets_only => {}
                 PaletteEvent::Query(q) => {
                     let pages = crate::history::search(q, 6)
                         .into_iter()
@@ -2161,6 +2177,9 @@ impl Workspace {
         let root = crate::inspect::project_root(&cwd);
         let weak = palette.downgrade();
         cx.spawn_in(window, async move |_, cx| {
+            if snippets_only {
+                return;
+            }
             let files = cx
                 .background_executor()
                 .spawn({
@@ -2297,6 +2316,27 @@ impl Workspace {
                 Box::new(RestartControl),
             ),
             action(
+                "Insert Snippet",
+                "A saved message, into the composer or terminal",
+                Icon::Snippet,
+                Some("⌘;"),
+                Box::new(InsertSnippet),
+            ),
+            action(
+                "Save as Snippet",
+                "What is in the composer, or the terminal selection",
+                Icon::Snippet,
+                None,
+                Box::new(SaveSnippet),
+            ),
+            action(
+                "Edit Snippets",
+                "Name, change or remove saved messages",
+                Icon::Pencil,
+                None,
+                Box::new(EditSnippets),
+            ),
+            action(
                 "New Browser Tab",
                 "",
                 Icon::Globe,
@@ -2404,6 +2444,7 @@ impl Workspace {
                 Box::new(PrevTab),
             ),
         ]);
+        items.extend(snippet_items());
         items
     }
 
@@ -2421,6 +2462,75 @@ impl Workspace {
             P::Page(url) => self.open_url_beside(&url, window, cx),
             P::NewTask(brief) => self.start_task(brief, window, cx),
             P::Review(task) => self.open_review(&task, window, cx),
+            P::Snippet(body) => self.insert_snippet(&body, window, cx),
+            P::SaveSnippet(text) => {
+                let name = crate::snippets::add(&text);
+                self.flash(format!("Kept \"{name}\" as a snippet. ⌘; puts it in."), cx);
+            }
+        }
+    }
+
+    // -- snippets -------------------------------------------------------------
+
+    /// Put a snippet's text where you are typing: at the caret in a chat's
+    /// composer, or at a terminal's prompt (as a paste, so nothing runs until
+    /// you press ⏎). Anywhere else it goes on the clipboard.
+    fn insert_snippet(&mut self, body: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let text =
+            crate::snippets::expand(body, || cx.read_from_clipboard().and_then(|c| c.text()));
+        let kind = self
+            .focused()
+            .and_then(|id| self.panes.get(&id))
+            .map(|p| match &p.kind {
+                PaneKind::Chat(c) => Ok(c.clone()),
+                PaneKind::Terminal(t) => Err(Some(t.clone())),
+                _ => Err(None),
+            });
+        match kind {
+            Some(Ok(chat)) => {
+                let composer = chat.read(cx).composer.clone();
+                composer.update(cx, |f, cx| f.insert(&text, cx));
+                let focus = composer.read(cx).focus.clone();
+                window.focus(&focus);
+            }
+            Some(Err(Some(term))) => term.update(cx, |t, _| t.paste_text(&text)),
+            _ => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                self.flash("Snippet copied. ⌘V to paste it.", cx);
+            }
+        }
+    }
+
+    /// Keep what you are writing as a snippet: the composer's text, or what
+    /// is selected in the terminal. With neither, open the snippets to add
+    /// one by hand.
+    fn save_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self
+            .focused()
+            .and_then(|id| self.panes.get(&id))
+            .and_then(|p| match &p.kind {
+                PaneKind::Chat(c) => Some(c.read(cx).composer.read(cx).text().to_string()),
+                PaneKind::Terminal(t) => t.read(cx).selection_text(),
+                _ => None,
+            })
+            .filter(|t| !t.trim().is_empty());
+        match text {
+            Some(text) => {
+                let name = crate::snippets::add(&text);
+                self.flash(format!("Kept \"{name}\" as a snippet. ⌘; puts it in."), cx);
+            }
+            None => self.edit_snippets(window, cx),
+        }
+    }
+
+    fn edit_snippets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(window, cx);
+        let pane = self.panes.values().find_map(|p| match &p.kind {
+            PaneKind::Settings(s) => Some(s.clone()),
+            _ => None,
+        });
+        if let Some(s) = pane {
+            s.update(cx, |s, cx| s.show(crate::settings_pane::Page::Snippets, cx));
         }
     }
 
@@ -5205,7 +5315,10 @@ impl Render for Workspace {
                 }),
             )
             .text_color(rgb(theme::text()))
-            .on_action(cx.listener(|ws, _: &CommandPalette, w, cx| ws.toggle_palette(w, cx)))
+            .on_action(cx.listener(|ws, _: &CommandPalette, w, cx| ws.toggle_palette(false, w, cx)))
+            .on_action(cx.listener(|ws, _: &InsertSnippet, w, cx| ws.toggle_palette(true, w, cx)))
+            .on_action(cx.listener(|ws, _: &SaveSnippet, w, cx| ws.save_snippet(w, cx)))
+            .on_action(cx.listener(|ws, _: &EditSnippets, w, cx| ws.edit_snippets(w, cx)))
             .on_action(cx.listener(|ws, _: &NewControl, w, cx| ws.new_control(w, cx)))
             .on_action(cx.listener(|ws, _: &RestartControl, w, cx| ws.restart_control(w, cx)))
             .on_action(cx.listener(|ws, _: &NewTab, w, cx| {
@@ -5366,6 +5479,9 @@ impl Render for Workspace {
                     } else {
                         0x00000026
                     }))
+                    // Nothing under the scrim gets the wheel or the hover,
+                    // so scrolling moves the palette's list, not the pane.
+                    .occlude()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|ws, _, window, cx| ws.close_palette(window, cx)),
@@ -5571,4 +5687,24 @@ mod tests {
         assert_eq!(host("https://example.com/a?b"), "example.com");
         assert_eq!(host("http://localhost:5173/"), "localhost:5173");
     }
+}
+
+/// The saved snippets as palette rows.
+fn snippet_items() -> Vec<Item> {
+    crate::snippets::load()
+        .into_iter()
+        .filter(|s| !s.body.trim().is_empty())
+        .map(|s| Item {
+            kind: Kind::Snippet,
+            detail: crate::snippets::preview(&s.body).into(),
+            title: if s.name.trim().is_empty() {
+                crate::snippets::preview(&s.body).into()
+            } else {
+                s.name.into()
+            },
+            icon: Icon::Snippet,
+            hint: None,
+            pick: crate::palette::Pick::Snippet(s.body),
+        })
+        .collect()
 }

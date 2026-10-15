@@ -26,6 +26,10 @@ pub enum Pick {
     NewTask(String),
     /// Open the review of the task with this id.
     Review(String),
+    /// Put this snippet's text into the pane the palette came from.
+    Snippet(String),
+    /// Keep the typed text as a new snippet.
+    SaveSnippet(String),
 }
 
 impl Clone for Pick {
@@ -37,6 +41,8 @@ impl Clone for Pick {
             Pick::Page(u) => Pick::Page(u.clone()),
             Pick::NewTask(t) => Pick::NewTask(t.clone()),
             Pick::Review(t) => Pick::Review(t.clone()),
+            Pick::Snippet(t) => Pick::Snippet(t.clone()),
+            Pick::SaveSnippet(t) => Pick::SaveSnippet(t.clone()),
         }
     }
 }
@@ -45,6 +51,7 @@ impl Clone for Pick {
 pub enum Kind {
     Tab,
     Action,
+    Snippet,
     File,
     Page,
 }
@@ -54,6 +61,7 @@ impl Kind {
         match self {
             Kind::Tab => "Tabs",
             Kind::Action => "Actions",
+            Kind::Snippet => "Snippets",
             Kind::File => "Files",
             Kind::Page => "Pages",
         }
@@ -87,6 +95,9 @@ pub struct Palette {
     pages: Vec<Item>,
     /// Whether "Start a task" is offered (the focused pane is in a repo).
     tasks: bool,
+    /// Opened with ⌘;: only snippets, all of them shown before anything is
+    /// typed, and what you type can be kept as a new one.
+    snippets_only: bool,
     /// (item index, matched byte positions), best first.
     shown: Vec<(Ref, Vec<usize>)>,
     selected: usize,
@@ -102,21 +113,41 @@ enum Ref {
     Item(usize),
     Page(usize),
     NewTask,
+    NewSnippet,
 }
 
 impl EventEmitter<PaletteEvent> for Palette {}
 
 impl Palette {
     pub fn new(items: Vec<Item>, tasks: bool, cx: &mut Context<Self>) -> Self {
+        let hint = if tasks {
+            "Search tabs, actions, snippets, files and pages, or describe a task…"
+        } else {
+            "Search tabs, actions, snippets, files and pages…"
+        };
+        Self::build(items, tasks, false, hint, cx)
+    }
+
+    /// The snippets alone (⌘;).
+    pub fn snippets(items: Vec<Item>, cx: &mut Context<Self>) -> Self {
+        Self::build(
+            items,
+            false,
+            true,
+            "Insert a snippet, or type a new one to keep…",
+            cx,
+        )
+    }
+
+    fn build(
+        items: Vec<Item>,
+        tasks: bool,
+        snippets_only: bool,
+        hint: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let field = cx.new(|cx| {
-            let mut f = Field::new(
-                if tasks {
-                    "Search tabs, actions, files and pages, or describe a task…"
-                } else {
-                    "Search tabs, actions, files and pages…"
-                },
-                cx,
-            );
+            let mut f = Field::new(hint, cx);
             f.bare = true;
             f.popup = true;
             f
@@ -138,6 +169,7 @@ impl Palette {
             items,
             pages: Vec::new(),
             tasks,
+            snippets_only,
             shown: Vec::new(),
             selected: 0,
             child_of: Vec::new(),
@@ -172,7 +204,7 @@ impl Palette {
         match r {
             Ref::Item(i) => self.items.get(i),
             Ref::Page(i) => self.pages.get(i),
-            Ref::NewTask => None,
+            Ref::NewTask | Ref::NewSnippet => None,
         }
     }
 
@@ -183,7 +215,9 @@ impl Palette {
             // Nothing typed: the tabs, then what you can do. Files and pages
             // only once there is something to look for.
             for (i, it) in self.items.iter().enumerate() {
-                if matches!(it.kind, Kind::Tab | Kind::Action) {
+                if matches!(it.kind, Kind::Tab | Kind::Action)
+                    || (self.snippets_only && it.kind == Kind::Snippet)
+                {
                     hits.push((0, it.kind, Ref::Item(i), Vec::new()));
                 }
             }
@@ -216,6 +250,7 @@ impl Palette {
                     let kind_bonus = match it.kind {
                         Kind::Tab => 6,
                         Kind::Action => 4,
+                        Kind::Snippet => 3,
                         Kind::Page => 0,
                         Kind::File => -2,
                     };
@@ -228,6 +263,9 @@ impl Palette {
         self.shown = hits.into_iter().map(|(_, _, r, at)| (r, at)).collect();
         if self.tasks && !q.is_empty() {
             self.shown.push((Ref::NewTask, Vec::new()));
+        }
+        if self.snippets_only && !q.is_empty() {
+            self.shown.push((Ref::NewSnippet, Vec::new()));
         }
         // Labels sit between kinds only while nothing is typed.
         self.child_of.clear();
@@ -265,6 +303,7 @@ impl Palette {
         };
         let pick = match r {
             Ref::NewTask => Pick::NewTask(self.query(cx)),
+            Ref::NewSnippet => Pick::SaveSnippet(self.field.read(cx).text().to_string()),
             r => match self.item(*r) {
                 Some(it) => it.pick.clone(),
                 None => return,
@@ -305,10 +344,11 @@ impl Render for Palette {
             .id("palette-list")
             .flex()
             .flex_col()
-            .max_h(u(420.))
+            .gap(u(2.))
+            .max_h(u(460.))
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
-            .p(u(6.));
+            .p(u(8.));
         let mut last_kind: Option<Kind> = None;
         for (row, (r, at)) in self.shown.iter().enumerate() {
             let selected = row == self.selected;
@@ -324,6 +364,13 @@ impl Render for Palette {
                     "A new branch and worktree, with an agent working on it".into(),
                     Icon::Git,
                     Some("⏎"),
+                    None,
+                ),
+                Ref::NewSnippet => (
+                    StyledText::new(SharedString::from(format!("Keep as a snippet: {q}"))),
+                    "Saved for ⌘; to put in again".into(),
+                    Icon::Plus,
+                    None,
                     None,
                 ),
                 r => {
@@ -342,9 +389,9 @@ impl Render for Palette {
                 if let Some(k) = kind {
                     list = list.child(
                         div()
-                            .px(u(10.))
-                            .pt(u(if row == 0 { 4. } else { 10. }))
-                            .pb(u(4.))
+                            .px(u(12.))
+                            .pt(u(if row == 0 { 6. } else { 14. }))
+                            .pb(u(6.))
                             .text_size(u(11.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(theme::dim()))
@@ -358,8 +405,8 @@ impl Render for Palette {
                     .id(ElementId::NamedInteger("pal".into(), row as u64))
                     .flex()
                     .items_center()
-                    .gap(u(10.))
-                    .h(u(36.))
+                    .gap(u(12.))
+                    .h(u(40.))
                     .px(u(10.))
                     .rounded(u(8.))
                     .text_size(u(13.))
@@ -368,22 +415,32 @@ impl Render for Palette {
                     // the selection a step more.
                     .when(selected, |d| d.bg(rgb(theme::surface_hover())))
                     .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::surface()))))
-                    .child(icon(
-                        glyph,
-                        15.,
-                        if selected {
-                            theme::text()
-                        } else {
-                            theme::text_2()
-                        },
-                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(u(26.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(u(7.))
+                            .bg(rgba(theme::tint()))
+                            .child(icon(
+                                glyph,
+                                14.,
+                                if selected {
+                                    theme::text()
+                                } else {
+                                    theme::text_2()
+                                },
+                            )),
+                    )
                     .child(
                         div()
                             .flex()
                             .flex_1()
                             .min_w_0()
                             .items_center()
-                            .gap(u(8.))
+                            .gap(u(10.))
                             .child(
                                 div()
                                     .flex_shrink()
@@ -402,15 +459,18 @@ impl Render for Palette {
                                     .child(detail),
                             ),
                     )
-                    .when(!q.is_empty() && kind.is_some(), |d| {
-                        d.child(
-                            div()
-                                .flex_none()
-                                .text_size(u(11.))
-                                .text_color(rgb(theme::dim()))
-                                .child(kind.map(Kind::label).unwrap_or_default()),
-                        )
-                    })
+                    .when(
+                        !q.is_empty() && kind.is_some() && !self.snippets_only,
+                        |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(kind.map(Kind::label).unwrap_or_default()),
+                            )
+                        },
+                    )
                     .children(hint.map(|h| {
                         div()
                             .flex_none()
@@ -430,17 +490,21 @@ impl Render for Palette {
         if self.shown.is_empty() {
             list = list.child(
                 div()
-                    .px(u(10.))
-                    .py(u(14.))
+                    .px(u(12.))
+                    .py(u(22.))
                     .text_size(u(13.))
                     .text_color(rgb(theme::dim()))
-                    .child("Nothing matches"),
+                    .child(if self.snippets_only {
+                        "No snippets yet. Type one and press ⏎ to keep it."
+                    } else {
+                        "Nothing matches"
+                    }),
             );
         }
 
         div()
             .id("palette")
-            .w(u(620.))
+            .w(u(660.))
             .max_w(relative(0.9))
             .flex()
             .flex_col()
@@ -454,10 +518,10 @@ impl Render for Palette {
                 div()
                     .flex()
                     .items_center()
-                    .gap(u(4.))
-                    .h(u(52.))
-                    .pl(u(16.))
-                    .pr(u(10.))
+                    .gap(u(10.))
+                    .h(u(56.))
+                    .pl(u(18.))
+                    .pr(u(14.))
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
                     .text_size(u(15.))
@@ -482,17 +546,39 @@ impl Render for Palette {
                 div()
                     .flex()
                     .items_center()
-                    .gap(u(14.))
-                    .h(u(32.))
-                    .px(u(16.))
+                    .gap(u(18.))
+                    .h(u(38.))
+                    .px(u(18.))
                     .border_t_1()
                     .border_color(rgba(theme::hairline()))
                     .text_size(u(11.))
                     .text_color(rgb(theme::dim()))
-                    .child("↑↓ choose")
-                    .child("⏎ open")
-                    .child("esc close"),
+                    .child(key_hint("↑↓", "choose"))
+                    .child(key_hint("⏎", "open"))
+                    .child(key_hint("esc", "close")),
             )
             .into_any_element()
     }
+}
+
+/// A keycap and what it does, for the footer.
+fn key_hint(key: &'static str, does: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(u(6.))
+        .child(
+            div()
+                .px(u(5.))
+                .h(u(18.))
+                .min_w(u(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(u(4.))
+                .bg(rgba(theme::tint()))
+                .text_color(rgb(theme::text_2()))
+                .child(key),
+        )
+        .child(does)
 }
