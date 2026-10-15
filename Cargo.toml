@@ -37,7 +37,7 @@ smol_str = { version = "0.3", features = ["serde"] }
 # Metal toolchain. phobos: switch to precompiled for release builds if launch
 # time ever shows it.
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
-wry = "0.57"
+wry = { version = "0.57", features = ["devtools"] }
 raw-window-handle = "0.6"
 objc2-app-kit = "0.3"
 

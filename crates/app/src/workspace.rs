@@ -5,9 +5,11 @@
 use crate::browser::{BrowserEvent, BrowserPane};
 use crate::chat::{ChatEnv, ChatEvent, ChatPane, ChatStatus};
 use crate::control::{self, Reply};
-use crate::icon::{icon, Icon};
+use crate::icon::{icon, shimmer, spinner, thinking, Icon};
 use crate::inspect;
 use crate::inspector::{self, Inspector};
+use crate::launcher::{Choice, LauncherEvent, LauncherPane, Pick};
+use crate::settings_pane::{SettingsEvent, SettingsPane};
 use crate::terminal::{TerminalEvent, TerminalPane};
 use crate::theme::{self, u};
 use futures::StreamExt;
@@ -15,7 +17,7 @@ use gpui::prelude::*;
 use gpui::{
     actions, div, px, rgb, rgba, AnyElement, AnyView, App, Context, ElementId, Entity, FontWeight,
     KeyBinding, Menu, MenuItem, MouseButton, OsAction, SharedString, StyleRefinement, Subscription,
-    Task, Window,
+    Task, WeakEntity, Window,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -27,9 +29,11 @@ use std::time::{Duration, Instant};
 actions!(
     deck,
     [
+        NewTab,
         NewTerminal,
         NewBrowser,
         NewChat,
+        OpenSettings,
         ToggleAgents,
         SplitRight,
         SplitDown,
@@ -40,6 +44,7 @@ actions!(
         PrevPane,
         FocusAddress,
         Reload,
+        ToggleDevTools,
         ToggleSidebar,
         ToggleInspector,
         Quit,
@@ -70,10 +75,12 @@ actions!(
 
 pub fn install(cx: &mut App) {
     let mut keys = vec![
-        KeyBinding::new("cmd-t", NewTerminal, None),
+        KeyBinding::new("cmd-t", NewTab, None),
+        KeyBinding::new("alt-cmd-t", NewTerminal, None),
         KeyBinding::new("cmd-n", NewChat, None),
         KeyBinding::new("cmd-shift-t", NewBrowser, None),
         KeyBinding::new("cmd-shift-a", ToggleAgents, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-d", SplitRight, None),
         KeyBinding::new("cmd-shift-d", SplitDown, None),
         KeyBinding::new("cmd-w", ClosePane, None),
@@ -96,6 +103,11 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-f", Find, Some("Terminal")),
         KeyBinding::new("cmd-g", FindNext, Some("Terminal")),
         KeyBinding::new("cmd-shift-g", FindPrevious, Some("Terminal")),
+        // Anywhere else, find goes to the focused page.
+        KeyBinding::new("cmd-f", Find, None),
+        KeyBinding::new("cmd-g", FindNext, None),
+        KeyBinding::new("cmd-shift-g", FindPrevious, None),
+        KeyBinding::new("alt-cmd-i", ToggleDevTools, None),
     ];
     for ctx in ["Terminal", "Field"] {
         keys.push(KeyBinding::new("cmd-c", Copy, Some(ctx)));
@@ -103,6 +115,7 @@ pub fn install(cx: &mut App) {
     }
     keys.push(KeyBinding::new("cmd-x", Cut, Some("Field")));
     keys.push(KeyBinding::new("cmd-a", SelectAll, Some("Field")));
+    keys.push(KeyBinding::new("cmd-a", SelectAll, Some("Terminal")));
     keys.push(KeyBinding::new("cmd-z", Undo, Some("Field")));
     keys.push(KeyBinding::new("cmd-shift-z", Redo, Some("Field")));
     keys.extend([
@@ -123,12 +136,17 @@ pub fn install(cx: &mut App) {
     cx.set_menus(vec![
         Menu {
             name: "Deck".into(),
-            items: vec![MenuItem::action("Quit Deck", Quit)],
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit Deck", Quit),
+            ],
         },
         Menu {
             name: "File".into(),
             items: vec![
                 MenuItem::action("New Chat", NewChat),
+                MenuItem::action("New Tab…", NewTab),
                 MenuItem::action("New Terminal Tab", NewTerminal),
                 MenuItem::action("New Browser Tab", NewBrowser),
                 MenuItem::action("New Agent…", ToggleAgents),
@@ -167,6 +185,7 @@ pub fn install(cx: &mut App) {
                 MenuItem::separator(),
                 MenuItem::action("Open Location…", FocusAddress),
                 MenuItem::action("Reload Page", Reload),
+                MenuItem::action("Web Inspector", ToggleDevTools),
             ],
         },
         Menu {
@@ -298,12 +317,28 @@ impl Node {
             Node::Split(_, children) => children.iter().any(|c| c.contains(id)),
         }
     }
+
+    /// Put `new` where `old` is, keeping the layout around it.
+    fn replace(&mut self, old: PaneId, new: PaneId) -> bool {
+        match self {
+            Node::Leaf(id) if *id == old => {
+                *id = new;
+                true
+            }
+            Node::Leaf(_) => false,
+            Node::Split(_, children) => children.iter_mut().any(|c| c.replace(old, new)),
+        }
+    }
 }
 
 enum PaneKind {
     Terminal(Entity<TerminalPane>),
     Browser(Entity<BrowserPane>),
     Chat(Entity<ChatPane>),
+    /// The one Settings tab (⌘,).
+    Settings(Entity<SettingsPane>),
+    /// A new tab that has not been told what to be yet (⌘T).
+    Launcher(Entity<LauncherPane>),
 }
 
 struct Pane {
@@ -345,6 +380,8 @@ pub enum Open {
     },
     /// A chat thread saved by an earlier launch.
     Thread(Box<crate::threads::Saved>),
+    Settings,
+    Launcher,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -387,6 +424,14 @@ pub struct Workspace {
     /// pane's rights, acting as the focused pane.
     automation: Option<String>,
     control: Option<control::Server>,
+    /// The right-click menu of a sidebar row, while open.
+    menu: Option<crate::menu::Open>,
+    /// The sidebar and the inspector, each its own cached view.
+    islands: Option<(Entity<Island>, Entity<Island>)>,
+    /// Where each terminal and chat is working, refreshed by the tick.
+    places: HashMap<PaneId, Place>,
+    /// Terminals running a command that is printing right now.
+    busy: std::collections::HashSet<PaneId>,
     _requests: Option<Task<()>>,
     _tick: Task<()>,
 }
@@ -422,14 +467,22 @@ impl Workspace {
             refreshing: false,
             chats: None,
             probed: false,
-            settings: crate::settings::load(),
+            settings: {
+                let s = crate::settings::load();
+                crate::browser::set_search_engine(s.search);
+                s
+            },
             statuses: Vec::new(),
             unseen: Default::default(),
+            islands: None,
+            places: HashMap::new(),
+            busy: Default::default(),
             ticks: 0,
             automation: std::env::var("DECK_AUTOMATION_TOKEN")
                 .ok()
                 .filter(|t| t.len() >= 16),
             control: None,
+            menu: None,
             _requests: None,
             _tick: tick,
         };
@@ -446,6 +499,14 @@ impl Workspace {
                     Err(e) => tracing::error!("agent runtime unavailable: {e}"),
                 }
                 ws.probed = true;
+                let agents = ws.ready_agents();
+                let settings = ws.settings.clone();
+                for pane in ws.panes.values() {
+                    if let PaneKind::Settings(s) = &pane.kind {
+                        let agents = agents.clone();
+                        s.update(cx, |s, cx| s.sync(&settings, Some(agents), cx));
+                    }
+                }
                 ws.open_control(saved, window, cx);
             });
         })
@@ -497,12 +558,15 @@ impl Workspace {
                             .map(|s| s.rsplit('/').next().unwrap_or("shell").to_string())
                     })
                     .unwrap_or_else(|| "shell".into());
-                let font_px = self.settings.terminal_font();
-                let t = cx.new(|cx| TerminalPane::new(pty, title, font_px, window, cx));
+                let look = self.settings.term_look();
+                let t = cx.new(|cx| TerminalPane::new(pty, title, look, window, cx));
                 let sub =
                     cx.subscribe_in(&t, window, move |ws, _, ev: &TerminalEvent, window, cx| {
                         match ev {
                             TerminalEvent::Focused => ws.mark_focused(id, cx),
+                            // The sidebar draws only when the workspace
+                            // notifies, so a new title has to say so.
+                            TerminalEvent::Retitled => cx.notify(),
                             TerminalEvent::Exited => ws.close_pane(id, window, cx),
                             TerminalEvent::OpenUrl(url) => {
                                 let url = url.clone();
@@ -526,12 +590,15 @@ impl Workspace {
                     Open::Chat { agent, cwd } => {
                         let agent = match agent {
                             Some(a) => agent_core::AgentId::new(a),
-                            None => env.default_agent().ok_or_else(|| {
+                            None => self.default_agent().ok_or_else(|| {
                                 anyhow::anyhow!("no agent CLI is installed and signed in")
                             })?,
                         };
                         let cwd = cwd.unwrap_or_else(|| self.cwd.clone());
-                        cx.new(|cx| ChatPane::new(env, agent, cwd, agent_env, cx))
+                        let c = cx.new(|cx| ChatPane::new(env, agent, cwd, agent_env, cx));
+                        let mode = self.settings.access.mode();
+                        c.update(cx, |c, _| c.set_mode(mode));
+                        c
                     }
                     _ => unreachable!(),
                 };
@@ -551,7 +618,7 @@ impl Workspace {
             }
             Open::Browser { url } => {
                 let (webview, events, url) = BrowserPane::build(&url, window)?;
-                let b = cx.new(|cx| BrowserPane::new(webview, events, url, cx));
+                let b = cx.new(|cx| BrowserPane::new(webview, events, url, window, cx));
                 let zoom = self.settings.zoom as f64;
                 b.update(cx, |b, _| b.set_zoom(zoom));
                 let sub =
@@ -567,11 +634,14 @@ impl Workspace {
                                 let url = url.clone();
                                 let _ = ws.new_tab(Open::Browser { url }, None, window, cx);
                             }
+                            BrowserEvent::Retitled => cx.notify(),
                             BrowserEvent::Close => ws.close_pane(id, window, cx),
                         }
                     });
                 (PaneKind::Browser(b), None, sub)
             }
+            Open::Settings => self.make_settings(window, cx),
+            Open::Launcher => self.make_launcher(id, window, cx),
         };
         self.next_id += 1;
         self.panes.insert(
@@ -603,7 +673,7 @@ impl Workspace {
             .iter()
             .rposition(|s| s.control)
             .map(|i| saved.remove(i));
-        let agent = self.chats.as_ref().and_then(|e| e.default_agent());
+        let agent = self.default_agent();
         let what = match control {
             Some(s) => Some(Open::Thread(Box::new(s))),
             None => agent.map(|a| Open::Chat {
@@ -784,6 +854,14 @@ impl Workspace {
                 window.focus(&c.read(cx).composer.read(cx).focus);
                 crate::browser::reclaim_keyboard(window);
             }
+            Some(PaneKind::Settings(s)) => {
+                window.focus(&s.read(cx).focus);
+                crate::browser::reclaim_keyboard(window);
+            }
+            Some(PaneKind::Launcher(l)) => {
+                window.focus(&l.read(cx).focus);
+                crate::browser::reclaim_keyboard(window);
+            }
             None => {}
         }
         self.inspector.data = Default::default();
@@ -855,6 +933,129 @@ impl Workspace {
             self.activate(self.active, window, cx);
         }
         cx.notify();
+    }
+
+    /// Every other tab of the same kind as `keep` (threads or workspace),
+    /// pinned ones aside. A terminal's "Close Other Tabs" leaves your chats.
+    fn close_other_tabs(&mut self, keep: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(keep) else {
+            return;
+        };
+        let (kept, group) = (tab.focused, self.group(tab));
+        for ix in (0..self.tabs.len()).rev() {
+            if ix == keep || self.tabs[ix].pinned || self.group(&self.tabs[ix]) != group {
+                continue;
+            }
+            for id in self.tabs[ix].leaves() {
+                self.discard(id, cx);
+            }
+            self.tabs.remove(ix);
+        }
+        if let Some(ix) = self.tab_of(kept) {
+            self.activate(ix, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// A sidebar row's right-click menu. Items find their tab again by pane
+    /// when they run, since tabs can open or close while the menu is up.
+    fn open_tab_menu(
+        &mut self,
+        ix: usize,
+        mut at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::menu::{Entry, Item};
+        let Some(tab) = self.tabs.get(ix) else {
+            return;
+        };
+        let pane = tab.focused;
+        let threads = self.group(tab) == Group::Threads;
+        let url = match self.panes.get(&pane).map(|p| &p.kind) {
+            Some(PaneKind::Browser(b)) => {
+                Some(b.read(cx).url.to_string()).filter(|u| !u.is_empty())
+            }
+            _ => None,
+        };
+        let ws = cx.entity().downgrade();
+        let mut entries: Vec<Entry> = Vec::new();
+        if let Some(url) = url {
+            entries.push(
+                Item::new("Copy URL", move |_, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()))
+                })
+                .icon(Icon::Link)
+                .into(),
+            );
+            entries.push(Entry::Separator);
+        }
+        let close = ws.clone();
+        entries.push(
+            Item::new(
+                if threads { "Close Thread" } else { "Close Tab" },
+                move |window, cx| {
+                    let _ = close.update(cx, |ws, cx| {
+                        if let Some(ix) = ws.tab_of(pane) {
+                            ws.close_tab(ix, window, cx);
+                        }
+                    });
+                },
+            )
+            .icon(Icon::Close)
+            .disabled(tab.pinned)
+            .into(),
+        );
+        entries.push(
+            Item::new(
+                if threads {
+                    "Close Other Threads"
+                } else {
+                    "Close Other Tabs"
+                },
+                move |window, cx| {
+                    let _ = ws.update(cx, |ws, cx| {
+                        if let Some(ix) = ws.tab_of(pane) {
+                            ws.close_other_tabs(ix, window, cx);
+                        }
+                    });
+                },
+            )
+            .icon(Icon::CloseOthers)
+            .into(),
+        );
+        // A page on screen is a native view the menu cannot cover, so keep
+        // the menu over the sidebar.
+        if self.browser_in_tab(self.active).is_some() {
+            let zoom = self.settings.zoom;
+            let room = (theme::SIDEBAR_PX - crate::menu::MIN_W - theme::GUTTER) * zoom;
+            at.x = at.x.min(px(room));
+        }
+        let restore = window.focused(cx);
+        self.menu = Some(crate::menu::open(
+            entries,
+            at,
+            restore,
+            window,
+            cx,
+            |ws: &mut Self, window, cx| {
+                ws.menu = None;
+                // A page had the keyboard before the menu took it.
+                if window.focused(cx).is_none() {
+                    if let Some((_, b)) = ws.browser_in_tab(ws.active) {
+                        b.read(cx).focus_native();
+                    }
+                }
+            },
+        ));
+        cx.notify();
+    }
+
+    fn focused_browser_pane(&self) -> Option<Entity<BrowserPane>> {
+        match &self.panes.get(&self.focused()?)?.kind {
+            PaneKind::Browser(b) => Some(b.clone()),
+            _ => None,
+        }
     }
 
     fn browser_in_tab(&self, ix: usize) -> Option<(PaneId, Entity<BrowserPane>)> {
@@ -996,6 +1197,77 @@ impl Workspace {
             self.refresh_inspector(cx);
         }
         self.refresh_servers(cx);
+        self.refresh_places(cx);
+    }
+
+    /// The project each terminal and chat is in, and what a terminal is
+    /// running, for the tab titles. libproc only.
+    fn refresh_places(&mut self, cx: &mut Context<Self>) {
+        let mut next = HashMap::new();
+        for (&id, pane) in &self.panes {
+            let place = match &pane.kind {
+                PaneKind::Terminal(t) => {
+                    let procs = inspect::descendants(t.read(cx).pid());
+                    let cwd = procs.iter().rev().find_map(|p| inspect::cwd(p.pid));
+                    cwd.map(|cwd| Place {
+                        front: procs.last().map(|p| p.name.clone()),
+                        ..place_of(&cwd)
+                    })
+                }
+                PaneKind::Chat(c) => Some(place_of(c.read(cx).cwd())),
+                _ => None,
+            };
+            if let Some(place) = place {
+                next.insert(id, place);
+            }
+        }
+        // Busy: something other than the shell is in front and printing.
+        let shell = std::env::var("SHELL")
+            .ok()
+            .and_then(|s| s.rsplit('/').next().map(str::to_string))
+            .unwrap_or_else(|| "zsh".into());
+        let busy: std::collections::HashSet<PaneId> = self
+            .panes
+            .iter()
+            .filter(|(id, p)| match &p.kind {
+                PaneKind::Terminal(t) => {
+                    t.read(cx).last_output.elapsed() < Duration::from_millis(1500)
+                        && next
+                            .get(id)
+                            .and_then(|pl| pl.front.as_deref())
+                            .is_some_and(|f| f != shell && !f.starts_with('-'))
+                }
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if next != self.places || busy != self.busy {
+            self.places = next;
+            self.busy = busy;
+            cx.notify();
+        }
+    }
+
+    /// The sidebar and inspector islands, made on first use.
+    fn islands(&mut self, cx: &mut Context<Self>) -> (Entity<Island>, Entity<Island>) {
+        if let Some(i) = &self.islands {
+            return i.clone();
+        }
+        let ws = cx.entity();
+        let sidebar = Island::new(&ws, |ws, _, cx| ws.render_sidebar(cx), cx);
+        let inspector = Island::new(
+            &ws,
+            |ws, _, cx| {
+                let title = ws
+                    .focused()
+                    .map(|id| ws.pane_title(id, cx))
+                    .unwrap_or_default();
+                inspector::render(ws, title, cx)
+            },
+            cx,
+        );
+        self.islands = Some((sidebar.clone(), inspector.clone()));
+        (sidebar, inspector)
     }
 
     /// Dev servers for any blank browser tab on screen: every port a process
@@ -1072,7 +1344,8 @@ impl Workspace {
                     let procs = inspect::descendants(t.read(cx).pid());
                     procs.iter().rev().find_map(|p| inspect::cwd(p.pid))
                 }
-                PaneKind::Browser(_) | PaneKind::Chat(_) => None,
+                PaneKind::Launcher(l) => l.read(cx).cwd.clone(),
+                PaneKind::Browser(_) | PaneKind::Chat(_) | PaneKind::Settings(_) => None,
             })
     }
 
@@ -1086,24 +1359,229 @@ impl Workspace {
     /// ⌘+ / ⌘− / ⌘0: one zoom for the whole app (UI, terminals, pages),
     /// wherever the focus is, remembered across launches.
     fn zoom(&mut self, step: i32, window: &mut Window, cx: &mut Context<Self>) {
-        let zoom = self.settings.stepped(step);
-        if zoom == self.settings.zoom {
+        let mut next = self.settings.clone();
+        next.zoom = self.settings.stepped(step);
+        self.apply_settings(next, window, cx);
+    }
+
+    /// Take new settings from anywhere (the Settings tab, ⌘+), save them, and
+    /// push what changed to every open pane, so nothing waits for a relaunch.
+    fn apply_settings(
+        &mut self,
+        next: crate::settings::Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if next == self.settings {
             return;
         }
-        self.settings.zoom = zoom;
+        let zoomed = next.zoom != self.settings.zoom;
+        crate::browser::set_search_engine(next.search);
+        self.settings = next;
         crate::settings::save(&self.settings);
-        let font_px = self.settings.terminal_font();
+        let look = self.settings.term_look();
+        let zoom = self.settings.zoom as f64;
         for pane in self.panes.values() {
             match &pane.kind {
-                PaneKind::Terminal(t) => t.update(cx, |t, cx| t.set_font_px(font_px, window, cx)),
-                PaneKind::Browser(b) => b.update(cx, |b, _| b.set_zoom(zoom as f64)),
-                PaneKind::Chat(_) => {}
+                PaneKind::Terminal(t) => {
+                    let look = look.clone();
+                    t.update(cx, |t, cx| t.set_look(look, window, cx))
+                }
+                PaneKind::Browser(b) => b.update(cx, |b, _| b.set_zoom(zoom)),
+                PaneKind::Settings(s) => {
+                    let settings = self.settings.clone();
+                    s.update(cx, |s, cx| s.sync(&settings, None, cx))
+                }
+                PaneKind::Chat(_) | PaneKind::Launcher(_) => {}
             }
         }
-        // The UI follows through the rem size, set every frame in render.
-        // Cached panes would keep their old layout: redraw everything once.
-        window.refresh();
+        if zoomed {
+            // The UI follows through the rem size, set every frame in render.
+            // Cached panes would keep their old layout: redraw everything once.
+            window.refresh();
+        }
         cx.notify();
+    }
+
+    /// The agent a new chat starts with: the one chosen in Settings if it is
+    /// ready, else Claude if it is, else the first agent that is.
+    fn default_agent(&self) -> Option<agent_core::AgentId> {
+        let env = self.chats.as_ref()?;
+        self.settings
+            .default_agent
+            .as_deref()
+            .map(agent_core::AgentId::new)
+            .filter(|id| env.registry.get(id).is_some_and(|e| e.is_ready()))
+            .or_else(|| env.default_agent())
+    }
+
+    /// Agents the Settings tab offers: those ready to chat right now.
+    fn ready_agents(&self) -> Vec<(SharedString, SharedString)> {
+        self.chats
+            .as_ref()
+            .map(|env| {
+                env.registry
+                    .ready()
+                    .map(|e| {
+                        (
+                            SharedString::from(e.id().as_str().to_string()),
+                            SharedString::from(e.display_name().to_string()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn make_settings(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (PaneKind, Option<String>, Subscription) {
+        let agents = self.ready_agents();
+        let settings = self.settings.clone();
+        let s = cx.new(|cx| SettingsPane::new(settings, agents, window, cx));
+        let sub = cx.subscribe_in(&s, window, |ws, _, ev: &SettingsEvent, window, cx| {
+            let SettingsEvent::Changed(next) = ev;
+            ws.apply_settings(next.clone(), window, cx)
+        });
+        (PaneKind::Settings(s), None, sub)
+    }
+
+    fn make_launcher(
+        &mut self,
+        id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (PaneKind, Option<String>, Subscription) {
+        let cwd = self.focused_cwd(cx);
+        let place = cwd.as_deref().map(|c| place_of(c).label());
+        let mut choices = vec![
+            Choice {
+                pick: Pick::Terminal,
+                label: "Terminal".into(),
+                detail: "Your shell".into(),
+                glyph: Icon::Terminal,
+                enabled: true,
+                tui: None,
+            },
+            Choice {
+                pick: Pick::Browser,
+                label: "Browser".into(),
+                detail: "Search or open a page".into(),
+                glyph: Icon::Globe,
+                enabled: true,
+                tui: None,
+            },
+        ];
+        for agent in AGENTS {
+            let installed = self.installed.iter().any(|a| a.cmd == agent.cmd);
+            let chat = self
+                .chats
+                .as_ref()
+                .and_then(|env| env.registry.get(&agent_core::AgentId::new(agent.cmd)))
+                .is_some_and(|e| e.is_ready());
+            choices.push(Choice {
+                pick: if chat {
+                    Pick::Chat(agent)
+                } else {
+                    Pick::Tui(agent)
+                },
+                label: agent.name.into(),
+                detail: match (chat, installed) {
+                    (true, _) => "Chat · or in a terminal",
+                    (false, true) => "In a terminal",
+                    (false, false) => "Not installed",
+                }
+                .into(),
+                glyph: Icon::agent(agent.cmd),
+                enabled: chat || installed,
+                tui: (chat && installed).then_some(agent),
+            });
+        }
+        let l = cx.new(|cx| LauncherPane::new(choices, cwd, place, cx));
+        let sub = cx.subscribe_in(
+            &l,
+            window,
+            move |ws, l, ev: &LauncherEvent, window, cx| match ev {
+                LauncherEvent::Pick(pick) => {
+                    let cwd = l.read(cx).cwd.clone();
+                    ws.turn_into(id, *pick, cwd, window, cx);
+                }
+                LauncherEvent::Cancel => ws.close_pane(id, window, cx),
+            },
+        );
+        (PaneKind::Launcher(l), None, sub)
+    }
+
+    /// Turn the launcher `id` into what was picked, in the same place.
+    fn turn_into(
+        &mut self,
+        id: PaneId,
+        pick: Pick,
+        cwd: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (what, agent) = match pick {
+            Pick::Terminal => (Open::Terminal { cmd: None, cwd }, None),
+            Pick::Browser => (
+                Open::Browser {
+                    url: "about:blank".into(),
+                },
+                None,
+            ),
+            Pick::Chat(a) => (
+                Open::Chat {
+                    agent: Some(a.cmd.into()),
+                    cwd,
+                },
+                None,
+            ),
+            Pick::Tui(a) => (
+                Open::Terminal {
+                    cmd: Some(a.cmd.into()),
+                    cwd,
+                },
+                Some(a),
+            ),
+        };
+        let Some(ix) = self.tab_of(id) else {
+            return;
+        };
+        let new = match self.make_pane(what, agent, window, cx) {
+            Ok(new) => new,
+            Err(e) => {
+                tracing::warn!("new tab: {e}");
+                return;
+            }
+        };
+        let tab = &mut self.tabs[ix];
+        tab.root.replace(id, new);
+        if tab.focused == id {
+            tab.focused = new;
+        }
+        self.discard(id, cx);
+        self.focus_pane(new, window, cx);
+        if matches!(pick, Pick::Browser) {
+            self.focus_address(window, cx);
+        }
+    }
+
+    /// ⌘,: the one Settings tab, opened or brought forward.
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let existing = self.panes.iter().find_map(|(id, p)| match p.kind {
+            PaneKind::Settings(_) => Some(*id),
+            _ => None,
+        });
+        match existing {
+            Some(id) => self.focus_pane(id, window, cx),
+            None => {
+                if let Err(e) = self.new_tab(Open::Settings, None, window, cx) {
+                    tracing::warn!("settings: {e}");
+                }
+            }
+        }
     }
 
     /// Show or hide the inspector. Asking for it in a window too narrow for
@@ -1161,6 +1639,16 @@ impl Workspace {
 
     fn pane_title(&self, id: PaneId, cx: &App) -> SharedString {
         match self.panes.get(&id) {
+            // Claude Code and friends title the terminal with the task at
+            // hand, which says more than the agent's name.
+            Some(Pane {
+                agent: Some(a),
+                kind: PaneKind::Terminal(t),
+                ..
+            }) => clean_title(&t.read(cx).title)
+                .filter(|t| !t.eq_ignore_ascii_case(a.name) && !t.eq_ignore_ascii_case(a.cmd))
+                .unwrap_or_else(|| a.name.to_string())
+                .into(),
             Some(Pane { agent: Some(a), .. }) => a.name.into(),
             Some(Pane {
                 kind: PaneKind::Chat(c),
@@ -1176,7 +1664,18 @@ impl Workspace {
             Some(Pane {
                 kind: PaneKind::Terminal(t),
                 ..
-            }) => short_title(&t.read(cx).title).into(),
+            }) => clean_title(&t.read(cx).title)
+                .or_else(|| self.places.get(&id).and_then(|p| p.front.clone()))
+                .unwrap_or_else(|| short_title(&t.read(cx).title))
+                .into(),
+            Some(Pane {
+                kind: PaneKind::Settings(_),
+                ..
+            }) => "Settings".into(),
+            Some(Pane {
+                kind: PaneKind::Launcher(_),
+                ..
+            }) => "New Tab".into(),
             Some(Pane {
                 kind: PaneKind::Browser(b),
                 ..
@@ -1191,6 +1690,18 @@ impl Workspace {
                 }
             }
             None => "".into(),
+        }
+    }
+
+    /// The second line of a tab: where a terminal or chat is working, the
+    /// site a page is on.
+    fn pane_subtitle(&self, id: PaneId, cx: &App) -> Option<SharedString> {
+        match &self.panes.get(&id)?.kind {
+            PaneKind::Browser(b) => {
+                let b = b.read(cx);
+                (!b.is_blank()).then(|| crate::history::host(&b.url).to_string().into())
+            }
+            _ => self.places.get(&id).map(|p| p.label().into()),
         }
     }
 
@@ -1279,6 +1790,8 @@ impl Workspace {
                         let c = c.read(cx);
                         json!({ "kind": "chat", "agent": c.agent.as_str(), "working": c.busy(), "needs_you": c.status == ChatStatus::Waiting })
                     }
+                    PaneKind::Settings(_) => json!({ "kind": "settings" }),
+                    PaneKind::Launcher(_) => json!({ "kind": "new-tab" }),
                 };
                 v["id"] = json!(id);
                 v["tab"] = json!(ix + 1);
@@ -1405,6 +1918,8 @@ impl Workspace {
             PaneKind::Browser(_) => {
                 return Err(format!("pane {id} is a browser; use `deck browser eval`"))
             }
+            PaneKind::Settings(_) => return Err(format!("pane {id} is the Settings tab")),
+            PaneKind::Launcher(_) => return Err(format!("pane {id} is an empty new tab")),
         }
         Ok(json!({ "pane": id }))
     }
@@ -1426,6 +1941,8 @@ impl Workspace {
                 let text = c.read(cx).read_text();
                 reply.send(Ok(json!({ "pane": id, "text": text })));
             }
+            PaneKind::Settings(_) => reply.send(Err(format!("pane {id} is the Settings tab"))),
+            PaneKind::Launcher(_) => reply.send(Err(format!("pane {id} is an empty new tab"))),
         }
     }
 
@@ -1474,7 +1991,9 @@ impl Workspace {
         match node {
             Node::Leaf(id) => self.render_leaf(*id, multi, cx),
             Node::Split(axis, children) => {
-                let mut d = div().flex().size_full().gap(u(1.)).bg(rgb(theme::BORDER));
+                // Each pane is its own card, a gutter apart, so the split
+                // reads as separate surfaces rather than ruled cells.
+                let mut d = div().flex().size_full().gap(u(theme::GUTTER));
                 d = match axis {
                     Axis::Row => d.flex_row(),
                     Axis::Column => d.flex_col(),
@@ -1508,14 +2027,33 @@ impl Workspace {
             PaneKind::Terminal(t) => t.clone().into(),
             PaneKind::Browser(b) => b.clone().into(),
             PaneKind::Chat(c) => c.clone().into(),
+            PaneKind::Settings(s) => s.clone().into(),
+            PaneKind::Launcher(l) => l.clone().into(),
         };
         let body = view
             .cached(StyleRefinement::default().size_full())
             .into_any_element();
+        let dim = multi && !focused;
+        if let PaneKind::Browser(b) = &pane.kind {
+            // A page is a native view gpui cannot paint over, so it dims itself.
+            b.update(cx, |b, _| b.set_dimmed(dim));
+        }
         div()
             .relative()
             .size_full()
             .bg(rgb(theme::PANE))
+            // In a split, the focused card has the brighter edge and the
+            // others step back a little: where keys go, without a stripe.
+            .when(multi, |d| {
+                d.rounded(u(theme::CARD_RADIUS))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(rgba(if focused {
+                        theme::FOCUS_EDGE
+                    } else {
+                        theme::HAIRLINE
+                    }))
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |ws, _, window, cx| {
@@ -1524,20 +2062,35 @@ impl Workspace {
                     }
                 }),
             )
+            // A right-click acts on the pane it lands in, so its menu does.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |ws, _, window, cx| {
+                    if ws.focused() != Some(id) {
+                        ws.focus_pane(id, window, cx)
+                    }
+                }),
+            )
             .child(body)
-            // In a split, a hairline on the focused pane says where keys go.
-            .when(multi && focused, |d| {
+            .when(dim && !matches!(pane.kind, PaneKind::Browser(_)), |d| {
                 d.child(
                     div()
                         .absolute()
                         .top_0()
                         .left_0()
-                        .right_0()
-                        .h(u(1.))
-                        .bg(rgba(0xffffff66)),
+                        .size_full()
+                        .bg(rgba(theme::UNFOCUSED_VEIL)),
                 )
             })
             .into_any_element()
+    }
+
+    /// A page's own icon for its tab, once deck has it.
+    fn tab_favicon(&self, first: PaneId, cx: &App) -> Option<Arc<gpui::Image>> {
+        match &self.panes.get(&first)?.kind {
+            PaneKind::Browser(b) => b.read(cx).favicon(),
+            _ => None,
+        }
     }
 
     fn tab_icon(&self, first: PaneId, cx: &App) -> (Icon, u32) {
@@ -1551,6 +2104,14 @@ impl Workspace {
                 kind: PaneKind::Browser(_),
                 ..
             }) => (Icon::Globe, theme::TEXT),
+            Some(Pane {
+                kind: PaneKind::Settings(_),
+                ..
+            }) => (Icon::Settings, theme::TEXT),
+            Some(Pane {
+                kind: PaneKind::Launcher(_),
+                ..
+            }) => (Icon::Plus, theme::TEXT_2),
             _ => (Icon::Terminal, theme::TEXT_2),
         }
     }
@@ -1725,6 +2286,37 @@ impl Workspace {
                     ),
             )
             .child(list)
+            .child(
+                div()
+                    .flex_none()
+                    .px(u(theme::GUTTER))
+                    .pb(u(theme::GUTTER))
+                    .child(
+                        div()
+                            .id("open-settings")
+                            .flex()
+                            .items_center()
+                            .gap(u(10.))
+                            .h(u(32.))
+                            .px(u(theme::ROW_PAD))
+                            .rounded(u(theme::ROW_RADIUS))
+                            .text_size(u(13.))
+                            .text_color(rgb(theme::TEXT_2))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(theme::ROW_HOVER)).text_color(rgb(theme::TEXT)))
+                            .child(icon(Icon::Settings, 15., theme::TEXT_2))
+                            .child(div().flex_1().child("Settings"))
+                            .child(
+                                div()
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::DIM))
+                                    .child("⌘,"),
+                            )
+                            .on_click(
+                                cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -1777,6 +2369,7 @@ impl Workspace {
             None => (Icon::GenericAgent, "No agent CLI found".into()),
         };
         let state = pane.map(|id| self.thread_state(id, cx));
+        let working = pane.and_then(|id| self.status(id, cx)) == Some(Status::Working);
         div()
             .id("control")
             .flex()
@@ -1802,7 +2395,11 @@ impl Workspace {
                     } else {
                         theme::SURFACE
                     }))
-                    .child(icon(glyph, 15., theme::TEXT)),
+                    .child(if working {
+                        thinking("control-think", glyph, 15., theme::TEXT)
+                    } else {
+                        icon(glyph, 15., theme::TEXT)
+                    }),
             )
             .child(
                 div()
@@ -1827,7 +2424,14 @@ impl Workspace {
                     ),
             )
             .when_some(state.filter(|(_, loud)| *loud), |d, (label, _)| {
-                d.child(pill(label))
+                d.child(if working {
+                    div()
+                        .text_size(u(11.))
+                        .child(shimmer("control-shimmer", label))
+                        .into_any_element()
+                } else {
+                    pill(label).into_any_element()
+                })
             })
             .on_click(
                 cx.listener(move |ws, _, window, cx| match ws.control_tab() {
@@ -1846,14 +2450,22 @@ impl Workspace {
         let active = ix == self.active;
         let first = tab.leaves()[0];
         let (glyph, _) = self.tab_icon(first, cx);
+        let project = self.places.get(&first).map(|p| p.project.clone());
         let who: SharedString = match self.panes.get(&first) {
             Some(Pane {
                 kind: PaneKind::Chat(c),
                 ..
-            }) => c.read(cx).agent_name(),
-            Some(Pane { agent: Some(a), .. }) => format!("{} · terminal", a.name).into(),
+            }) => match project {
+                Some(p) => format!("{} · {p}", c.read(cx).agent_name()).into(),
+                None => c.read(cx).agent_name(),
+            },
+            Some(Pane { agent: Some(a), .. }) => match project {
+                Some(p) => format!("{} · {p}", a.name).into(),
+                None => format!("{} · terminal", a.name).into(),
+            },
             _ => "".into(),
         };
+        let working = self.status(first, cx) == Some(Status::Working);
         let (state, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
         div()
@@ -1869,15 +2481,24 @@ impl Workspace {
             .cursor_pointer()
             .when(active, |d| d.bg(rgb(theme::SURFACE)))
             .when(!active, |d| d.hover(|s| s.bg(rgb(theme::ROW_HOVER))))
-            .child(icon(
-                glyph,
-                15.,
-                if active || loud {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_2
-                },
-            ))
+            .child(if working {
+                thinking(
+                    ElementId::NamedInteger("thread-think".into(), ix as u64),
+                    glyph,
+                    15.,
+                    theme::TEXT,
+                )
+            } else {
+                icon(
+                    glyph,
+                    15.,
+                    if active || loud {
+                        theme::TEXT
+                    } else {
+                        theme::TEXT_2
+                    },
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1915,7 +2536,13 @@ impl Workspace {
                     .child(
                         div()
                             .group_hover(group.clone(), |s| s.opacity(0.))
-                            .child(if loud {
+                            .text_size(u(11.))
+                            .child(if working {
+                                shimmer(
+                                    ElementId::NamedInteger("thread-shimmer".into(), ix as u64),
+                                    state,
+                                )
+                            } else if loud {
                                 pill(state).into_any_element()
                             } else {
                                 div()
@@ -1942,6 +2569,12 @@ impl Workspace {
                     ),
             )
             .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
+                    ws.open_tab_menu(ix, ev.position, window, cx)
+                }),
+            )
             .into_any_element()
     }
 
@@ -2047,6 +2680,31 @@ impl Workspace {
         let status = self.status(first, cx);
         let count = tab.leaves().len();
         let group = SharedString::from(format!("tab-{ix}"));
+        let subtitle = self.pane_subtitle(tab.focused, cx);
+        let is_page = matches!(
+            self.panes.get(&first).map(|p| &p.kind),
+            Some(PaneKind::Browser(_))
+        );
+        let tone = if active { tint } else { theme::TEXT_2 };
+        // A loading page spins where its icon goes, as tab strips do; a busy
+        // terminal spins at the end of its row.
+        let loading = match self.panes.get(&first).map(|p| &p.kind) {
+            Some(PaneKind::Browser(b)) => {
+                let b = b.read(cx);
+                b.loading && !b.is_blank()
+            }
+            _ => false,
+        };
+        let busy = status == Some(Status::Working) || self.busy.contains(&first);
+        let lead = match (loading, self.tab_favicon(first, cx)) {
+            (true, _) => spinner(
+                ElementId::NamedInteger("tab-load".into(), ix as u64),
+                14.,
+                theme::TEXT_2,
+            ),
+            (_, Some(image)) => crate::browser::site_image(image, 15.),
+            _ => icon(glyph, 15., tone),
+        };
 
         div()
             .id(ElementId::NamedInteger("tab".into(), ix as u64))
@@ -2054,7 +2712,7 @@ impl Workspace {
             .flex()
             .items_center()
             .gap(u(10.))
-            .h(u(32.))
+            .h(u(if subtitle.is_some() { 42. } else { 32. }))
             .pl(u(theme::ROW_PAD))
             .pr(u(4.))
             .rounded(u(theme::ROW_RADIUS))
@@ -2067,15 +2725,28 @@ impl Workspace {
                 d.text_color(rgb(theme::TEXT_2))
                     .hover(|s| s.bg(rgb(theme::ROW_HOVER)))
             })
-            .child(icon(glyph, 15., if active { tint } else { theme::TEXT_2 }))
-            // A definite-width box, so gpui knows where to put the ellipsis.
+            .child(lead)
+            // Definite-width boxes, so gpui knows where to put the ellipsis.
             .child(
-                div().flex_1().min_w_0().child(
-                    div()
-                        .w_full()
-                        .truncate()
-                        .child(self.pane_title(tab.focused, cx)),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .child(self.pane_title(tab.focused, cx)),
+                    )
+                    .children(subtitle.map(|sub| {
+                        div()
+                            .w_full()
+                            .truncate()
+                            .text_size(u(11.))
+                            .text_color(rgb(theme::DIM))
+                            .child(sub)
+                    })),
             )
             .when(count > 1, |d| {
                 d.child(
@@ -2089,15 +2760,23 @@ impl Workspace {
                         .child(format!("{count}")),
                 )
             })
-            .when_some(status, |d, s| {
-                // Monochrome, so the states differ by shape and lightness:
-                // solid white = working, dim = idle, white ring = needs you.
-                let dot = div().flex_none().size(u(7.)).rounded(u(4.));
-                d.child(match s {
-                    Status::Working => dot.bg(rgb(theme::TEXT)),
-                    Status::Idle => dot.bg(rgb(theme::DIM)),
-                    Status::Attention => dot.border_1().border_color(rgb(theme::TEXT)),
-                })
+            .when(busy && !is_page, |d| {
+                d.child(spinner(
+                    ElementId::NamedInteger("tab-busy".into(), ix as u64),
+                    12.,
+                    theme::TEXT_2,
+                ))
+            })
+            // A white ring: something needs you. Idle needs no mark.
+            .when(status == Some(Status::Attention), |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .size(u(7.))
+                        .rounded(u(4.))
+                        .border_1()
+                        .border_color(rgb(theme::TEXT)),
+                )
             })
             .child(
                 icon_button(
@@ -2113,6 +2792,12 @@ impl Workspace {
                 })),
             )
             .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
+                    ws.open_tab_menu(ix, ev.position, window, cx)
+                }),
+            )
             .into_any_element()
     }
 
@@ -2209,8 +2894,119 @@ pub fn icon_button(id: impl Into<ElementId>, glyph: Icon) -> gpui::Stateful<gpui
 /// past it the inspector folds away (and comes back when there is room).
 const MIN_CONTENT_PX: f32 = 520.;
 
+/// A part of the window chrome drawn as its own cached view.
+///
+/// gpui redraws every ancestor of a view that changed, and the workspace is
+/// the root, so each frame of a streaming agent in a terminal used to rebuild
+/// the whole sidebar and inspector too. As islands they draw again only when
+/// the workspace itself notifies, not whenever a pane inside it repaints.
+pub struct Island {
+    ws: WeakEntity<Workspace>,
+    draw: fn(&mut Workspace, &mut Window, &mut Context<Workspace>) -> AnyElement,
+    _observe: Subscription,
+}
+
+impl Island {
+    fn new(
+        ws: &Entity<Workspace>,
+        draw: fn(&mut Workspace, &mut Window, &mut Context<Workspace>) -> AnyElement,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Island> {
+        let weak = ws.downgrade();
+        let ws = ws.clone();
+        cx.new(|cx| Island {
+            ws: weak,
+            draw,
+            _observe: cx.observe(&ws, |_, _, cx| cx.notify()),
+        })
+    }
+}
+
+impl Render for Island {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let draw = self.draw;
+        self.ws
+            .update(cx, |ws, cx| draw(ws, window, cx))
+            .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
+/// Where a pane is working: its project (the git root's name, else the
+/// folder's) and the folder below that root.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Place {
+    project: String,
+    /// The path inside the project, `""` at its root.
+    sub: String,
+    /// What a terminal is running in front ("zsh", "nvim", "cargo").
+    front: Option<String>,
+}
+
+impl Place {
+    fn label(&self) -> String {
+        if self.sub.is_empty() {
+            self.project.clone()
+        } else {
+            format!("{} / {}", self.project, self.sub)
+        }
+    }
+}
+
+fn place_of(cwd: &std::path::Path) -> Place {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if home.as_deref() == Some(cwd) {
+        return Place {
+            project: "~".into(),
+            ..Default::default()
+        };
+    }
+    let name = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    // Stop at home: a dotfiles repo there would swallow every project.
+    let root = cwd
+        .ancestors()
+        .take_while(|d| Some(*d) != home.as_deref())
+        .find(|d| d.join(".git").exists());
+    match root {
+        Some(root) => Place {
+            project: name(root),
+            sub: cwd
+                .strip_prefix(root)
+                .map(|r| r.display().to_string())
+                .unwrap_or_default(),
+            front: None,
+        },
+        None => Place {
+            project: name(cwd),
+            ..Default::default()
+        },
+    }
+}
+
+/// A terminal title worth showing: a program's own ("✳ Fix tab titles" from
+/// Claude Code, "vim main.rs"), without the spinner glyph agents put in
+/// front. The shell's default `user@host:dir` says less than the tab already
+/// does, so it is dropped.
+fn clean_title(t: &str) -> Option<String> {
+    let t = t.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '~' && c != '/');
+    let t = t.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((user, rest)) = t.split_once('@') {
+        if !user.contains(' ') && rest.contains(':') && !rest.contains(' ') {
+            return None;
+        }
+    }
+    Some(t.to_string())
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (sidebar, inspector) = self.islands(cx);
         window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
         let width = f32::from(window.viewport_size().width) / self.settings.zoom;
         let sidebar_w = if self.sidebar { theme::SIDEBAR_PX } else { 0. };
@@ -2233,10 +3029,13 @@ impl Render for Workspace {
             .focused()
             .map(|id| self.pane_title(id, cx))
             .unwrap_or_default();
+        let multi = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| matches!(t.root, Node::Split(..)));
         let content = match self.tabs.get(self.active) {
             Some(tab) => {
                 let root = tab.root.clone();
-                let multi = matches!(root, Node::Split(..));
                 self.render_node(&root, multi, cx)
             }
             None => self.render_empty(cx),
@@ -2314,11 +3113,14 @@ impl Render for Workspace {
                     .ml(u(left))
                     .mr(u(if inspector_shown { 0. } else { theme::GUTTER }))
                     .mb(u(theme::GUTTER))
-                    .rounded(u(theme::CARD_RADIUS))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(rgba(theme::HAIRLINE))
-                    .bg(rgb(theme::PANE))
+                    // A split draws a card per pane instead.
+                    .when(!multi, |d| {
+                        d.rounded(u(theme::CARD_RADIUS))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(rgba(theme::HAIRLINE))
+                            .bg(rgb(theme::PANE))
+                    })
                     .child(content),
             );
 
@@ -2328,6 +3130,9 @@ impl Render for Workspace {
             .bg(rgb(theme::SIDEBAR))
             .font_family(theme::UI)
             .text_color(rgb(theme::TEXT))
+            .on_action(cx.listener(|ws, _: &NewTab, w, cx| {
+                let _ = ws.new_tab(Open::Launcher, None, w, cx);
+            }))
             .on_action(cx.listener(|ws, _: &NewTerminal, w, cx| {
                 let what = ws.shell_here(cx);
                 let _ = ws.new_tab(what, None, w, cx);
@@ -2359,6 +3164,7 @@ impl Render for Workspace {
                     ws.focus_address(w, cx);
                 }
             }))
+            .on_action(cx.listener(|ws, _: &OpenSettings, w, cx| ws.open_settings(w, cx)))
             .on_action(cx.listener(|ws, _: &ToggleAgents, _, cx| {
                 ws.picker = !ws.picker;
                 ws.sidebar = true;
@@ -2394,6 +3200,26 @@ impl Render for Workspace {
                     });
                 }
             }))
+            .on_action(cx.listener(|ws, _: &Find, w, cx| {
+                if let Some(b) = ws.focused_browser_pane() {
+                    b.update(cx, |b, cx| b.open_find(w, cx));
+                }
+            }))
+            .on_action(cx.listener(|ws, _: &FindNext, _, cx| {
+                if let Some(b) = ws.focused_browser_pane() {
+                    b.update(cx, |b, cx| b.find_step(false, cx));
+                }
+            }))
+            .on_action(cx.listener(|ws, _: &FindPrevious, _, cx| {
+                if let Some(b) = ws.focused_browser_pane() {
+                    b.update(cx, |b, cx| b.find_step(true, cx));
+                }
+            }))
+            .on_action(cx.listener(|ws, _: &ToggleDevTools, _, cx| {
+                if let Some((_, b)) = ws.browser_in_tab(ws.active) {
+                    b.read(cx).toggle_devtools();
+                }
+            }))
             .on_action(cx.listener(|ws, _: &ToggleSidebar, _, cx| {
                 ws.sidebar = !ws.sidebar;
                 cx.notify();
@@ -2424,11 +3250,28 @@ impl Render for Workspace {
                 let last = ws.tabs.len().saturating_sub(1);
                 ws.activate(last, w, cx)
             }))
-            .when(self.sidebar, |d| d.child(self.render_sidebar(cx)))
+            .when(self.sidebar, |d| {
+                d.child(
+                    AnyView::from(sidebar).cached(
+                        StyleRefinement::default()
+                            .flex_none()
+                            .w(u(theme::SIDEBAR_PX))
+                            .h_full(),
+                    ),
+                )
+            })
             .child(main)
             .when(inspector_shown, |d| {
-                d.child(inspector::render(self, title, cx))
+                d.child(
+                    AnyView::from(inspector).cached(
+                        StyleRefinement::default()
+                            .flex_none()
+                            .w(u(theme::INSPECTOR_PX))
+                            .h_full(),
+                    ),
+                )
             })
+            .children(self.menu.as_ref().map(crate::menu::Open::render))
     }
 }
 

@@ -12,17 +12,22 @@
 
 use crate::field::{Field, FieldEvent};
 use crate::icon::Icon;
+use crate::menu::{self, Entry, Item};
+use crate::pasteboard::{self, Pasted};
 use crate::theme;
-use crate::workspace::{icon_button, Copy, Find, FindNext, FindPrevious, Paste};
+use crate::workspace::{
+    icon_button, ClearTerminal, ClosePane, Copy, Find, FindNext, FindPrevious, Paste, SelectAll,
+    SplitDown, SplitRight,
+};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
     div, fill, font, outline, point, px, relative, rgb, rgba, size, App, BorderStyle, Bounds,
     ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, FontStyle, FontWeight, GlobalElementId, InspectorElementId,
-    KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, Subscription,
-    Task, TextRun, UTF16Selection, UnderlineStyle, Window,
+    EventEmitter, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
+    InspectorElementId, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine,
+    SharedString, Style, Subscription, Task, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use std::collections::HashMap;
 use std::ops::Range;
@@ -31,6 +36,8 @@ use std::time::Instant;
 
 pub enum TerminalEvent {
     Focused,
+    /// The title or the bell changed: things the sidebar shows.
+    Retitled,
     Exited,
     /// ⌘-click on a URL in the output.
     OpenUrl(String),
@@ -45,7 +52,7 @@ pub struct TerminalPane {
     /// Set by BEL, cleared when the pane is focused: "this one wants you".
     pub bell: bool,
     exited: bool,
-    font_px: f32,
+    look: Look,
     cell_w: f32,
     /// Where the grid was last painted, for turning mouse positions into cells.
     origin: Point<Pixels>,
@@ -63,8 +70,37 @@ pub struct TerminalPane {
     rows: Vec<RowCache>,
     /// The find bar (⌘F), while open.
     find: Option<FindBar>,
+    /// The right-click menu, while open.
+    menu: Option<menu::Open>,
+    /// The next snapshot must rebuild every row (the palette changed).
+    restyle: bool,
+    /// Whether a blinking cursor is in its visible half.
+    blink_on: bool,
+    /// When the user last typed: the cursor stays solid while they do.
+    typed: Instant,
+    _blink: Option<Task<()>>,
     _wake: Task<()>,
 }
+
+/// How terminals look and type, from Settings. Every pane gets the same one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Look {
+    pub family: SharedString,
+    /// The font size on screen: the setting times the app zoom.
+    pub font_px: f32,
+    /// Line height as a multiple of `font_px`.
+    pub line: f32,
+    pub palette: term::Palette,
+    pub cursor_color: u32,
+    /// The cursor until a program asks for another (DECSCUSR).
+    pub cursor: term::CursorShape,
+    pub blink: bool,
+    /// Option sends Esc+key (Meta) instead of typing Option-characters.
+    pub option_meta: bool,
+}
+
+/// Half a blink cycle, as macOS text fields use.
+const BLINK: std::time::Duration = std::time::Duration::from_millis(530);
 
 struct FindBar {
     field: Entity<Field>,
@@ -77,8 +113,8 @@ struct FindBar {
 
 impl EventEmitter<TerminalEvent> for TerminalPane {}
 
-pub fn line_height(font_px: f32) -> f32 {
-    (font_px * 1.385).round()
+pub fn line_height(font_px: f32, factor: f32) -> f32 {
+    (font_px * factor).round()
 }
 
 impl TerminalPane {
@@ -98,7 +134,7 @@ impl TerminalPane {
     pub fn new(
         term: term::Terminal,
         title: String,
-        font_px: f32,
+        look: Look,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -116,8 +152,14 @@ impl TerminalPane {
                     p.term.prune_selection();
                     for ev in p.term.drain_events() {
                         match ev {
-                            term::TermEvent::Title(t) if !t.is_empty() => p.title = t.into(),
-                            term::TermEvent::Bell => p.bell = true,
+                            term::TermEvent::Title(t) if !t.is_empty() && t != p.title.as_ref() => {
+                                p.title = t.into();
+                                cx.emit(TerminalEvent::Retitled);
+                            }
+                            term::TermEvent::Bell => {
+                                p.bell = true;
+                                cx.emit(TerminalEvent::Retitled);
+                            }
                             term::TermEvent::Exited(_) => {
                                 p.exited = true;
                                 cx.emit(TerminalEvent::Exited);
@@ -134,6 +176,7 @@ impl TerminalPane {
             }
         });
 
+        term.set_cursor_default(look.cursor, look.blink);
         Self {
             term,
             focus: cx.focus_handle(),
@@ -141,8 +184,8 @@ impl TerminalPane {
             last_output: Instant::now(),
             bell: false,
             exited: false,
-            font_px,
-            cell_w: cell_width(window, font_px),
+            cell_w: cell_width(window, &look.family, look.font_px),
+            look,
             origin: Point::default(),
             press: None,
             reporting: None,
@@ -151,6 +194,11 @@ impl TerminalPane {
             marked: None,
             rows: Vec::new(),
             find: None,
+            menu: None,
+            restyle: false,
+            blink_on: true,
+            typed: Instant::now(),
+            _blink: None,
             _wake: wake,
         }
     }
@@ -160,15 +208,43 @@ impl TerminalPane {
     }
 
     fn line_px(&self) -> f32 {
-        line_height(self.font_px)
+        line_height(self.look.font_px, self.look.line)
     }
 
-    pub fn set_font_px(&mut self, font_px: f32, window: &Window, cx: &mut Context<Self>) {
-        if self.font_px != font_px {
-            self.font_px = font_px;
-            self.cell_w = cell_width(window, font_px);
-            cx.notify();
+    /// Settings or the zoom changed: re-measure the cell and redraw every row.
+    pub fn set_look(&mut self, look: Look, window: &Window, cx: &mut Context<Self>) {
+        if self.look == look {
+            return;
         }
+        if (self.look.cursor, self.look.blink) != (look.cursor, look.blink) {
+            self.term.set_cursor_default(look.cursor, look.blink);
+        }
+        self.cell_w = cell_width(window, &look.family, look.font_px);
+        self.restyle |= self.look.palette != look.palette;
+        self.look = look;
+        self.rows.clear();
+        cx.notify();
+    }
+
+    /// Run the blink timer only while a focused cursor is meant to blink, so
+    /// an idle window costs nothing.
+    fn sync_blink(&mut self, blink: bool, cx: &mut Context<Self>) {
+        if blink == self._blink.is_some() {
+            return;
+        }
+        self.blink_on = true;
+        self._blink = blink.then(|| {
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(BLINK).await;
+                let alive = this.update(cx, |p, cx| {
+                    p.blink_on = !p.blink_on || p.typed.elapsed() < BLINK;
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+            })
+        });
     }
 
     /// ⌘K: drop scrollback and have the shell redraw its prompt at the top.
@@ -309,7 +385,7 @@ impl TerminalPane {
 
     /// The visible screen as plain text, trailing blanks trimmed.
     pub fn read_text(&mut self) -> String {
-        self.term.snapshot(&theme::palette(), true);
+        self.term.snapshot(&self.look.palette, true);
         let mut lines: Vec<String> = self
             .term
             .last()
@@ -338,7 +414,15 @@ impl TerminalPane {
         if self.marked.is_some() || !self.focus.is_focused(window) {
             return;
         }
-        if let Some(bytes) = key_bytes(&ev.keystroke, self.term.app_cursor()) {
+        self.typed = Instant::now();
+        self.blink_on = true;
+        let bytes = key_bytes(&ev.keystroke, self.term.app_cursor()).or_else(|| {
+            self.look
+                .option_meta
+                .then(|| meta_bytes(&ev.keystroke))
+                .flatten()
+        });
+        if let Some(bytes) = bytes {
             self.term.select_clear();
             self.term.write(bytes);
             cx.stop_propagation();
@@ -419,6 +503,10 @@ impl TerminalPane {
 
     fn on_other_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_here(window, cx);
+        // Taken by the find bar's field.
+        if window.default_prevented() {
+            return;
+        }
         let button = match ev.button {
             MouseButton::Right => term::MouseButton::Right,
             MouseButton::Middle => term::MouseButton::Middle,
@@ -431,7 +519,94 @@ impl TerminalPane {
             &ev.modifiers,
         ) {
             self.reporting = Some(button);
+        } else if button == term::MouseButton::Right {
+            self.open_menu(ev.position, window, cx);
         }
+    }
+
+    /// The right-click menu. A program that takes the mouse (vim, htop)
+    /// gets the click instead; Shift brings the menu back, as it does
+    /// selection.
+    fn open_menu(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let (row, col, _) = self.cell_at(at);
+        let line = self
+            .term
+            .last()
+            .rows
+            .get(row)
+            .map(row_cols)
+            .unwrap_or_default();
+        let this = cx.entity().downgrade();
+        let f = self.focus.clone();
+        let mut entries: Vec<Entry> = Vec::new();
+        if let Some(url) = url_at(&line, col) {
+            let open = url.clone();
+            let open_in = this.clone();
+            entries.push(
+                Item::new("Open Link", move |_, cx| {
+                    let url = open.clone();
+                    let _ = open_in.update(cx, |_, cx| cx.emit(TerminalEvent::OpenUrl(url)));
+                })
+                .icon(Icon::ArrowUpRight)
+                .into(),
+            );
+            entries.push(
+                Item::new("Copy Link", move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+                })
+                .icon(Icon::Link)
+                .into(),
+            );
+            entries.push(Entry::Separator);
+        }
+        let selected = self.term.selection_text().is_some();
+        entries.extend([
+            Item::new("Copy", menu::send(f.clone(), Copy))
+                .icon(Icon::Copy)
+                .shortcut("⌘C")
+                .disabled(!selected)
+                .into(),
+            Item::new("Paste", menu::send(f.clone(), Paste))
+                .icon(Icon::Clipboard)
+                .shortcut("⌘V")
+                .into(),
+            Item::new("Select All", menu::send(f.clone(), SelectAll))
+                .icon(Icon::SelectAll)
+                .shortcut("⌘A")
+                .into(),
+            Entry::Separator,
+            Item::new("Find…", menu::send(f.clone(), Find))
+                .icon(Icon::Search)
+                .shortcut("⌘F")
+                .into(),
+            Item::new("Clear", menu::send(f.clone(), ClearTerminal))
+                .icon(Icon::Eraser)
+                .shortcut("⌘K")
+                .into(),
+            Entry::Separator,
+            Item::new("Split Right", menu::send(f.clone(), SplitRight))
+                .icon(Icon::Split)
+                .shortcut("⌘D")
+                .into(),
+            Item::new("Split Down", menu::send(f.clone(), SplitDown))
+                .icon(Icon::SplitDown)
+                .shortcut("⇧⌘D")
+                .into(),
+            Entry::Separator,
+            Item::new("Close", menu::send(f.clone(), ClosePane))
+                .icon(Icon::Close)
+                .shortcut("⌘W")
+                .into(),
+        ]);
+        self.menu = Some(menu::open(
+            entries,
+            at,
+            Some(f),
+            window,
+            cx,
+            |p: &mut Self, _, _| p.menu = None,
+        ));
+        cx.notify();
     }
 
     fn on_mouse_up(&mut self, ev: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -510,10 +685,37 @@ impl TerminalPane {
         }
     }
 
+    /// Text pastes as text. Files copied in Finder paste as their paths, and
+    /// an image (a screenshot, "Copy Image") is kept as a file and pastes as
+    /// its path, which Claude Code and Codex pick up as an attachment.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
-            return;
-        };
+        match pasteboard::read_for_terminal() {
+            Some(Pasted::Files(paths)) => self.paste_text(&pasteboard::shell_paths(&paths)),
+            Some(Pasted::Image(bytes, ext)) => {
+                cx.spawn(async move |this, cx| {
+                    let saved = cx
+                        .background_executor()
+                        .spawn(async move { pasteboard::save_image(&bytes, ext) })
+                        .await;
+                    match saved {
+                        Ok(path) => {
+                            let _ = this
+                                .update(cx, |t, _| t.paste_text(&pasteboard::shell_paths(&[path])));
+                        }
+                        Err(e) => tracing::warn!("could not keep the pasted image: {e}"),
+                    }
+                })
+                .detach();
+            }
+            None => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    self.paste_text(&text);
+                }
+            }
+        }
+    }
+
+    fn paste_text(&mut self, text: &str) {
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let bytes = if self.term.bracketed_paste() {
             format!("\x1b[200~{text}\x1b[201~")
@@ -584,6 +786,8 @@ impl EntityInputHandler for TerminalPane {
     ) {
         self.marked = None;
         if !text.is_empty() {
+            self.typed = Instant::now();
+            self.blink_on = true;
             self.term.select_clear();
             self.term.write(text.as_bytes().to_vec());
         }
@@ -633,8 +837,13 @@ impl EntityInputHandler for TerminalPane {
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.term.snapshot(&theme::palette(), false);
-        let focused = self.focus.is_focused(window);
+        let restyle = std::mem::take(&mut self.restyle);
+        self.term.snapshot(&self.look.palette, restyle);
+        // An open menu holds the keyboard for this pane; the cursor should
+        // not go hollow under it.
+        let focused = self.focus.is_focused(window) || self.menu.is_some();
+        let blink = focused && self.look.blink && self.term.last().cursor_blink;
+        self.sync_blink(blink, cx);
         // Full-screen TUIs (OpenCode, Claude Code) paint their own background.
         // Extending the top-left cell's colour into the padding, as Ghostty
         // does, keeps that from showing as a frame around the app.
@@ -645,7 +854,7 @@ impl Render for TerminalPane {
             .first()
             .and_then(|r| r.runs.first())
             .and_then(|r| r.style.bg)
-            .unwrap_or(theme::PANE);
+            .unwrap_or(self.look.palette.bg);
         let find = self.find.as_ref().map(|bar| self.render_find(bar, cx));
         div()
             .track_focus(&self.focus)
@@ -660,6 +869,10 @@ impl Render for TerminalPane {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(|p, _: &SelectAll, _, cx| {
+                p.term.select_all();
+                cx.notify();
+            }))
             .on_action(cx.listener(|p, _: &FindNext, _, cx| p.find_step(true, cx)))
             .on_action(cx.listener(|p, _: &FindPrevious, _, cx| p.find_step(false, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -670,12 +883,21 @@ impl Render for TerminalPane {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
+            // Files dropped from Finder type their paths, as in Terminal; an
+            // agent CLI turns an image path into an attachment.
+            .on_drop(cx.listener(|p, paths: &ExternalPaths, window, cx| {
+                p.paste_text(&pasteboard::shell_paths(paths.paths()));
+                window.focus(&p.focus);
+                cx.notify();
+            }))
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme::RAISED)))
             .child(Grid {
                 pane: cx.entity(),
                 focus: self.focus.clone(),
                 focused,
             })
             .children(find)
+            .children(self.menu.as_ref().map(menu::Open::render))
     }
 }
 
@@ -695,6 +917,8 @@ struct Prepared {
     /// IME composition, drawn over the cursor cell.
     marked: Option<(Point<Pixels>, ShapedLine)>,
     line_px: f32,
+    cursor_color: u32,
+    bg: u32,
 }
 
 impl IntoElement for Grid {
@@ -845,7 +1069,7 @@ impl Element for Grid {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepared {
-        let regular = font(theme::MONO);
+        let regular = font(self.pane.read(cx).look.family.clone());
         let ts = window.text_system().clone();
         // Rows are shaped once and reused while their content is unchanged:
         // typing or a spinner touches one or two rows a frame, not all fifty.
@@ -857,7 +1081,7 @@ impl Element for Grid {
             if p.term.resize(cols, rows, p.cell_w as u16, lh as u16) {
                 cx.notify();
             }
-            let (cell_w, font_px) = (p.cell_w, p.font_px);
+            let (cell_w, font_px) = (p.cell_w, p.look.font_px);
             let size_px = px(font_px);
             let snap = p.term.last();
             let cache = &mut p.rows;
@@ -908,27 +1132,29 @@ impl Element for Grid {
                 size(px(cell_w), px(lh)),
             )
         });
-        let cursor = cursor_at.map(|b| (b, snap.cursor_shape));
+        let (bg, fg, cursor_color) = (
+            pane.look.palette.bg,
+            pane.look.palette.fg,
+            pane.look.cursor_color,
+        );
+        let cursor = cursor_at
+            .filter(|_| pane.blink_on)
+            .map(|b| (b, snap.cursor_shape));
         let under_cursor = match (snap.cursor, snap.cursor_shape, self.focused) {
-            (Some((y, x)), term::CursorShape::Block, true) => snap
+            (Some((y, x)), term::CursorShape::Block, true) if pane.blink_on => snap
                 .rows
                 .get(y)
                 .and_then(|r| row_cols(r).chars().nth(x))
                 .filter(|c| *c != '\0' && !c.is_whitespace())
                 .zip(cursor_at)
-                .map(|(c, b)| {
-                    (
-                        b.origin,
-                        shape(c.to_string(), regular.clone(), theme::PANE, false),
-                    )
-                }),
+                .map(|(c, b)| (b.origin, shape(c.to_string(), regular.clone(), bg, false))),
             _ => None,
         };
         let marked = pane
             .marked
             .clone()
             .zip(cursor_at)
-            .map(|(m, b)| (b.origin, shape(m, regular.clone(), theme::TEXT, true)));
+            .map(|(m, b)| (b.origin, shape(m, regular.clone(), fg, true)));
         Prepared {
             glyphs,
             fills,
@@ -936,6 +1162,8 @@ impl Element for Grid {
             under_cursor,
             marked,
             line_px: lh,
+            cursor_color,
+            bg,
         }
     }
 
@@ -979,16 +1207,16 @@ impl Element for Grid {
                 };
                 match (shape, self.focused) {
                     (term::CursorShape::Block, true) => {
-                        window.paint_quad(fill(c, rgb(theme::ACCENT)));
+                        window.paint_quad(fill(c, rgb(prep.cursor_color)));
                         if let Some((origin, glyph)) = &prep.under_cursor {
                             let _ = glyph.paint(*origin, lh, window, cx);
                         }
                     }
                     (term::CursorShape::Beam, _) => {
-                        window.paint_quad(fill(bar(2., 0., false), rgb(theme::ACCENT)))
+                        window.paint_quad(fill(bar(2., 0., false), rgb(prep.cursor_color)))
                     }
                     (term::CursorShape::Underline, _) => {
-                        window.paint_quad(fill(bar(0., 2., true), rgb(theme::ACCENT)))
+                        window.paint_quad(fill(bar(0., 2., true), rgb(prep.cursor_color)))
                     }
                     (term::CursorShape::Block, false) => {
                         window.paint_quad(outline(c, rgba(0xffffff80), BorderStyle::Solid))
@@ -997,7 +1225,7 @@ impl Element for Grid {
             }
             if let Some((origin, glyph)) = &prep.marked {
                 let w = glyph.width;
-                window.paint_quad(fill(Bounds::new(*origin, size(w, lh)), rgb(theme::PANE)));
+                window.paint_quad(fill(Bounds::new(*origin, size(w, lh)), rgb(prep.bg)));
                 let _ = glyph.paint(*origin, lh, window, cx);
             }
         });
@@ -1019,9 +1247,9 @@ fn row_text(row: &term::Row) -> String {
         .collect()
 }
 
-fn cell_width(window: &Window, font_px: f32) -> f32 {
+fn cell_width(window: &Window, family: &SharedString, font_px: f32) -> f32 {
     let ts = window.text_system();
-    let id = ts.resolve_font(&font(theme::MONO));
+    let id = ts.resolve_font(&font(family.clone()));
     ts.advance(id, px(font_px), 'm')
         .map(|s| f32::from(s.width))
         .unwrap_or(font_px * 0.6)
@@ -1120,6 +1348,24 @@ fn key_bytes(ks: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
     None
 }
 
+/// Option-key as Meta: Esc then the key itself, so Option-b / -f / -d reach
+/// readline, Emacs and TUIs as word motions instead of typing ∫ ƒ ∂.
+fn meta_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
+    let m = &ks.modifiers;
+    if !m.alt || m.control || m.platform {
+        return None;
+    }
+    let mut chars = ks.key.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    if !c.is_ascii_graphic() {
+        return None;
+    }
+    let c = if m.shift { c.to_ascii_uppercase() } else { c };
+    Some(vec![0x1b, c as u8])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1215,9 +1461,37 @@ mod tests {
     }
 
     #[test]
+    fn option_as_meta_sends_escape_and_the_key() {
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            meta_bytes(&ks("b", Some("∫"), alt)),
+            Some(b"\x1bb".to_vec())
+        );
+        let alt_shift = Modifiers { shift: true, ..alt };
+        assert_eq!(
+            meta_bytes(&ks("f", Some("Ï"), alt_shift)),
+            Some(b"\x1bF".to_vec())
+        );
+        assert_eq!(meta_bytes(&ks("b", Some("b"), Modifiers::default())), None);
+        let cmd_alt = Modifiers {
+            platform: true,
+            ..alt
+        };
+        assert_eq!(meta_bytes(&ks("b", None, cmd_alt)), None);
+        assert_eq!(meta_bytes(&ks("space", None, alt)), None);
+    }
+
+    #[test]
     fn line_height_matches_the_default_metrics() {
         // 13px Menlo on an 18px line is the classic Terminal.app metric.
-        assert_eq!(line_height(13.), 18.);
-        assert_eq!(line_height(theme::FONT_PX), 18.);
+        assert_eq!(line_height(13., crate::settings::DEFAULT_LINE_HEIGHT), 18.);
+        assert_eq!(
+            line_height(theme::FONT_PX, crate::settings::DEFAULT_LINE_HEIGHT),
+            18.
+        );
+        assert_eq!(line_height(13., 1.6), 21.);
     }
 }

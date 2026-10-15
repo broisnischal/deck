@@ -49,6 +49,13 @@ icons! {
     Git => "git.svg",
     Info => "info.svg",
     Copy => "copy.svg",
+    Clipboard => "clipboard.svg",
+    Scissors => "scissors.svg",
+    SelectAll => "select-all.svg",
+    Eraser => "eraser.svg",
+    SplitDown => "split-down.svg",
+    Link => "link.svg",
+    CloseOthers => "close-others.svg",
     ArrowUp => "arrow-up.svg",
     Stop => "stop.svg",
     Check => "check.svg",
@@ -56,6 +63,9 @@ icons! {
     ListCheck => "list-check.svg",
     Pencil => "pencil.svg",
     Search => "search.svg",
+    Download => "download.svg",
+    Clock => "clock.svg",
+    Settings => "settings.svg",
     Claude => "agent-claude.svg",
     Codex => "agent-codex.svg",
     Gemini => "agent-gemini.svg",
@@ -87,9 +97,9 @@ pub fn icon(kind: Icon, size: f32, color: u32) -> AnyElement {
         .into_any_element()
 }
 
-/// Serves the embedded icons to gpui.
-/// A spinner that turns once a second, for work in progress. `id` keeps the
-/// rotation steady across frames.
+/// Work in progress: a comet, its head bright and its tail fading, turning
+/// a little faster than once a second. `id` keeps the motion steady across
+/// frames.
 pub fn spinner(id: impl Into<gpui::ElementId>, size: f32, color: u32) -> AnyElement {
     use gpui::{percentage, Animation, AnimationExt, Transformation};
     svg()
@@ -99,12 +109,92 @@ pub fn spinner(id: impl Into<gpui::ElementId>, size: f32, color: u32) -> AnyElem
         .text_color(rgb(color))
         .with_animation(
             id,
-            Animation::new(std::time::Duration::from_millis(900)).repeat(),
+            Animation::new(std::time::Duration::from_millis(850)).repeat(),
             |s, t| s.with_transformation(Transformation::rotate(percentage(t))),
         )
         .into_any_element()
 }
 
+/// An agent at work: its own mark turns in eased quarter steps and breathes
+/// in between, the way Claude Code's glyph does in a terminal. Still marks
+/// read as idle; this one reads as thinking.
+pub fn thinking(id: impl Into<gpui::ElementId>, glyph: Icon, size: f32, color: u32) -> AnyElement {
+    use gpui::{percentage, size as sz, Animation, AnimationExt, Transformation};
+    svg()
+        .path(glyph.path())
+        .size(u(size))
+        .flex_none()
+        .text_color(rgb(color))
+        .with_animation(
+            id,
+            Animation::new(std::time::Duration::from_millis(2400)).repeat(),
+            |s, t| {
+                let (step, within) = ((t * 4.).floor(), (t * 4.).fract());
+                let turn = (step + ease_in_out(within)) / 4.;
+                // Smallest mid-turn, full size at rest.
+                let scale = 1. - 0.16 * (within * std::f32::consts::PI).sin();
+                s.with_transformation(
+                    Transformation::rotate(percentage(turn)).with_scaling(sz(scale, scale)),
+                )
+            },
+        )
+        .into_any_element()
+}
+
+/// Text with a band of light sweeping across it: "Working…" while an agent
+/// is busy.
+pub fn shimmer(id: impl Into<gpui::ElementId>, text: SharedString) -> AnyElement {
+    use gpui::{Animation, AnimationExt, HighlightStyle, StyledText};
+    gpui::div()
+        .flex_none()
+        .with_animation(
+            id,
+            Animation::new(std::time::Duration::from_millis(1900)).repeat(),
+            move |d, t| {
+                let n = text.chars().count() as f32;
+                let band = 5.;
+                let at = t * (n + band * 2.) - band;
+                let lights: Vec<_> = text
+                    .char_indices()
+                    .enumerate()
+                    .map(|(i, (byte, ch))| {
+                        let k = (1. - (i as f32 - at).abs() / band).max(0.);
+                        (
+                            byte..byte + ch.len_utf8(),
+                            HighlightStyle {
+                                color: Some(rgb(mix(SHIMMER_BASE, SHIMMER_PEAK, k)).into()),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect();
+                d.child(StyledText::new(text.clone()).with_highlights(lights))
+            },
+        )
+        .into_any_element()
+}
+
+const SHIMMER_BASE: u32 = 0x8a8a8a;
+const SHIMMER_PEAK: u32 = 0xffffff;
+
+fn ease_in_out(t: f32) -> f32 {
+    if t < 0.5 {
+        4. * t * t * t
+    } else {
+        1. - (-2. * t + 2.).powi(3) / 2.
+    }
+}
+
+/// `a` → `b` by `k` in 0–1, per channel.
+fn mix(a: u32, b: u32, k: f32) -> u32 {
+    let ch = |shift: u32| {
+        let (x, y) = ((a >> shift) & 0xff, (b >> shift) & 0xff);
+        ((x as f32 + (y as f32 - x as f32) * k).round() as u32) << shift
+    };
+    ch(16) | ch(8) | ch(0)
+}
+
+/// Serves the embedded icons to gpui.
 pub struct Assets;
 
 impl AssetSource for Assets {

@@ -32,16 +32,35 @@ Each item says how it was verified.
 - [x] Sidebar (⌘B) and inspector (⌘I); the inspector folds itself away when the window is too narrow (screenshot at 690 px)
 - [x] Inspector: processes, project dir, ports, files, git, all native except `git status` (timings: tree 0.04 ms, ports 0.01 ms)
 - [x] Black monochrome design, real SVG icons throughout (screenshots)
+- [~] ⌘T opens a new tab page: Terminal (preselected, so ⌘T ⏎ is still a shell), Browser, and every agent deck knows with its mark, as a chat or in its own terminal (⌥⏎ or the card's terminal button); 1–9 pick, esc closes. ⌥⌘T is a plain terminal.
+- [~] Splits draw a card per pane, a gutter apart; the focused card has the brighter edge and the others dim (a page dims itself, since gpui cannot paint over it)
+- [~] Tab titles: a program's own title (Claude Code's task, `vim file`), else the command in front; a second line says which project (git root) and folder the pane is in, or which site a page is on; threads say "Claude · project"
+- [~] Spinners: a comet for a busy terminal or a loading page, the agent's own mark turning while it works, and a light sweep across "Working…"
+- [~] Right-click menus in deck's own look: terminal (links, copy, paste, select all, find, clear, splits, close), text fields, chat messages, sidebar rows
+- [~] Terminal ⌘V pastes copied Finder files as paths and a copied image as a saved file's path, and files dropped on a terminal type their paths, so Claude Code and Codex attach them (path escaping unit-tested)
+- [~] Settings tab (⌘,, Deck › Settings…, or the gear at the foot of the sidebar), one per window, applied live and saved to settings.json: zoom; terminal colour scheme (Deck, Tomorrow Night, Catppuccin Mocha, Tokyo Night, Gruvbox Dark, Solarized Dark, One Dark); font family (installed monospace faces only), size, line height; default cursor (block / bar / underline), blink, Option as Meta; search engine (Google by default); the agent and access new chats start with. An old settings.json still loads, and a bad value resets only itself (serde round-trip, legacy file, cursor default and Meta keys unit-tested). Not yet seen in the window.
 
 ## Browser
 
-- [x] Toolbar: back, forward, reload / stop, address bar (URL or search), zoom chip, close (screenshot)
-- [~] Loading bar; page hidden until it has painted, so no white flash
-- [x] New-tab page lists dev servers running in your terminals (screenshot: `localhost:8765 · Python`)
+- [x] Toolbar: back, forward, reload / stop, address bar (URL or search), close (screenshot)
+- [~] Back / forward dim when there is nowhere to go; two-finger swipe goes back and forward (WebKit's own gesture)
+- [~] Real loading progress along the toolbar edge, from WebKit's estimate, polled only while a load runs; a failed load no longer leaves the bar spinning forever
+- [~] A pane's first page shows 250 ms after it commits (was: up to 1.2 s, or until every subresource finished, on every address-bar navigation); later loads keep the old page up until the new one paints
+- [~] Safari's user agent, so sites send their current code instead of fallback bundles
+- [~] Search with Google by default (or the engine in Settings); `?text` forces a search; localhost, `*.localhost` and LAN IPs open over http (unit-tested)
+- [~] Address bar: first click selects the whole address; inline completion from history (Safari-style host, then full address; ⇥ accepts, ⌫ drops it); suggestions from history, dev servers and the search engine, ↑↓ ⏎ esc; the page steps aside while suggestions show (ranking and completion unit-tested)
+- [~] History kept in `browser-history.json`, frecency-ranked, search result pages left out (unit-tested)
+- [~] Site icons fetched natively (ICO, PNG, SVG, WebP), kept per host under `favicons/`, shown in the address bar, the sidebar and the new tab page
+- [~] New tab page: frequently visited sites as tiles, dev servers running in your terminals
+- [~] Find in page ⌘F (⌘G / ⇧⌘G, ↑↓, esc) with a match count
+- [~] Downloads go to ~/Downloads with a toolbar chip; click shows the file in Finder
+- [~] ⌘-click or middle-click a link opens it in a new tab; pages report single-page-app navigation, and deck reads the real address from WebKit rather than trusting the page (message parsing unit-tested)
+- [~] Links that open new windows (target=_blank, window.open) become tabs
+- [~] Address bar looks focused only while editing (was verified by screenshot before the redesign)
+- [~] Web Inspector: right-click › Inspect Element, or ⌥⌘I
+- [~] Pages render in dark appearance, so sites that follow `prefers-color-scheme` match deck
 - [~] Page zoom ⌘+ / ⌘− / ⌘0 when a page has focus
-- [~] Links that open new windows become tabs
 - [~] Rounded bottom corners that match the card
-- [x] Address bar looks focused only while editing (screenshot after `deck open`)
 
 ## Agents and control plane
 
@@ -76,6 +95,8 @@ Each item says how it was verified.
 - [x] Selection no longer stretches over the screen when a full-screen app scrolls its own region (engine test reproduces the stretch)
 
 ## Performance
+
+- [~] The sidebar and inspector are their own cached views: gpui redraws every ancestor of a view that changed, so before this each frame of a streaming agent in a terminal rebuilt the whole sidebar and inspector too (emulator core measured separately: 143 MB/s, 0.28 ms to snapshot a full coloured 200×60 screen)
 
 - [x] Idle CPU 0.1% (was 3.6%): no per-second process spawning, and the sidebar repaints only when a status changes
 - [x] Output redraws on PTY wakeup, not on a poll

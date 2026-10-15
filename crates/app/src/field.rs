@@ -3,6 +3,8 @@
 //! so the IME, dead keys, accents and the emoji picker all work; `key_down`
 //! only handles editing commands.
 
+use crate::icon::Icon;
+use crate::menu::{self, Entry, Item};
 use crate::pasteboard::{self, Pasted};
 use crate::textbuf::{Move, TextInput};
 use crate::theme::{self, u};
@@ -87,6 +89,8 @@ pub struct Field {
     /// Multi-line fields scroll; the caret is kept in view when it moves.
     scroll: ScrollHandle,
     shown_caret: Option<usize>,
+    /// The right-click menu, while open.
+    menu: Option<menu::Open>,
 }
 
 impl EventEmitter<FieldEvent> for Field {}
@@ -115,6 +119,7 @@ impl Field {
             goal_x: None,
             scroll: ScrollHandle::new(),
             shown_caret: None,
+            menu: None,
         }
     }
 
@@ -142,6 +147,22 @@ impl Field {
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         self.buf.select_all();
         cx.notify();
+    }
+
+    /// Show `rest` after the text, selected, the way an address bar
+    /// completes a host: typing on replaces it and ⌫ drops it. Not an edit,
+    /// so no undo step and no `Changed`.
+    pub fn complete_with(&mut self, rest: &str, cx: &mut Context<Self>) {
+        let typed = self.buf.text().len();
+        let text = format!("{}{rest}", self.buf.text());
+        let end = text.len();
+        self.buf.restore(text, end, typed);
+        cx.notify();
+    }
+
+    /// The caret sits at the end with nothing selected: typing appends.
+    pub fn caret_at_end(&self) -> bool {
+        self.buf.selection().is_none() && self.buf.cursor() == self.buf.text().len()
     }
 
     /// Start the undo history here (a restored draft is not an edit).
@@ -408,6 +429,61 @@ impl Field {
         cx.notify();
     }
 
+    /// Cut, Copy, Paste, Select All. A right-click outside the selection
+    /// moves the caret there first, as in any Mac text view.
+    fn on_right_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The pane around the field (a terminal's find bar) has a menu of
+        // its own; this click is the field's.
+        window.prevent_default();
+        let was_focused = self.focus.is_focused(window);
+        window.focus(&self.focus);
+        crate::browser::reclaim_keyboard(window);
+        if !was_focused && !self.multiline {
+            self.buf.select_all();
+        } else if let Some(ix) = self.index_at(ev.position) {
+            let inside = self
+                .buf
+                .selection()
+                .is_some_and(|(s, e)| (s..=e).contains(&ix));
+            if !inside {
+                self.buf.place(ix, false);
+            }
+        }
+        let selected = self.buf.selection().is_some();
+        let f = self.focus.clone();
+        let entries: Vec<Entry> = vec![
+            Item::new("Cut", menu::send(f.clone(), Cut))
+                .icon(Icon::Scissors)
+                .shortcut("⌘X")
+                .disabled(!selected)
+                .into(),
+            Item::new("Copy", menu::send(f.clone(), Copy))
+                .icon(Icon::Copy)
+                .shortcut("⌘C")
+                .disabled(!selected)
+                .into(),
+            Item::new("Paste", menu::send(f.clone(), Paste))
+                .icon(Icon::Clipboard)
+                .shortcut("⌘V")
+                .into(),
+            Entry::Separator,
+            Item::new("Select All", menu::send(f.clone(), SelectAll))
+                .icon(Icon::SelectAll)
+                .shortcut("⌘A")
+                .disabled(self.buf.is_empty())
+                .into(),
+        ];
+        self.menu = Some(menu::open(
+            entries,
+            ev.position,
+            Some(f),
+            window,
+            cx,
+            |f: &mut Self, _, _| f.menu = None,
+        ));
+        cx.notify();
+    }
+
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
@@ -571,7 +647,9 @@ impl EntityInputHandler for Field {
 
 impl Render for Field {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focused = self.focus.is_focused(window);
+        // While its menu is open the field still reads as focused: the
+        // selection the menu acts on stays highlighted.
+        let focused = self.focus.is_focused(window) || self.menu.is_some();
         let entity = cx.entity();
         let focus = self.focus.clone();
         let text = self.buf.text().to_string();
@@ -766,6 +844,7 @@ impl Render for Field {
             .cursor_text()
             .on_key_down(cx.listener(Self::on_key))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(|f, _: &SelectAll, _, cx| f.select_all(cx)))
             .on_action(cx.listener(|f, _: &Copy, _, cx| {
@@ -798,6 +877,7 @@ impl Render for Field {
             .on_action(cx.listener(|f, _: &Undo, _, cx| f.undo(cx)))
             .on_action(cx.listener(|f, _: &Redo, _, cx| f.redo(cx)))
             .child(body)
+            .children(self.menu.as_ref().map(menu::Open::render))
     }
 }
 

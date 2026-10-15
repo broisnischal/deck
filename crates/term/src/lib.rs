@@ -59,7 +59,7 @@ const SCROLLBACK: usize = 10_000;
 /// Supplied by the caller so the terminal inherits the app's theme. Without
 /// this a terminal widget always looks like it was pasted in from another
 /// program, because it was.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
@@ -219,6 +219,9 @@ pub struct Snapshot {
     /// scrolled out of view.
     pub cursor: Option<(usize, usize)>,
     pub cursor_shape: CursorShape,
+    /// Whether the cursor style in force (the program's, or the default set
+    /// with [`Terminal::set_cursor_default`]) asks for blinking.
+    pub cursor_blink: bool,
     /// How far the view is scrolled back, in lines. Non-zero means the user is
     /// looking at history rather than the live tail.
     pub scrolled_back: usize,
@@ -758,6 +761,39 @@ pub struct Terminal {
     selected: Mutex<Option<String>>,
 }
 
+/// Select every line, leaving out the blank rows below the prompt so a copy
+/// does not end in a run of empty lines.
+fn select_everything(term: &mut Term<Proxy>) {
+    use alacritty_terminal::selection::{Selection, SelectionType};
+    let top = term.topmost_line();
+    let mut bottom = term.bottommost_line();
+    while bottom > top && term.grid()[bottom].is_clear() {
+        bottom -= 1;
+    }
+    let mut s = Selection::new(
+        SelectionType::Simple,
+        Point::new(top, Column(0)),
+        Side::Left,
+    );
+    s.update(Point::new(bottom, term.last_column()), Side::Right);
+    term.selection = Some(s);
+}
+
+/// The terminal config with `shape` as the default cursor.
+fn cursor_config(shape: CursorShape, blinking: bool) -> Config {
+    use alacritty_terminal::vte::ansi::{CursorShape as A, CursorStyle};
+    let shape = match shape {
+        CursorShape::Block => A::Block,
+        CursorShape::Beam => A::Beam,
+        CursorShape::Underline => A::Underline,
+    };
+    Config {
+        scrolling_history: SCROLLBACK,
+        default_cursor_style: CursorStyle { shape, blinking },
+        ..Default::default()
+    }
+}
+
 /// Whether the live selection no longer covers the text that was selected.
 fn selection_changed(term: &Term<Proxy>, held: Option<&str>) -> bool {
     term.selection_to_string().as_deref() != held
@@ -826,6 +862,13 @@ impl Terminal {
             search: None,
             selected: Mutex::new(None),
         })
+    }
+
+    /// The cursor a program gets until it asks for another with DECSCUSR,
+    /// and goes back to when it resets (`ESC [ 0 SP q`).
+    pub fn set_cursor_default(&self, shape: CursorShape, blinking: bool) {
+        self.term.lock().set_options(cursor_config(shape, blinking));
+        self.shared.dirty.store(true, Ordering::Release);
     }
 
     /// True when content has changed since the last snapshot. One atomic load —
@@ -922,6 +965,14 @@ impl Terminal {
         if let Some(sel) = term.selection.as_mut() {
             sel.update(point, side(right));
         }
+        self.hold_selection(&term);
+        self.shared.dirty.store(true, Ordering::Release);
+    }
+
+    /// Scrollback and screen, down to the last line with anything on it.
+    pub fn select_all(&self) {
+        let mut term = self.term.lock();
+        select_everything(&mut term);
         self.hold_selection(&term);
         self.shared.dirty.store(true, Ordering::Release);
     }
@@ -1135,6 +1186,7 @@ impl Terminal {
         };
         // Cells arrive in grid order, as do matches: one cursor walks both.
         let mut next_match = 0;
+        self.scratch.cursor_blink = term.cursor_style().blinking;
         let content = term.renderable_content();
         let columns = self.size.columns;
         let rows = self.size.screen_lines;
@@ -1691,6 +1743,34 @@ mod tests {
     }
 
     #[test]
+    fn the_default_cursor_holds_until_a_program_asks_and_returns_on_reset() {
+        let style = |bytes: &[u8]| {
+            let window = WindowSize {
+                num_cols: 80,
+                num_lines: 24,
+                cell_width: 8,
+                cell_height: 16,
+            };
+            let proxy = Proxy(Arc::new(Shared::new(window)));
+            let size = Size {
+                columns: 80,
+                screen_lines: 24,
+            };
+            let mut term = Term::new(cursor_config(CursorShape::Beam, true), &size, proxy);
+            let mut parser: alacritty_terminal::vte::ansi::Processor =
+                alacritty_terminal::vte::ansi::Processor::new();
+            parser.advance(&mut term, bytes);
+            (
+                cursor_shape_of(term.renderable_content().cursor.shape),
+                term.cursor_style().blinking,
+            )
+        };
+        assert_eq!(style(b""), (CursorShape::Beam, true));
+        assert_eq!(style(b"\x1b[2 q"), (CursorShape::Block, false));
+        assert_eq!(style(b"\x1b[2 q\x1b[0 q"), (CursorShape::Beam, true));
+    }
+
+    #[test]
     fn clearing_scrollback_drops_history_and_returns_to_the_tail() {
         let spawn = Spawn {
             program: Some("/bin/sh".into()),
@@ -1955,6 +2035,35 @@ mod tests {
             "an idle terminal must not rebuild its grid every frame"
         );
     }
+    #[test]
+    fn select_all_takes_scrollback_and_stops_at_the_last_written_line() {
+        let window = WindowSize {
+            num_cols: 20,
+            num_lines: 4,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let size = Size {
+            columns: 20,
+            screen_lines: 4,
+        };
+        let mut term = Term::new(
+            Config::default(),
+            &size,
+            Proxy(Arc::new(Shared::new(window))),
+        );
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        // Five lines on a four-line screen: "one" has scrolled into history,
+        // and the cursor sits on a blank last row.
+        parser.advance(&mut term, b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        select_everything(&mut term);
+        assert_eq!(
+            term.selection_to_string().as_deref(),
+            Some("one\ntwo\nthree\nfour")
+        );
+    }
+
     #[test]
     fn a_selection_stretched_by_a_scrolling_region_is_caught_and_one_that_moves_with_its_text_is_not(
     ) {

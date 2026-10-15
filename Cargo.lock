@@ -146,6 +146,7 @@ dependencies = [
  "agent-cli",
  "agent-core",
  "anyhow",
+ "block2",
  "futures",
  "gpui",
  "objc2-app-kit",

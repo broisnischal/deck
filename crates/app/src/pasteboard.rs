@@ -21,6 +21,20 @@ pub enum Pasted {
 /// a file name riding along with the picture), so copying a table out of
 /// Numbers, which also carries a picture of it, still pastes the text.
 pub fn read() -> Option<Pasted> {
+    read_with(|t| t.trim().contains(char::is_whitespace))
+}
+
+/// The terminal's ⌘V: any text wins, so a single word copied with a picture
+/// of it still pastes as the word, except a lone link riding along with an
+/// image ("Copy Image" in a browser).
+pub fn read_for_terminal() -> Option<Pasted> {
+    read_with(|t| {
+        let t = t.trim();
+        !t.is_empty() && !t.starts_with("http://") && !t.starts_with("https://")
+    })
+}
+
+fn read_with(text_wins: impl Fn(&str) -> bool) -> Option<Pasted> {
     let pb = NSPasteboard::generalPasteboard();
     let files: Vec<PathBuf> = pb
         .pasteboardItems()
@@ -38,10 +52,7 @@ pub fn read() -> Option<Pasted> {
     let text = pb
         .stringForType(unsafe { NSPasteboardTypeString })
         .map(|s| s.to_string());
-    if text
-        .as_deref()
-        .is_some_and(|t| t.trim().contains(char::is_whitespace))
-    {
+    if text.as_deref().is_some_and(text_wins) {
         return None;
     }
     // Formats the model accepts as they are; anything else (TIFF from a
@@ -64,6 +75,52 @@ pub fn read() -> Option<Pasted> {
         rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
     }?;
     Some(Pasted::Image(png.to_vec(), "png"))
+}
+
+/// Longest edge a pasted image keeps. The model scales anything larger down
+/// to about this anyway, so the extra pixels would only cost upload time.
+const PASTE_MAX_EDGE: u32 = 1568;
+
+/// Keep a pasted image as a file, so every agent can be handed a path.
+/// Big ones are scaled down with `sips`; if that fails the original stays.
+pub fn save_image(bytes: &[u8], ext: &str) -> std::io::Result<PathBuf> {
+    let dir = crate::threads::attachments_dir();
+    std::fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("pasted-{stamp}.{ext}"));
+    std::fs::write(&path, bytes)?;
+    if bytes.len() > 512 * 1024 && ext != "gif" {
+        let edge = PASTE_MAX_EDGE.to_string();
+        let _ = std::process::Command::new("/usr/bin/sips")
+            .args(["-Z", &edge])
+            .arg(&path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    Ok(path)
+}
+
+/// Paths as a terminal types them when files are dropped on it: each one
+/// backslash-escaped, joined by spaces. Agent CLIs (Claude Code, Codex) turn
+/// a pasted image path into an attachment.
+pub fn shell_paths(paths: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        for c in p.to_string_lossy().chars() {
+            if !(c.is_alphanumeric() || "/._-+,:@%~".contains(c)) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// `file:///Users/me/My%20Shot.png` → `/Users/me/My Shot.png`.
@@ -118,5 +175,14 @@ mod tests {
             Some("/tmp/100%".into())
         );
         assert_eq!(file_url_to_path("https://example.com"), None);
+    }
+
+    #[test]
+    fn shell_paths_escape_like_a_drop() {
+        assert_eq!(
+            shell_paths(&["/Users/me/My Shot (2).png".into(), "/tmp/aé.txt".into()]),
+            r"/Users/me/My\ Shot\ \(2\).png /tmp/aé.txt"
+        );
+        assert_eq!(shell_paths(&["/tmp/it's".into()]), r"/tmp/it\'s");
     }
 }

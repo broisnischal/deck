@@ -11,7 +11,8 @@
 use crate::field::{Field, FieldEvent};
 use crate::icon::{icon, spinner, Icon};
 use crate::markdown::{self, MdBlock, Spans};
-use crate::pasteboard::Pasted;
+use crate::menu::{self, Item};
+use crate::pasteboard::{self, Pasted};
 use crate::theme::{self, u};
 use crate::threads;
 use agent_core::{
@@ -22,10 +23,10 @@ use agent_core::{
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
-    div, img, list, pulsating_between, px, relative, rgb, rgba, Animation, AnimationExt,
-    AnyElement, Context, ElementId, Entity, EventEmitter, ExternalPaths, FontStyle, FontWeight,
-    InteractiveText, ListAlignment, ListState, SharedString, StrikethroughStyle, StyledImage,
-    StyledText, Subscription, Task, TextRun, UnderlineStyle, Window,
+    div, img, list, px, relative, rgb, rgba, Animation, AnimationExt, AnyElement, Context,
+    ElementId, Entity, EventEmitter, ExternalPaths, FontStyle, FontWeight, InteractiveText,
+    ListAlignment, ListState, SharedString, StrikethroughStyle, StyledImage, StyledText,
+    Subscription, Task, TextRun, UnderlineStyle, Window,
 };
 use session::{Conn, DriverEvent};
 use std::collections::{HashMap, HashSet};
@@ -246,6 +247,8 @@ pub struct ChatPane {
     /// Work logs the user opened or closed by hand, by (message, group).
     log_open: HashMap<(usize, usize), bool>,
     copied: Option<String>,
+    /// The right-click menu on a message, while open.
+    menu: Option<menu::Open>,
     /// Files and images going out with the next message.
     attachments: Vec<PathBuf>,
     /// Files under `cwd` for `@`, listed on first use and again when stale.
@@ -380,6 +383,7 @@ impl ChatPane {
             worked: HashMap::new(),
             log_open: HashMap::new(),
             copied: None,
+            menu: None,
             attachments: Vec::new(),
             files: None,
             files_at: None,
@@ -529,6 +533,10 @@ impl ChatPane {
     /// How long the current turn has been running.
     pub fn working_for(&self) -> Option<Duration> {
         self.turn_started.map(|t| t.elapsed())
+    }
+
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
     }
 
     pub fn agent_name(&self) -> SharedString {
@@ -801,7 +809,7 @@ impl ChatPane {
                 cx.spawn(async move |this, cx| {
                     let saved = cx
                         .background_executor()
-                        .spawn(async move { save_pasted_image(&bytes, ext) })
+                        .spawn(async move { pasteboard::save_image(&bytes, ext) })
                         .await;
                     let _ = this.update(cx, |c, cx| match saved {
                         Ok(path) => c.attach_paths(&[path], cx),
@@ -1315,6 +1323,12 @@ impl ChatPane {
         cx.notify();
     }
 
+    /// Where a new thread starts (Settings › Agents), set before its first
+    /// turn so nothing needs a restart.
+    pub fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+    }
+
     fn toggle_mode(&mut self, cx: &mut Context<Self>) {
         // Ask before edits → auto-accept edits → full access → ask…
         self.mode = match self.mode {
@@ -1601,6 +1615,31 @@ impl ChatPane {
             .child(div().w_full().max_w(u(COLUMN)).px(u(24.)).child(content))
     }
 
+    /// Right-click on a message: copy all of its text, as Copy under it does.
+    fn open_message_menu(
+        &mut self,
+        text: String,
+        at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = vec![Item::new("Copy Message", move |_, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()))
+        })
+        .icon(Icon::Copy)
+        .into()];
+        let restore = Some(self.composer.read(cx).focus.clone());
+        self.menu = Some(menu::open(
+            entries,
+            at,
+            restore,
+            window,
+            cx,
+            |c: &mut Self, _, _| c.menu = None,
+        ));
+        cx.notify();
+    }
+
     fn render_message(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(msg) = self.transcript.messages.get(ix) else {
             return div().into_any_element();
@@ -1627,6 +1666,7 @@ impl ChatPane {
                 }
                 let waiting = ix + 1 == self.transcript.messages.len() && self.busy();
                 if !text.is_empty() {
+                    let copy = text.clone();
                     col = col.child(
                         div()
                             .max_w(relative(0.8))
@@ -1635,6 +1675,12 @@ impl ChatPane {
                             .rounded(u(18.))
                             .bg(rgb(theme::SURFACE))
                             .text_color(rgb(theme::TEXT))
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                cx.listener(move |c, ev: &gpui::MouseDownEvent, window, cx| {
+                                    c.open_message_menu(copy.clone(), ev.position, window, cx)
+                                }),
+                            )
                             .child(text),
                     );
                 }
@@ -1683,6 +1729,15 @@ impl ChatPane {
                 let last_work = parts.iter().rposition(|p| matches!(p, Part::Work(_)));
 
                 let mut col = div().flex().flex_col().gap(u(12.)).pt(u(24.));
+                if !text.is_empty() {
+                    let copy = text.clone();
+                    col = col.on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |c, ev: &gpui::MouseDownEvent, window, cx| {
+                            c.open_message_menu(copy.clone(), ev.position, window, cx)
+                        }),
+                    );
+                }
                 for (pi, part) in parts.iter().enumerate() {
                     col = col.child(match part {
                         Part::One(bix) => self.render_block(ix, *bix, &blocks[*bix], cx),
@@ -3089,17 +3144,7 @@ fn message_text(msg: &agent_core::Message) -> String {
 
 /// A label that breathes while the agent works on it.
 fn working_label(id: String, label: SharedString) -> AnyElement {
-    div()
-        .flex_none()
-        .child(label)
-        .with_animation(
-            ElementId::Name(id.into()),
-            Animation::new(Duration::from_millis(1400))
-                .repeat()
-                .with_easing(pulsating_between(0.45, 1.)),
-            |d, t| d.opacity(t),
-        )
-        .into_any_element()
+    crate::icon::shimmer(ElementId::Name(id.into()), label)
 }
 
 /// `+12 −3`, additions bright and removals dim, in the mono face so the
@@ -3749,6 +3794,7 @@ impl Render for ChatPane {
                 window.focus(&c.composer.read(cx).focus);
             }))
             .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme::RAISED)))
+            .children(self.menu.as_ref().map(menu::Open::render))
             .when(empty, |d| d.child(self.render_empty(window, cx)))
             .when(!empty, |d| {
                 d.child(
@@ -3792,29 +3838,6 @@ fn settle(t: &mut Transcript) {
 
 fn uuid_like() -> String {
     SessionId::new().0.to_string()
-}
-
-/// Longest edge a pasted image keeps. The model scales anything larger down
-/// to about this anyway, so the extra pixels would only cost upload time.
-const PASTE_MAX_EDGE: u32 = 1568;
-
-/// Keep a pasted image as a file, so every agent can be handed a path.
-/// Big ones are scaled down with `sips`; if that fails the original stays.
-fn save_pasted_image(bytes: &[u8], ext: &str) -> std::io::Result<PathBuf> {
-    let dir = threads::attachments_dir();
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("pasted-{}.{ext}", now()));
-    std::fs::write(&path, bytes)?;
-    if bytes.len() > 512 * 1024 && ext != "gif" {
-        let edge = PASTE_MAX_EDGE.to_string();
-        let _ = std::process::Command::new("/usr/bin/sips")
-            .args(["-Z", &edge])
-            .arg(&path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    Ok(path)
 }
 
 /// How long a listing of the project's files is trusted.

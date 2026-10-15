@@ -26,6 +26,10 @@ pub const SELECTION: u32 = 0x3a3a3a;
 pub const HAIRLINE: u32 = 0xffffff0f;
 /// White at 10%: the edge of something you type into.
 pub const INPUT_EDGE: u32 = 0xffffff1a;
+/// White at 16%: the card that has the keyboard, in a split.
+pub const FOCUS_EDGE: u32 = 0xffffff29;
+/// Black at 28% over the panes of a split that do not have the keyboard.
+pub const UNFOCUSED_VEIL: u32 = 0x00000047;
 
 pub const UI: &str = ".SystemUIFont";
 /// Every Mac has Menlo, so the grid never falls back to a proportional face.
