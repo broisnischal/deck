@@ -32,6 +32,7 @@ mod net;
 mod notify;
 mod palette;
 mod pasteboard;
+mod privacy;
 mod preview;
 mod refine;
 mod retry;

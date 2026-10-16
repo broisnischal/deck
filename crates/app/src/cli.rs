@@ -44,7 +44,7 @@ deck: drive the deck window you are running in.
       the alert, confirm, prompt or login the page has up, or its answer
       click, type and key answer dialogs they raise themselves (OK; --dismiss to cancel)
       every browser verb takes --pane N or --name NAME; without, the page in your tab
-  deck settings open [--page general|appearance|terminal|browser|agents|models|keyboard|snippets]
+  deck settings open [--page general|appearance|terminal|browser|agents|models|permissions|keyboard|snippets]
   deck window shot [PATH]            a PNG of this deck window (default: shot.png in deck's data folder)
   deck task new [--agent claude|codex|…] [--cwd DIR] BRIEF
       a sub-agent on its own branch and worktree of this project

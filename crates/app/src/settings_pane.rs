@@ -18,6 +18,7 @@ use gpui::{
 use std::time::Duration;
 
 mod models;
+mod permissions;
 
 pub enum SettingsEvent {
     Changed(Settings),
@@ -78,6 +79,8 @@ pub struct SettingsPane {
     key_note: Option<(&'static str, SharedString)>,
     /// The Models page: local runtimes, models and routes.
     models: models::Models,
+    /// The Permissions page is looking again every few seconds.
+    perms_polling: bool,
     _search: Subscription,
 }
 
@@ -187,6 +190,7 @@ impl SettingsPane {
             recording: None,
             key_note: None,
             models: models::Models::new(cx),
+            perms_polling: false,
             _search,
         }
     }
@@ -346,6 +350,7 @@ impl SettingsPane {
             Page::Browser => self.page_browser(cx),
             Page::Agents => self.page_agents(cx),
             Page::Models => self.page_models(cx),
+            Page::Permissions => self.page_permissions(cx),
             Page::Keyboard => self.page_keyboard(cx),
             Page::Snippets => self.page_snippets(cx),
         }
@@ -989,18 +994,20 @@ pub enum Page {
     Browser,
     Agents,
     Models,
+    Permissions,
     Keyboard,
     Snippets,
 }
 
 impl Page {
-    const ALL: [Page; 8] = [
+    const ALL: [Page; 9] = [
         Page::General,
         Page::Appearance,
         Page::Terminal,
         Page::Browser,
         Page::Agents,
         Page::Models,
+        Page::Permissions,
         Page::Keyboard,
         Page::Snippets,
     ];
@@ -1013,6 +1020,7 @@ impl Page {
             Page::Browser => "Browser",
             Page::Agents => "Agents",
             Page::Models => "Models",
+            Page::Permissions => "Permissions",
             Page::Keyboard => "Keyboard",
             Page::Snippets => "Snippets",
         }
@@ -2042,6 +2050,9 @@ impl Render for SettingsPane {
             let page = self.page;
             if page == Page::Models {
                 self.watch_models(cx);
+            }
+            if page == Page::Permissions {
+                self.watch_permissions(cx);
             }
             column = column.child(title(page.name().into()));
             for (p, secs) in outline {

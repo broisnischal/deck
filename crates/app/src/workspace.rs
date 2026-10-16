@@ -5244,6 +5244,7 @@ impl Workspace {
                     "browser" => Ok(Page::Browser),
                     "agents" => Ok(Page::Agents),
                     "models" => Ok(Page::Models),
+                    "permissions" | "privacy" => Ok(Page::Permissions),
                     "keyboard" | "shortcuts" | "keys" => Ok(Page::Keyboard),
                     "snippets" => Ok(Page::Snippets),
                     other => Err(format!("no settings page {other}")),
