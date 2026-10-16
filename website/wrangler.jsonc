@@ -1,0 +1,13 @@
+// Deck's website: static files served by Cloudflare (Pages is now part of
+// Workers, as static assets). `npx wrangler deploy` from this folder.
+{
+  "$schema": "../backend/node_modules/wrangler/config-schema.json",
+  "name": "deck-site",
+  "account_id": "16b2c363a412bfaaec2a5a2572964728",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./public",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  }
+}

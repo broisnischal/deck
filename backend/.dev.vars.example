@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `npm run dev`; these override wrangler.jsonc locally.
+BETTER_AUTH_URL=http://localhost:8787
+BETTER_AUTH_SECRET=replace-with-openssl-rand-base64-32
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+DODO_PAYMENTS_API_KEY=
+DODO_PRODUCT_PRO=

@@ -1,0 +1,342 @@
+<!-- {"title": "Features", "description": "Everything Deck does: chats with any coding agent, approvals, undo, tasks on their own branch, terminals and a browser made for agents, snippets, the command palette and more.", "path": "/features/"} -->
+    <header class="page-head">
+      <div class="eyebrow left">Features</div>
+      <h1>Everything Deck does</h1>
+      <p class="sub">Deck is one Mac window for coding with agents: chats, terminals and a browser side by side. Here is each part, what it does, and how you use it.</p>
+    </header>
+
+    <div class="with-toc">
+      <nav class="toc" aria-label="On this page">
+        <h2>On this page</h2>
+        <a href="#chat">Chats</a>
+        <a href="#approvals">Approvals and alerts</a>
+        <a href="#undo">Undo a turn</a>
+        <a href="#rewrite">Prompt rewriting</a>
+        <a href="#tasks">Tasks</a>
+        <a href="#terminal">Terminals</a>
+        <a href="#browser">Browser</a>
+        <a href="#snippets">Snippets</a>
+        <a href="#workspace">The workspace</a>
+        <a href="#drive">Agents driving Deck</a>
+        <a href="#account">Account and updates</a>
+      </nav>
+
+      <div>
+        <section class="feature-group" id="chat">
+          <h2>Chats</h2>
+          <p>A chat is a conversation with one coding agent, working in one folder on your Mac. Deck runs the agent's own CLI, signed in with your own account, and shows what it does in a form you can read and act on.</p>
+          <figure class="fig">
+            <img src="/shots/chat.webp" width="1512" height="949" loading="lazy" alt="A Codex chat in Deck: the test was racing a 50 ms timer; Codex fixed it, and a card lists the one changed file.">
+            <figcaption># a codex chat: each turn folds into one line you can open, and a card lists what changed</figcaption>
+          </figure>
+
+          <div class="feature">
+            <h3>One window, every agent</h3>
+            <p>Chat with Claude Code, Codex, Gemini CLI, Grok and OpenCode, whichever you have installed. You can switch agents in the middle of a thread: the new one is handed the conversation so far. Cursor Agent, Amp and Aider run in their own terminals, with their own interface.</p>
+            <p class="how"><b>How:</b> <kbd>⇧⌘N</kbd> starts a chat with your default agent; <kbd>⌘N</kbd> lets you pick any agent, as a chat or in a terminal. Choose the default in Settings › Agents.</p>
+          </div>
+
+          <div class="feature">
+            <h3>The control chat</h3>
+            <p>A chat pinned at the top of the sidebar, always there. Besides coding, it can run Deck for you: open terminals and pages, split panes, start your dev server, and hand out tasks.</p>
+            <p class="how"><b>How:</b> it's the first tab (<kbd>⌘1</kbd>). Right-click it to start a new conversation or restart its agent.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Every step, as it happens</h3>
+            <p>Commands, file reads and edits appear the moment the agent makes them, written as plain sentences ("Ran npm test", "Edited src/app.ts"). Each one opens to show its output or its diff. While the agent works you see the newest steps and a live timer; when the turn ends, it all folds into one summary line that opens back up.</p>
+            <p class="how"><b>How:</b> click a step to open it, and the summary line to see the whole turn.</p>
+          </div>
+
+          <div class="feature">
+            <h3>What changed, after every turn</h3>
+            <p>When a turn that edited files is over, a card lists each changed file with lines added and removed. Click a file to see all of its changes.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Talk while it works</h3>
+            <p>You don't have to wait. A message you send mid-turn reaches the agent as soon as its current step finishes, the way a colleague reads a message between tasks.</p>
+            <p class="how"><b>How:</b> <kbd>⏎</kbd> queues it after this step, <kbd>⌘⏎</kbd> sends it right now, <kbd>esc</kbd> stops the turn.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Attach anything</h3>
+            <p>Paste a screenshot, drop in files, or mention a file in your project. The agent receives them with your message.</p>
+            <p class="how"><b>How:</b> <kbd>⌘V</kbd> an image, drag files onto the chat, or type <code>@</code> and a few letters of a file name.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Select and copy any part</h3>
+            <p>Select text anywhere in a conversation, across replies, lists, tables and code, and copy it as Markdown would write it.</p>
+            <p class="how"><b>How:</b> drag across it, double-click a word or triple-click a paragraph, then <kbd>⌘C</kbd>.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Threads last</h3>
+            <p>Conversations, drafts and attachments are saved as you go and come back after you quit. Claude picks up its own session, so it remembers the conversation too.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="approvals">
+          <h2>Approvals and alerts</h2>
+          <p>You decide how much an agent may do on its own, and Deck makes sure you notice when it needs you.</p>
+
+          <div class="feature">
+            <h3>Approvals where you type</h3>
+            <p>When an agent wants to run a command or edit a file, the request appears just above the message box, with the command or the diff. You can allow it once, allow it for the rest of the chat, refuse it, or type what it should do instead. Questions from the agent show their options the same way.</p>
+            <p class="how"><b>How:</b> <kbd>↑</kbd> <kbd>↓</kbd> and <kbd>⏎</kbd>, the number keys, a click, or <kbd>esc</kbd> to refuse.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Choose how much it may do</h3>
+            <p>Each thread has an access mode: <strong>Ask first</strong> (asks before every edit and command), <strong>Accept edits</strong> (edits on its own, asks before commands) or <strong>Full access</strong> (does both without asking).</p>
+            <p class="how"><b>How:</b> click the chip in the message box to change it. Settings › Agents sets where new threads start.</p>
+          </div>
+
+          <div class="feature">
+            <h3>"Needs you"</h3>
+            <p>When an agent asks for permission or a question, its tab says "Needs you", the Dock icon shows a count, and if you're looking elsewhere, a notification tells you. Click it to go straight there. Long jobs that finish while you're away notify you too. This also works for Claude Code running in a terminal.</p>
+            <p class="how"><b>How:</b> on by default; turn either kind off in Settings › Agents › Notifications.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Turns that fail come back</h3>
+            <p>If a turn dies on a network or API error, Deck says "continue" for you after 5 seconds, then 10, 20 and so on up to five minutes, eight times. If you hit a usage limit, it waits until the limit resets. Problems a retry can't fix, like being signed out or a billing issue, are shown to you instead.</p>
+            <p class="how"><b>How:</b> automatic. <kbd>esc</kbd> cancels a retry that's lined up. Turn it off in Settings › Agents › Recovery.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="undo">
+          <h2>Undo a turn</h2>
+          <p>Agents sometimes go the wrong way. In a project that uses git, every message you send quietly saves your files as they were at that moment, so you can go back.</p>
+
+          <div class="feature">
+            <h3>Undo to here</h3>
+            <p>Puts your files back the way they were when you sent that message, and ends the conversation there. Files the agent changed are restored, and files it created are removed. Your branch, your staged changes, your stash and the files git ignores are never touched.</p>
+            <p class="how"><b>How:</b> right-click one of your messages › Undo to Here.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Edit from here</h3>
+            <p>The same, but your message comes back into the box so you can change it and send it again.</p>
+            <p class="how"><b>How:</b> right-click one of your messages › Edit from Here.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Put files back</h3>
+            <p>Before going back, Deck saves how things were, so you can undo the undo.</p>
+            <p class="how"><b>How:</b> right-click a message › Put Files Back.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="rewrite">
+          <h2>Prompt rewriting</h2>
+          <p>Type or dictate the way you think, and Deck turns it into a clear, complete prompt before it goes to the agent. It uses the agent's current task and last reply to work out what "it" and "that" mean, and never adds facts you didn't give it.</p>
+
+          <div class="feature">
+            <h3>Rewrite and send</h3>
+            <p>Short replies like "yes, do it", slash commands and shell commands are sent as you typed them. Anything longer is rewritten first.</p>
+            <p class="how"><b>How:</b> <kbd>⏎</kbd> rewrites and sends, <kbd>⌃O</kbd> rewrites into the box without sending, <kbd>⌃Z</kbd> brings back your own words. In Settings › Agents you can have it show the rewrite first, choose the model, or turn it off.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="tasks">
+          <h2>Tasks</h2>
+          <p>A task is a job handed to an agent that works on its own branch, in its own copy of your project, so it never touches the files you're working in. Run as many as you like at once.</p>
+
+          <div class="feature">
+            <h3>Start a task</h3>
+            <p>Describe what you want, and Deck makes a new branch and a separate checkout for it, then starts an agent working there. The sidebar shows what each task's agent is doing right now, or how many files and lines it has changed.</p>
+            <p class="how"><b>How:</b> <kbd>⌘K</kbd>, describe the job, and pick "Start a task".</p>
+          </div>
+
+          <div class="feature">
+            <h3>Preview it running</h3>
+            <p>Runs the project's dev server from the task's own checkout, on a port of its own so it doesn't clash with yours, and opens the page beside the review once it's up. A fresh checkout installs its packages first.</p>
+            <p class="how"><b>How:</b> open the task's review › Preview.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Review, then decide</h3>
+            <p>The review shows every change, file by file. Then <strong>Merge</strong> squashes it into your branch as one commit, <strong>Open PR</strong> pushes the branch and opens a pull request, and <strong>Discard</strong> throws it away. A terminal in the task's folder is one click away if you want to run the tests yourself.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Agents hand out tasks too</h3>
+            <p>An agent working on a big job can split it into tasks, each with its own agent on its own branch. Deck tells it when each one finishes, so it can review the changes and merge them.</p>
+            <p class="how"><b>How:</b> ask the control chat to "split this into tasks", or see <a href="/docs/#cli">the deck command</a>.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="terminal">
+          <h2>Terminals</h2>
+          <p>A real, fast terminal for your shell and for the agents that live in one.</p>
+
+          <div class="feature">
+            <h3>Fast and faithful</h3>
+            <p>True colour, wide characters and emoji, mouse support for full-screen programs, input methods, smooth scrolling, and search through the scrollback.</p>
+            <p class="how"><b>How:</b> <kbd>⌘T</kbd> opens one, <kbd>⌘F</kbd> searches, <kbd>⇧⌘K</kbd> clears it.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Made for agent CLIs</h3>
+            <p>Paste a screenshot or drop files and their paths go in, which Claude Code and Codex turn into attachments. Diffs and highlights that programs paint in solid colour are shown as soft tints. If Claude Code gets stuck in its own retry loop, Deck nudges it along.</p>
+            <p class="how"><b>How:</b> <kbd>⌘V</kbd> an image, or drag files onto the terminal. Turn the soft colours off in Settings › Terminal.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Knows what's running</h3>
+            <p>Tabs are named after the program's own title, such as Claude Code's current task, and show the project and folder they're in. Links open beside the terminal.</p>
+            <p class="how"><b>How:</b> <kbd>⌘</kbd>-click a link.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Your look</h3>
+            <p>Choose the font, size, line height, cursor and blink, and one of six colour schemes or one that matches the window.</p>
+            <p class="how"><b>How:</b> Settings › Terminal and Settings › Appearance.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Your default terminal</h3>
+            <p>Make Deck the app that opens shell scripts, <code>.command</code> files and <code>ssh:</code>, <code>telnet:</code> and <code>x-man-page:</code> links. Each opens in a new tab. You can hand them back to Terminal at any time.</p>
+            <p class="how"><b>How:</b> Deck offers on its first launch; or Settings › General › Default terminal.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="browser">
+          <h2>Browser</h2>
+          <p>A real browser in the same window, so the page you're building sits next to the agent building it.</p>
+
+          <div class="feature">
+            <h3>Beside your code</h3>
+            <p>Search or type an address, with suggestions from your history and your search engine. The new tab page shows the sites you visit most and the dev servers running on your Mac, one click each.</p>
+            <p class="how"><b>How:</b> <kbd>⌘L</kbd> for the address bar, <kbd>⇧⌘T</kbd> for a new browser tab. Choose the search engine in Settings › Browser.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Everything a browser needs</h3>
+            <p>Find in page, downloads, the Web Inspector, two-finger swipe back and forward, and <kbd>⌘</kbd>-click to open a link in a new tab. Pages follow your theme, dark or light.</p>
+            <p class="how"><b>How:</b> <kbd>⌘F</kbd> to find, <kbd>⌥⌘I</kbd> for the Web Inspector.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="snippets">
+          <h2>Snippets</h2>
+          <p>The prompts you send again and again, kept and put in with a keystroke.</p>
+
+          <div class="feature">
+            <h3>Put one in</h3>
+            <p>A snippet goes into the chat's message box, or into the terminal at the prompt, ready to add to. Nothing is sent or run until you press <kbd>⏎</kbd>.</p>
+            <p class="how"><b>How:</b> <kbd>⌘;</kbd> lists them, or type its keyword after a semicolon, like <code>;review</code>, and a space.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Fill-ins</h3>
+            <p><code>{clipboard}</code>, <code>{selection}</code>, <code>{branch}</code> and <code>{folder}</code> in a snippet become what you've copied, what's selected, and the branch and folder you're in.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Keep and share</h3>
+            <p>Save what you've typed, or what's selected in a terminal, as a snippet. A project can share its own snippets with everyone who works on it by committing <code>.deck/snippets.json</code>.</p>
+            <p class="how"><b>How:</b> <kbd>⌘K</kbd> › Save as Snippet; edit them in Settings › Snippets.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="workspace">
+          <h2>The workspace</h2>
+          <p>The window that holds it all, made to stay out of your way.</p>
+
+          <div class="feature">
+            <h3>Command palette</h3>
+            <p>One box for any open tab, any action and its shortcut, your snippets, the files of the project you're in, and pages you've visited. Typing a description offers to start it as a task.</p>
+            <p class="how"><b>How:</b> <kbd>⌘K</kbd>.</p>
+          </div>
+
+          <div class="feature">
+            <h3>New tab page</h3>
+            <p>A terminal, a browser, or any agent, as a chat or in its own terminal.</p>
+            <p class="how"><b>How:</b> <kbd>⌘N</kbd>, then <kbd>⏎</kbd> for a terminal or <kbd>1</kbd>–<kbd>9</kbd> to pick.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Splits and the inspector</h3>
+            <p>Split any pane right or down and drag the divider to resize. The inspector shows the focused terminal's processes, the ports they listen on, the project's files and its git status.</p>
+            <p class="how"><b>How:</b> <kbd>⌘D</kbd> and <kbd>⇧⌘D</kbd> to split, double-click a divider to even it out, <kbd>⌘I</kbd> for the inspector, <kbd>⌘B</kbd> for the sidebar.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Comes back as you left it</h3>
+            <p>Tabs, splits, focus and conversations are restored after a restart. Agents running in terminals resume their own conversation.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Themes, zoom and settings</h3>
+            <p>Five window themes (System, Black, Graphite, Midnight, Light) and one zoom for everything. Settings are searchable and apply the moment you change them.</p>
+            <p class="how"><b>How:</b> <kbd>⌘,</kbd> for Settings, <kbd>⌘+</kbd> and <kbd>⌘−</kbd> to zoom.</p>
+          </div>
+          <figure class="fig">
+            <img src="/shots/themes.webp" width="1512" height="949" loading="lazy" alt="Deck's Appearance settings: five window themes and terminal palettes.">
+            <figcaption># settings › appearance: five themes, zoom, terminal palettes</figcaption>
+          </figure>
+
+          <div class="feature">
+            <h3>Your shortcuts</h3>
+            <p>Change any shortcut: click it and press the new keys. Deck tells you if the keys are already taken, and the menus and the command palette show yours.</p>
+            <p class="how"><b>How:</b> Settings › Keyboard.</p>
+          </div>
+          <figure class="fig">
+            <img src="/shots/keys.webp" width="1512" height="949" loading="lazy" alt="Deck's Keyboard settings: every shortcut as a keycap you click to change.">
+            <figcaption># settings › keyboard: click a shortcut, press the new keys</figcaption>
+          </figure>
+
+          <div class="feature">
+            <h3>Lock</h3>
+            <p>Hides everything behind Touch ID or your Mac's password. Your terminals and agents keep running underneath.</p>
+            <p class="how"><b>How:</b> <kbd>⇧⌘L</kbd>, or the avatar menu › Lock.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="drive">
+          <h2>Agents driving Deck</h2>
+          <p>Agents can work the window themselves, so "start the app and check the page" just works.</p>
+
+          <div class="feature">
+            <h3>The deck command</h3>
+            <p>Every terminal and chat in Deck can use the <code>deck</code> command: open terminals and pages, read a terminal's screen, message another chat, run JavaScript in a page, take a picture of the window, and hand out tasks. Output is JSON, so agents can read it.</p>
+            <p class="how"><b>How:</b> run <code>deck</code> in a Deck terminal for the full list, or see <a href="/docs/#cli">the docs</a>.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Tools of their own</h3>
+            <p>Agents in Deck's chats also get these as built-in tools, including a look at the window, without needing to type commands.</p>
+          </div>
+        </section>
+
+        <section class="feature-group" id="account">
+          <h2>Account and updates</h2>
+
+          <div class="feature">
+            <h3>Sign in with Google</h3>
+            <p>Your account holds your plan. Deck checks it every few hours, and keeps working for up to a week without a connection.</p>
+            <p class="how"><b>How:</b> Deck asks on first launch. Manage your plan in Settings › General, or on <a href="/account/">your account page</a>.</p>
+          </div>
+
+          <div class="feature">
+            <h3>Updates</h3>
+            <p>Deck looks for a new version once a day and says so in the title bar. It downloads in the background and installs when you restart.</p>
+            <p class="how"><b>How:</b> click "Update available" in the title bar, or Settings › General › Updates.</p>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <section class="sec center">
+      <div class="head" style="margin-bottom:0">
+        <h2 class="h-sec">See it on your own work</h2>
+        <p class="sub">Free for 14 days. No credit card required.</p>
+        <div class="buttons" style="justify-content:center;margin-top:32px">
+          <a class="btn btn-primary" data-download data-soft href="/download/"><span data-download-label>Download for Mac</span></a>
+          <a class="btn" href="/pricing/">See pricing</a>
+        </div>
+      </div>
+    </section>

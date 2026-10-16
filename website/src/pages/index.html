@@ -1,0 +1,318 @@
+<!-- {"title": "Deck", "description": "Deck is the Mac app for coding with AI agents. Run Claude Code, Codex, Gemini and other agents in one native window beside your terminals and a browser: see every step, approve what matters, and undo anything.", "path": "/"} -->
+    <section class="hero" id="top">
+      <div class="eyebrow"><a href="/changelog/">Introducing Deck 0.1</a></div>
+      <h1 class="h-display">A better way to work<br class="lg"> with coding agents</h1>
+      <p class="sub">Claude Code, Codex and Gemini in one native Mac app, beside your terminals and a browser. See every step they take, approve what matters, and undo anything.</p>
+      <div class="buttons">
+        <a class="btn btn-primary" data-download data-soft href="/download/">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.4 12.6c0-2.4 2-3.5 2-3.6-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9-.7 0-1.8-.8-3-.8-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7c1.3 0 2.1-1.1 2.8-2.3.9-1.3 1.3-2.6 1.3-2.6s-2.5-1-2.5-3.7zM14.1 5.6c.6-.8 1.1-1.9 1-3-1 0-2.1.7-2.8 1.4-.6.7-1.2 1.8-1 2.9 1 .1 2.1-.6 2.8-1.3z"/></svg>
+          <span data-download-label>Download for Mac</span>
+        </a>
+        <a class="btn" href="#features">See how it works <svg class="arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8h10M9 4l4 4-4 4"/></svg></a>
+      </div>
+      <p class="note">Free for 14 days. No credit card required.</p>
+
+      <div class="shot-wrap">
+        <div class="glow" aria-hidden="true"></div>
+        <div class="device">
+          <img src="/shots/hero-1512.webp" srcset="/shots/hero-1512.webp 1512w, /shots/hero-3024.webp 3024w" sizes="(max-width: 1100px) 100vw, 1060px" width="3024" height="1898" alt="Deck with three panes: Claude's chat after adding a dark mode switch, a terminal where the tests passed, and the app's settings page with the switch on." fetchpriority="high">
+        </div>
+      </div>
+    </section>
+
+    <section class="sec tight strip">
+      <p>Works with the coding agents you already use</p>
+      <div class="agents">
+        <span class="agent"><i style="--icon:url(/agents/claude.svg)"></i>Claude Code</span>
+        <span class="agent"><i style="--icon:url(/agents/codex.svg)"></i>Codex</span>
+        <span class="agent"><i style="--icon:url(/agents/gemini.svg)"></i>Gemini CLI</span>
+        <span class="agent"><i style="--icon:url(/agents/grok.svg)"></i>Grok</span>
+        <span class="agent"><i style="--icon:url(/agents/opencode.svg)"></i>OpenCode</span>
+        <span class="agent"><i style="--icon:url(/agents/generic.svg)"></i>Cursor Agent</span>
+        <span class="agent"><i style="--icon:url(/agents/generic.svg)"></i>Amp</span>
+        <span class="agent"><i style="--icon:url(/agents/generic.svg)"></i>Aider</span>
+      </div>
+    </section>
+
+    <section class="sec" id="features">
+      <div class="head" data-reveal>
+        <div class="eyebrow">Features</div>
+        <h2 class="h-sec">Stay in charge of the work</h2>
+        <p class="sub">Agents read your code, run commands and edit files. Deck shows all of it as it happens, so you can follow along, step in, and take it back.</p>
+      </div>
+
+      <div class="bento">
+        <article class="card c7" data-reveal>
+          <div class="mock log" data-play>
+            <div class="mock-bar"><span class="dots"><i></i><i></i><i></i></span><b>Dark mode switch in settings</b><span class="grow"></span><span class="pill"><i class="ag" style="--icon:url(/agents/claude.svg);width:12px;height:12px"></i>Claude</span></div>
+            <div class="mock-body">
+              <div class="you">Add a dark mode switch to settings that remembers the choice</div>
+              <ol>
+                <li><span class="ic">✓</span>Read <code>src/settings/Page.jsx</code></li>
+                <li><span class="ic">✓</span>Searched <code>data-theme</code> in <code>src</code></li>
+                <li><span class="ic">✓</span>Wrote <code>src/theme.js</code><span class="n plus">+12</span></li>
+                <li><span class="ic">✓</span>Edited <code>src/settings/Page.jsx</code><span class="n"><span class="plus">+20</span> <span class="minus">−6</span></span></li>
+                <li><span class="ic">✓</span>Ran <code>npm test</code><span class="n plus">3 passed</span></li>
+                <li><span class="ic">✓</span>Opened <code>localhost:5173/settings</code></li>
+              </ol>
+              <div class="worked"><b>Worked for 48s</b> · ran 2 commands, edited 3 files<span class="n"><span class="plus">+56</span> <span class="minus">−6</span></span></div>
+              <div class="reply">Done. Settings has a <b>Dark mode</b> switch, and the choice sticks across reloads.</div>
+            </div>
+          </div>
+          <h3>Every step, as it happens</h3>
+          <p>Each command, file read and edit shows up the moment the agent makes it. Open any step to see its output or diff, and see every changed file when the turn ends.</p>
+        </article>
+
+        <article class="card c5" data-reveal>
+          <div class="mock bare ask">
+            <div class="ask-card">
+              <div class="who-asks"><i class="ag" style="--icon:url(/agents/claude.svg);width:14px;height:14px"></i>Claude wants to run a command</div>
+              <pre>rm -rf dist &amp;&amp; npm run build</pre>
+              <div class="row">
+                <span class="mini-btn primary">Allow once</span>
+                <span class="mini-btn">Always allow</span>
+                <span class="mini-btn">Deny</span>
+              </div>
+            </div>
+            <div class="composer"><span class="caret"></span>or tell it what to do instead…</div>
+          </div>
+          <h3>Approve where you type</h3>
+          <p>When an agent wants to run something or edit a file, the question appears right above the message box. Allow it, refuse it, or say what to do instead.</p>
+        </article>
+
+        <article class="card c5" data-reveal>
+          <div class="mock bare undo">
+            <div class="msg">Refactor the auth module to use sessions</div>
+            <div class="ans">I moved login and logout onto sessions and updated 9 files…</div>
+            <div class="menu" aria-hidden="true">
+              <div>Copy <span>⌘C</span></div>
+              <div>Edit from Here</div>
+              <hr>
+              <div class="on">Undo to Here <span>files + chat</span></div>
+            </div>
+            <div class="toast"><span>9 files back to before this message</span><span class="u">Put Files Back</span></div>
+          </div>
+          <h3>Undo any turn</h3>
+          <p>In a git project, Deck saves your files before every message you send. Right-click one to put the files and the conversation back to just before it, or edit it and go again.</p>
+        </article>
+
+        <article class="card c7" data-reveal>
+          <div class="mock">
+            <div class="mock-bar"><span class="dots"><i></i><i></i><i></i></span><b>Tasks</b><span class="grow"></span><span>acme-web · main</span></div>
+            <div>
+              <div class="task"><span class="br"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="4.5" cy="3.5" r="1.6"/><circle cx="4.5" cy="12.5" r="1.6"/><circle cx="11.5" cy="5.5" r="1.6"/><path d="M4.5 5.1v5.8M11.5 7.1c0 2.4-2.2 3.2-7 3.6"/></svg></span><div><b>Add a dark mode switch</b><small>task/dark-mode · Claude</small></div><span class="st"><span class="plus">+56</span> <span class="minus">−6</span></span><span class="pill ok">Ready to review</span></div>
+              <div class="task"><span class="br"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="4.5" cy="3.5" r="1.6"/><circle cx="4.5" cy="12.5" r="1.6"/><circle cx="11.5" cy="5.5" r="1.6"/><path d="M4.5 5.1v5.8M11.5 7.1c0 2.4-2.2 3.2-7 3.6"/></svg></span><div><b>Fix the flaky login test</b><small>task/flaky-login · Codex</small></div><span class="st"><span class="plus">+1</span> <span class="minus">−2</span></span><span class="pill hot"><span class="spin"></span>Working</span></div>
+              <div class="task"><span class="br"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="4.5" cy="3.5" r="1.6"/><circle cx="4.5" cy="12.5" r="1.6"/><circle cx="11.5" cy="5.5" r="1.6"/><path d="M4.5 5.1v5.8M11.5 7.1c0 2.4-2.2 3.2-7 3.6"/></svg></span><div><b>Write the README's local setup</b><small>task/readme · Gemini</small></div><span class="st"><span class="plus">+14</span></span><span class="pill">Merged</span></div>
+              <div class="task-foot"><span class="mini-btn">Preview</span><span class="mini-btn">Review changes</span><span class="mini-btn primary">Merge</span><span class="mini-btn">Open PR</span></div>
+            </div>
+          </div>
+          <h3>Several agents at once, each on its own branch</h3>
+          <p>Hand a job to a task and it gets its own branch and copy of the project, so agents never trip over each other or your work. Preview it, review it, then merge it or throw it away.</p>
+        </article>
+
+        <article class="card c7" data-reveal>
+          <div class="mock">
+            <div class="split" data-flip>
+              <div class="diff">
+                <div class="k">export default function Settings() {</div>
+                <div class="a">  const [theme, pick] = useTheme();</div>
+                <div class="k">  return (</div>
+                <div class="k">    &lt;Section title="Profile"&gt;…&lt;/Section&gt;</div>
+                <div class="a">    &lt;Section title="Appearance"&gt;</div>
+                <div class="a">      &lt;Switch on={theme === "dark"}</div>
+                <div class="a">        onChange={pick} /&gt;</div>
+                <div class="a">    &lt;/Section&gt;</div>
+                <div class="r">    {/* TODO: theme */}</div>
+                <div class="k">  );</div>
+              </div>
+              <div class="web">
+                <div class="web-bar"><span class="web-url">localhost:5173/settings</span></div>
+                <div class="page">
+                  <h4>Settings</h4>
+                  <div class="page-row"><span>Name<small>Maya Kim</small></span></div>
+                  <div class="page-row"><span>Dark mode<small>Easier on the eyes at night</small></span><span class="switch dm"></span></div>
+                  <div class="page-row"><span>Weekly summary</span><span class="switch on"></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <h3>Your app, right beside the code</h3>
+          <p>Open your dev server in a browser pane next to the agent changing it, and check every change without switching apps. Agents can open it for you, too.</p>
+        </article>
+
+        <article class="card c5" data-reveal>
+          <div class="mock bare alerts">
+            <div class="banner"><img src="/icon.png" alt=""><div><b>Codex needs you</b><span>Allow an edit to test/login.test.js?</span></div><time>now</time></div>
+            <div class="banner"><img src="/icon.png" alt=""><div><b>Claude finished</b><span>Dark mode switch in settings · 48s</span></div><time>2m</time></div>
+            <div class="side-list">
+              <div class="side-item on"><i class="ag" style="--icon:url(/agents/codex.svg)"></i>Fix the flaky login test<span class="badge">1</span></div>
+              <div class="side-item"><i class="ag" style="--icon:url(/agents/claude.svg)"></i>Dark mode switch<span class="done">✓</span></div>
+              <div class="side-item"><i class="ag" style="--icon:url(/agents/gemini.svg)"></i>README: local setup<span class="spin"></span></div>
+            </div>
+          </div>
+          <h3>Knows when an agent needs you</h3>
+          <p>Get on with something else. When an agent asks a question or finishes, you get a badge, a Dock count and a notification that opens it.</p>
+        </article>
+      </div>
+
+      <p class="note" style="text-align:center;margin-top:36px"><a class="page-link" href="/features/">See everything Deck does</a></p>
+    </section>
+
+    <section class="sec" id="private">
+      <div class="head" data-reveal>
+        <div class="eyebrow">Local by design</div>
+        <h2 class="h-sec">Your code stays on your Mac</h2>
+        <p class="sub">Deck runs the agents you already have, signed in with your own accounts. Your code and prompts never pass through us.</p>
+      </div>
+
+      <div class="trio" data-reveal>
+        <div>
+          <div class="viz">
+            <div class="kv-card">
+              <div class="hd"><span>Agents on this Mac</span><span class="pill ok">3 found</span></div>
+              <div class="ln"><i class="ag" style="--icon:url(/agents/claude.svg)"></i><b>claude</b><span class="r">signed in</span></div>
+              <div class="ln"><i class="ag" style="--icon:url(/agents/codex.svg)"></i><b>codex</b><span class="r">signed in</span></div>
+              <div class="ln"><i class="ag" style="--icon:url(/agents/gemini.svg)"></i><b>gemini</b><span class="r">signed in</span></div>
+            </div>
+          </div>
+          <div class="num">01</div>
+          <h3>Your agents, your accounts</h3>
+          <p>Deck finds the agent CLIs on your Mac and runs them as they are, with your subscriptions and settings. There's nothing new to sign up for.</p>
+        </div>
+        <div>
+          <div class="viz">
+            <div class="flow">
+              <div class="node">Your Mac<small>agent + code</small></div>
+              <div class="wire"></div>
+              <div class="providers">
+                <div class="node">Anthropic</div>
+                <div class="node">OpenAI</div>
+                <div class="node">Google</div>
+              </div>
+            </div>
+            <div class="blocked">Deck's servers aren't in the path</div>
+          </div>
+          <div class="num">02</div>
+          <h3>Straight to their providers</h3>
+          <p>Agents talk to their own providers directly, exactly as they would in a terminal. Deck doesn't proxy, store or resell any model.</p>
+        </div>
+        <div>
+          <div class="viz">
+            <div class="kv-card">
+              <div class="hd"><span>What Deck's server knows</span></div>
+              <div class="ln">email<span class="r"><b>you@example.com</b></span></div>
+              <div class="ln">plan<span class="r"><b>Pro</b></span></div>
+              <div class="ln">renews<span class="r"><b>Nov 14</b></span></div>
+            </div>
+          </div>
+          <div class="num">03</div>
+          <h3>We only know your plan</h3>
+          <p>Your account holds your email and your plan, so Deck can check it. That's all. No analytics, no trackers, nothing about your work.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="sec" id="native">
+      <div class="head" data-reveal>
+        <div class="eyebrow">Built different</div>
+        <h2 class="h-sec">Native, all the way down</h2>
+        <p class="sub">Written in Rust and drawn on the GPU. Not a web page in a box, so it opens instantly and stays light with a dozen panes open.</p>
+      </div>
+
+      <div class="bento">
+        <article class="card c7" data-reveal>
+          <div class="stat"><b>279 MB</b><span>for the whole app</span></div>
+          <p>Measured on a real day: four terminals and three agent chats open, twelve hours after launch.</p>
+          <div class="chart" aria-hidden="true">
+            <svg viewBox="0 0 600 150" preserveAspectRatio="none">
+              <defs><linearGradient id="fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#4ade80" stop-opacity=".28"/><stop offset="1" stop-color="#4ade80" stop-opacity="0"/></linearGradient></defs>
+              <path d="M0 112 C60 110 90 104 140 106 S240 101 300 103 S420 99 480 101 S560 98 600 99 L600 150 L0 150Z" fill="url(#fill)"/>
+              <path d="M0 112 C60 110 90 104 140 106 S240 101 300 103 S420 99 480 101 S560 98 600 99" fill="none" stroke="#4ade80" stroke-width="2" vector-effect="non-scaling-stroke"/>
+            </svg>
+            <span class="tag" style="top:76px">● Deck, all day</span>
+          </div>
+        </article>
+
+        <article class="card c5" data-reveal>
+          <ul class="stack">
+            <li><i></i>Rust<small>the whole app</small></li>
+            <li><i></i>Drawn on the GPU<small>Metal</small></li>
+            <li><i></i>A real terminal engine<small>alacritty</small></li>
+            <li><i></i>The system's browser engine<small>WebKit</small></li>
+            <li><i></i>Small download<small>11 MB</small></li>
+          </ul>
+          <h3>No Electron. No compromise.</h3>
+          <p>One app for Apple silicon and Intel, built on the same pieces the fastest Mac tools use.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="sec" id="pricing">
+      <div class="head" data-reveal>
+        <div class="eyebrow">Pricing</div>
+        <h2 class="h-sec">Simple, honest pricing</h2>
+        <p class="sub">One plan with everything in it. Start with 14 days free; no card needed.</p>
+      </div>
+
+      <div class="price-card" data-reveal>
+        <div>
+          <h3>Deck Pro</h3>
+          <div class="price" data-price-block><strong data-price></strong><span data-per></span></div>
+          <p class="price-note" data-trial>The first 14 days are free, no card needed.</p>
+          <a class="btn btn-primary btn-block" data-download data-soft href="/download/"><span data-download-label>Download and try it free</span></a>
+          <a class="alt" data-subscribe href="/subscribe">or subscribe now</a>
+          <p class="fine">Billed through Dodo Payments. Cancel any time.</p>
+        </div>
+        <div>
+          <span class="label">Everything included</span>
+          <ul class="checks">
+            <li>Chats with every agent you have installed</li>
+            <li>Approvals, alerts and a live work log</li>
+            <li>Undo any turn, files and conversation</li>
+            <li>Tasks on their own branch, with preview and review</li>
+            <li>Fast terminals and a built-in browser</li>
+            <li>Snippets, ⌘K and your own shortcuts</li>
+            <li>Every Mac you sign in on</li>
+            <li>New versions, installed for you</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="sec" id="faq">
+      <div class="faq-grid">
+        <div class="faq-side" data-reveal>
+          <div class="eyebrow left">FAQ</div>
+          <h2 class="h-sec">Questions,<br><span class="soft">answered</span></h2>
+          <p class="sub">What people ask before trying Deck.</p>
+          <div class="links">
+            <a href="/docs/"><span class="ic"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 2h6l3 3v9H4z"/><path d="M10 2v3h3M6 8.5h5M6 11h5"/></svg></span><span><b>Read the docs</b><small>Setting up, and how things work</small></span><span class="go">↗</span></a>
+            <a href="mailto:nischaldahal01395@gmail.com"><span class="ic"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4 5.5-4"/></svg></span><span><b>Email us</b><small>Questions and feedback, answered by a person</small></span><span class="go">↗</span></a>
+          </div>
+        </div>
+        <div class="qa" data-reveal>
+          <details open><summary>Is Deck an AI?</summary><p>No. Deck is the app you run AI coding agents in. It uses the agents you already have, like Claude Code or Codex, signed in with your own accounts, and makes their work easy to follow and control.</p></details>
+          <details><summary>Do I need Claude Code or another agent?</summary><p>To get the most from Deck, yes: at least one coding agent CLI, such as Claude Code, Codex, Gemini CLI, Grok or OpenCode. Without one, Deck is still a fast terminal and browser.</p></details>
+          <details><summary>Is there a free trial?</summary><p>Yes. Every account gets 14 days of Deck with everything in it, counted from the day you first sign in, and no card is asked for. After that, Deck asks you to choose a plan; your chats and settings stay as they are.</p></details>
+          <details><summary>Is my code sent anywhere?</summary><p>Not to us. Your agents run on your Mac and talk to their own providers directly, as they would in a terminal. Deck's server only knows your account and your plan.</p></details>
+          <details><summary>Does it replace my code editor?</summary><p>No. Keep your editor for writing code yourself. Deck is where agents do their work, and where you watch, approve, test and review it.</p></details>
+          <details><summary>Which Macs does it run on?</summary><p>Any Mac with macOS 13 Ventura or later, Apple silicon or Intel. One download covers both.</p></details>
+          <details><summary>Can I cancel any time?</summary><p>Yes, from Settings › General › Manage Plan or your account page. You keep Deck until the end of the period you've paid for, and you won't be charged again.</p></details>
+        </div>
+      </div>
+    </section>
+
+    <section class="sec center" id="download">
+      <div class="head" data-reveal>
+        <h2 class="h-sec">Try Deck free for 14 days</h2>
+        <p class="sub">Every feature unlocked. No credit card required.</p>
+      </div>
+      <div class="get" data-reveal>
+        <div class="dl">
+          <span class="os"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16.4 12.6c0-2.4 2-3.5 2-3.6-1.1-1.6-2.8-1.8-3.4-1.8-1.4-.1-2.8.9-3.5.9-.7 0-1.8-.8-3-.8-1.5 0-3 .9-3.8 2.3-1.6 2.8-.4 7 1.2 9.3.8 1.1 1.7 2.4 2.9 2.3 1.2 0 1.6-.7 3-.7s1.8.7 3 .7c1.3 0 2.1-1.1 2.8-2.3.9-1.3 1.3-2.6 1.3-2.6s-2.5-1-2.5-3.7zM14.1 5.6c.6-.8 1.1-1.9 1-3-1 0-2.1.7-2.8 1.4-.6.7-1.2 1.8-1 2.9 1 .1 2.1-.6 2.8-1.3z"/></svg></span>
+          <div><b>Deck for macOS</b><small data-file>Apple silicon and Intel · macOS 13+</small></div>
+          <a class="btn btn-primary" data-download href="/download/"><span data-download-label>Download</span></a>
+        </div>
+        <div class="rel"><code data-version-tag>v0.1.0</code><span class="pill hot">Preview</span><span data-version>The first public version is on its way.</span><a href="/changelog/">Release notes</a></div>
+      </div>
+    </section>

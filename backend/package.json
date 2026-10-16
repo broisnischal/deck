@@ -1,0 +1,28 @@
+{
+  "name": "deck-backend",
+  "private": true,
+  "type": "module",
+  "description": "Accounts, sign-in and subscriptions for the Deck app: a Cloudflare Worker with Hono, Better Auth (Google), Dodo Payments and D1.",
+  "scripts": {
+    "dev": "npm run build:site && wrangler dev",
+    "deploy": "npm run build:site && wrangler deploy",
+    "types": "wrangler types",
+    "migrate:local": "wrangler d1 migrations apply deck --local",
+    "migrate": "wrangler d1 migrations apply deck --remote",
+    "typecheck": "wrangler types && tsc --noEmit",
+    "build:site": "node ../website/build.mjs"
+  },
+  "dependencies": {
+    "@dodopayments/better-auth": "^1.6.6",
+    "better-auth": "^1.7.9",
+    "dodopayments": "^2.55.0",
+    "hono": "^4.13.13",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261015.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.151.0"
+  }
+}

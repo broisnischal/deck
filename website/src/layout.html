@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}}</title>
+  <meta name="description" content="{{description}}">
+  <meta name="theme-color" content="#0b0b0c" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#fafaf9" media="(prefers-color-scheme: light)">
+  <link rel="canonical" href="{{url}}">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Deck">
+  <meta property="og:title" content="{{title}}">
+  <meta property="og:description" content="{{description}}">
+  <meta property="og:url" content="{{url}}">
+  <meta property="og:image" content="https://deck.stroke.click/og.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="apple-touch-icon" href="/icon.png">
+  <link rel="preload" href="/fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/style.css">
+  <script>try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body class="{{bodyclass}}">
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="top">
+    <div class="top-in">
+      <a class="brand" href="/"><img src="/icon.png" alt="" width="24" height="24">Deck</a>
+      <nav class="nav" aria-label="Site">
+        <a href="/features/" data-nav>Features</a>
+        <a href="/pricing/" data-nav>Pricing</a>
+        <a href="/docs/" data-nav>Docs</a>
+        <a href="/changelog/" data-nav>Changelog</a>
+      </nav>
+      <div class="top-actions">
+        <button class="icon-btn hide-sm" type="button" data-palette-open aria-label="Search the site (⌘K)" title="Search  ⌘K">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="9" cy="9" r="5.5"/><path d="M13.2 13.2 17 17"/></svg>
+        </button>
+        <button class="icon-btn" type="button" data-theme-toggle aria-label="Theme: automatic" title="Theme: automatic">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10" cy="10" r="7"/><path d="M10 3a7 7 0 0 1 0 14z" fill="currentColor" stroke="none"/></svg>
+        </button>
+        <a class="top-link hide-sm" href="/account/" data-account-link>Sign in</a>
+        <a class="btn btn-primary btn-sm" href="/download/">Download</a>
+        <button class="icon-btn menu-btn" type="button" aria-label="Menu" aria-expanded="false" data-menu>
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3.5 6.5h13M3.5 13.5h13"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" class="frame">
+{{body}}
+  </main>
+
+  <footer class="frame">
+    <div class="sec foot">
+      <div>
+        <a class="brand" href="/"><img src="/icon.png" alt="" width="24" height="24">Deck</a>
+        <p>The Mac app for coding with AI agents: chats, terminals and a browser in one native window.</p>
+      </div>
+      <div>
+        <h4>Product</h4>
+        <nav aria-label="Product">
+          <a href="/features/">Features</a>
+          <a href="/pricing/">Pricing</a>
+          <a href="/download/">Download</a>
+          <a href="/changelog/">Changelog</a>
+        </nav>
+      </div>
+      <div>
+        <h4>Resources</h4>
+        <nav aria-label="Resources">
+          <a href="/docs/">Docs</a>
+          <a href="/docs/#cli">The deck command</a>
+          <a href="/account/">Your account</a>
+          <a href="mailto:nischaldahal01395@gmail.com">Contact</a>
+        </nav>
+      </div>
+      <div>
+        <h4>Legal</h4>
+        <nav aria-label="Legal">
+          <a href="/privacy/">Privacy Policy</a>
+          <a href="/terms/">Terms of Service</a>
+          <a href="/refunds/">Refund Policy</a>
+        </nav>
+      </div>
+    </div>
+    <div class="base">
+      <span>© 2026 Nischal Dahal. Payments are handled by Dodo Payments, our merchant of record.</span>
+      <span class="status"><i></i>For macOS 13 and later</span>
+    </div>
+  </footer>
+
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Search" hidden data-palette>
+    <div class="palette-box">
+      <div class="palette-input">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="9" cy="9" r="5.5"/><path d="M13.2 13.2 17 17"/></svg>
+        <input type="text" placeholder="Go to a page or section…" aria-label="Search" data-palette-input autocomplete="off" spellcheck="false">
+      </div>
+      <ul class="palette-list" role="listbox" data-palette-list></ul>
+      <div class="palette-foot"><span>↑↓ to choose</span><span>⏎ to open</span><span>esc to close</span></div>
+    </div>
+  </div>
+
+  <script src="/site.js" defer></script>
+</body>
+</html>

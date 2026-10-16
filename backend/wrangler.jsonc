@@ -1,0 +1,54 @@
+// Deck on Cloudflare Workers: the website (static pages from ../website,
+// built into public/) and its account server, on one origin so sign-in
+// cookies are first-party. Data in D1.
+// Secrets (`npx wrangler secret put NAME`): BETTER_AUTH_SECRET,
+// GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, DODO_PAYMENTS_API_KEY.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "deck",
+  // The broisnees account.
+  "account_id": "16b2c363a412bfaaec2a5a2572964728",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  // Better Auth and the Dodo SDK use node:crypto and friends.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // The site's address; Cloudflare makes the DNS record and certificate.
+  "routes": [{ "pattern": "deck.stroke.click", "custom_domain": true }],
+  // One address: sign-in cookies belong to it.
+  "workers_dev": false,
+  "assets": {
+    "directory": "../website/public",
+    "binding": "ASSETS",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page",
+    // These reach the server; everything else is a page.
+    "run_worker_first": ["/api/*", "/v1/*", "/desktop/*", "/subscribe", "/download/mac", "/health"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "deck",
+      // From `npx wrangler d1 create deck`.
+      "database_id": "71ce4efe-49c5-44ae-a054-da8f19e6879f",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    // Where the Worker is reached (Google sends people back here).
+    "BETTER_AUTH_URL": "https://deck.stroke.click",
+    // test_mode while trying it, live_mode to take real payments.
+    "DODO_ENVIRONMENT": "test_mode",
+    // The Dodo product people subscribe to (Products › your plan › ID).
+    "DODO_PRODUCT_PRO": "pdt_replace_me",
+    // Days of Deck every new account gets before it needs a plan; no card asked.
+    // Give the Dodo product no trial of its own, or people get both.
+    "DECK_TRIAL_DAYS": "14",
+    // Pin the release the app and the site are told about (zip for the updater,
+    // dmg for people); empty: GitHub's latest release.
+    "DECK_LATEST_VERSION": "",
+    "DECK_DOWNLOAD_URL": "",
+    "DECK_DMG_URL": "",
+    "DECK_NOTES_URL": ""
+  }
+}

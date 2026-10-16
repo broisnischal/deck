@@ -1,0 +1,133 @@
+<!-- {"title": "Docs", "description": "How to set up and use Deck: chats, tasks, undo, snippets, shortcuts, and the deck command.", "path": "/docs/"} -->
+    <div class="with-toc" style="border-top:0;padding-top:clamp(64px,9vw,104px)">
+      <nav class="toc" aria-label="On this page">
+        <h2>Docs</h2>
+        <a href="#start">Getting started</a>
+        <a href="#chats">Chats</a>
+        <a href="#tasks">Tasks</a>
+        <a href="#undo">Undo</a>
+        <a href="#snippets">Snippets</a>
+        <a href="#shortcuts">Shortcuts</a>
+        <a href="#cli">The deck command</a>
+        <a href="#files">Where Deck keeps things</a>
+        <a href="#help">Troubleshooting</a>
+      </nav>
+
+      <article class="prose">
+        <h1>Docs</h1>
+        <p class="meta">Everything you need to set up Deck and get the most from it.</p>
+
+        <h2 id="start">Getting started</h2>
+        <ol>
+          <li><a href="/download/">Download Deck</a> and move it into your Applications folder.</li>
+          <li>Open it and sign in with Google. Your browser opens, you continue with your account, and Deck picks up from there. Your 14 free days start now; no card is needed.</li>
+          <li>Make sure you have at least one agent CLI installed and signed in, such as <code>claude</code> or <code>codex</code>. Deck finds them on your <code>PATH</code>; Settings › Agents shows which ones it found.</li>
+          <li>Press <kbd>⇧⌘N</kbd> to start a chat in the folder you're working in, and say what you want.</li>
+        </ol>
+        <div class="callout">On first launch Deck offers to become your default terminal, so shell scripts and <code>ssh:</code> links open in it. You can change this any time in Settings › General.</div>
+
+        <h2 id="chats">Chats</h2>
+        <p>A chat runs one agent in one folder. Everything it does shows up as steps: click one to see its output or diff. When it wants to run a command or edit a file and your access mode says to ask, the request appears above the message box.</p>
+        <ul>
+          <li><strong>Send:</strong> <kbd>⏎</kbd>. With prompt rewriting on, this rewrites first; <kbd>⌃Z</kbd> brings your words back.</li>
+          <li><strong>New line:</strong> <kbd>⇧⏎</kbd>. <strong>Send right now, mid-turn:</strong> <kbd>⌘⏎</kbd>. <strong>Stop:</strong> <kbd>esc</kbd>.</li>
+          <li><strong>Attach:</strong> paste an image, drop files, or type <code>@</code> to mention a file.</li>
+          <li><strong>Access:</strong> click the chip in the message box: Ask first, Accept edits, or Full access.</li>
+          <li><strong>Switch agent:</strong> pick another agent in the chat; it's handed the conversation so far.</li>
+        </ul>
+
+        <h2 id="tasks">Tasks</h2>
+        <p>Press <kbd>⌘K</kbd>, describe a job, and choose "Start a task". Deck creates a branch named <code>deck/…</code> and a separate checkout, and starts your default agent there. The sidebar's Tasks section shows each one. Open a task to review its changes, then:</p>
+        <ul>
+          <li><strong>Preview</strong> runs its dev server from its own checkout and opens the page.</li>
+          <li><strong>Merge</strong> squashes it into the branch you started from. Your main checkout must be on that branch.</li>
+          <li><strong>Open PR</strong> pushes the branch and opens a pull request (needs the GitHub CLI, <code>gh</code>).</li>
+          <li><strong>Discard</strong> removes the branch and its checkout (click twice).</li>
+        </ul>
+
+        <h2 id="undo">Undo</h2>
+        <p>In a git project, each message you send saves your working files. Right-click one of your messages:</p>
+        <ul>
+          <li><strong>Undo to Here</strong> restores the files to that moment and ends the conversation there.</li>
+          <li><strong>Edit from Here</strong> does the same and puts your message back in the box.</li>
+          <li><strong>Put Files Back</strong> undoes the last undo.</li>
+        </ul>
+        <p>Your branch, staged changes and ignored files are never touched. The agent starts a fresh session with the conversation up to that point.</p>
+
+        <h2 id="snippets">Snippets</h2>
+        <p>Open the list with <kbd>⌘;</kbd> and pick one; it goes into the message box or terminal without being sent. Give a snippet a keyword in Settings › Snippets and type <code>;keyword</code> followed by a space to put it in. These fill themselves in:</p>
+        <table>
+          <tr><th>Write</th><th>Becomes</th></tr>
+          <tr><td><code>{clipboard}</code></td><td>what you last copied</td></tr>
+          <tr><td><code>{selection}</code></td><td>the text selected in the chat or terminal</td></tr>
+          <tr><td><code>{branch}</code></td><td>the git branch of the folder you're in</td></tr>
+          <tr><td><code>{folder}</code></td><td>the folder you're in</td></tr>
+        </table>
+        <p>To share snippets with a project, commit a <code>.deck/snippets.json</code> file:</p>
+<pre>[
+  { "name": "Run the checks", "keyword": "checks",
+    "body": "Run npm run lint and npm test, and fix anything that fails." }
+]</pre>
+
+        <h2 id="shortcuts">Shortcuts</h2>
+        <p>These are the defaults. Change any of them in Settings › Keyboard.</p>
+        <table>
+          <tr><td><kbd>⌘K</kbd></td><td>Command palette</td></tr>
+          <tr><td><kbd>⌘N</kbd></td><td>New tab: a terminal, a page or an agent</td></tr>
+          <tr><td><kbd>⌘T</kbd> / <kbd>⇧⌘N</kbd></td><td>New terminal / new chat</td></tr>
+          <tr><td><kbd>⌘L</kbd> / <kbd>⇧⌘T</kbd></td><td>Browser address bar / new browser tab</td></tr>
+          <tr><td><kbd>⌘D</kbd> / <kbd>⇧⌘D</kbd></td><td>Split right / split down</td></tr>
+          <tr><td><kbd>⌘W</kbd></td><td>Close the pane</td></tr>
+          <tr><td><kbd>⌘1</kbd>…<kbd>⌘9</kbd></td><td>Go to a tab (<kbd>⌘9</kbd> is the last)</td></tr>
+          <tr><td><kbd>⇧⌘]</kbd> / <kbd>⇧⌘[</kbd></td><td>Next / previous tab</td></tr>
+          <tr><td><kbd>⌘;</kbd></td><td>Insert a snippet</td></tr>
+          <tr><td><kbd>⌘F</kbd></td><td>Find in the terminal or page</td></tr>
+          <tr><td><kbd>⇧⌘K</kbd></td><td>Clear the terminal</td></tr>
+          <tr><td><kbd>⌘B</kbd> / <kbd>⌘I</kbd></td><td>Sidebar / inspector</td></tr>
+          <tr><td><kbd>⇧⌘L</kbd></td><td>Lock Deck</td></tr>
+          <tr><td><kbd>⌘,</kbd></td><td>Settings</td></tr>
+        </table>
+
+        <h2 id="cli">The deck command</h2>
+        <p>Every terminal and chat inside Deck can use <code>deck</code> to work the window. Agents use it to open terminals and pages for you. Output is JSON.</p>
+<pre><span class="c"># what's open, and a server in a new terminal beside this one</span>
+deck pane list
+deck pane split --cmd 'npm run dev'
+
+<span class="c"># open a page beside you, read a terminal, message another chat</span>
+deck open http://localhost:3000
+deck pane read --pane 3
+deck pane send --pane 5 'run the tests'
+deck browser eval --pane 4 'document.title'
+
+<span class="c"># hand out a task, follow it, and finish it</span>
+deck task new 'add a dark mode toggle to settings'
+deck task list
+deck task wait --task add-a-dark-mode
+deck task diff --task add-a-dark-mode
+deck task merge --task add-a-dark-mode
+
+<span class="c"># a picture of the window, and settings</span>
+deck window shot ~/Desktop/deck.png
+deck settings open --page keyboard</pre>
+        <p>Run <code>deck</code> on its own for the full list. Agents in Deck's chats also get all of this as built-in tools.</p>
+
+        <h2 id="files">Where Deck keeps things</h2>
+        <p>Everything lives in <code>~/Library/Application Support/deck/</code> on your Mac:</p>
+        <ul>
+          <li><code>settings.json</code>: your settings (Settings › General › Show in Finder)</li>
+          <li><code>snippets.json</code>: your snippets</li>
+          <li><code>threads/</code>: your conversations</li>
+          <li><code>session.json</code>: the tabs and splits to restore</li>
+        </ul>
+        <p>Your session token is kept in your Mac's Keychain.</p>
+
+        <h2 id="help">Troubleshooting</h2>
+        <h3>Deck says an agent isn't installed</h3>
+        <p>Deck looks for agents on the <code>PATH</code> your login shell sets. Check that the CLI runs in a regular terminal, then restart Deck.</p>
+        <h3>Merge says the main checkout is on another branch</h3>
+        <p>Switch your project back to the branch the task started from, then merge again.</p>
+        <h3>Something else</h3>
+        <p>Email <a href="mailto:nischaldahal01395@gmail.com">nischaldahal01395@gmail.com</a> with what happened and your Deck version (Settings › General › Updates).</p>
+      </article>
+    </div>
