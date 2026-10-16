@@ -73,6 +73,9 @@ pub struct Colors {
     pub surface: u32,
     pub surface_hover: u32,
     pub row_hover: u32,
+    /// The selected sidebar row: lifted clear of the hover tone, so a
+    /// hovered row never reads as the open one.
+    pub row_active: u32,
     pub border: u32,
     pub text: u32,
     pub text_2: u32,
@@ -120,6 +123,7 @@ static ALL: [Colors; 4] = [
         surface: 0x1c1c1c,
         surface_hover: 0x262626,
         row_hover: 0x141414,
+        row_active: 0x1c1c1c,
         border: 0x1a1a1a,
         text: 0xf5f5f5,
         text_2: 0xa3a3a3,
@@ -144,6 +148,7 @@ static ALL: [Colors; 4] = [
         surface: 0x353538,
         surface_hover: 0x3f3f43,
         row_hover: 0x2c2c2f,
+        row_active: 0x353538,
         border: 0x38383b,
         text: 0xf2f2f7,
         text_2: 0xb0b0b5,
@@ -168,6 +173,7 @@ static ALL: [Colors; 4] = [
         surface: 0x1e2431,
         surface_hover: 0x272e3e,
         row_hover: 0x181d28,
+        row_active: 0x1e2431,
         border: 0x202634,
         text: 0xe8ebf2,
         text_2: 0xa6aec0,
@@ -192,6 +198,7 @@ static ALL: [Colors; 4] = [
         surface: 0xe6e6e6,
         surface_hover: 0xdcdcdc,
         row_hover: 0xe8e8e8,
+        row_active: 0xffffff,
         border: 0xe2e2e2,
         text: 0x1d1d1f,
         text_2: 0x55555a,
@@ -239,6 +246,9 @@ pub fn surface_hover() -> u32 {
 }
 pub fn row_hover() -> u32 {
     current().row_hover
+}
+pub fn row_active() -> u32 {
+    current().row_active
 }
 pub fn border() -> u32 {
     current().border
@@ -318,6 +328,20 @@ pub const PANE_PAD_Y: f32 = 8.;
 pub fn u(v: f32) -> gpui::Rems {
     gpui::rems(v / REM_PX)
 }
+
+/// One line of text that ends in "…" where it stops fitting.
+///
+/// gpui 0.2.2's `truncate()` sizes nowrap text once and keeps that size for
+/// the rest of the layout, so the "…" goes where the first, wider pass put
+/// it and the box then clips the line mid-letter. A one-line clamp is
+/// measured again at every width, so the ellipsis lands at the real edge.
+pub trait OneLine: gpui::Styled {
+    fn one_line(self) -> Self {
+        self.whitespace_normal().line_clamp(1).text_ellipsis()
+    }
+}
+
+impl<T: gpui::Styled> OneLine for T {}
 
 /// The rem size at 100% zoom.
 pub const REM_PX: f32 = 16.;

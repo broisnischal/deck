@@ -7,7 +7,7 @@ use crate::icon::Icon;
 use crate::menu::{self, Entry, Item};
 use crate::pasteboard::{self, Pasted};
 use crate::textbuf::{Move, TextInput};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use crate::workspace::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui::prelude::*;
 use gpui::{
@@ -707,7 +707,7 @@ impl Render for Field {
                 .child(
                     div()
                         .w_full()
-                        .truncate()
+                        .one_line()
                         .text_color(rgb(color))
                         .child(shown),
                 )

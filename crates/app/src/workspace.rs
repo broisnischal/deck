@@ -13,7 +13,7 @@ use crate::palette::{Item, Kind, Palette, PaletteEvent};
 use crate::review::{ReviewEvent, ReviewPane};
 use crate::settings_pane::{SettingsEvent, SettingsPane};
 use crate::terminal::{TerminalEvent, TerminalPane};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
@@ -1496,6 +1496,18 @@ impl Workspace {
 
     fn control_tab(&self) -> Option<usize> {
         self.tabs.iter().position(|t| t.pinned)
+    }
+
+    /// The Settings tab while it is open on its own. The sidebar's footer
+    /// stands for it then, rather than a second Settings row above.
+    fn settings_tab(&self) -> Option<usize> {
+        self.tabs.iter().position(|t| match t.root {
+            Node::Leaf(id) => matches!(
+                self.panes.get(&id).map(|p| &p.kind),
+                Some(PaneKind::Settings(_))
+            ),
+            Node::Split(..) => false,
+        })
     }
 
     fn new_tab(
@@ -3439,19 +3451,9 @@ impl Workspace {
         let id = task.id.clone();
         let review_id = task.id.clone();
         let key = SharedString::from(format!("task-{}", task.id));
-        div()
-            .id(ElementId::Name(key.clone()))
+        sidebar_row(div().id(ElementId::Name(key.clone())), active)
             .group(key.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
             .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
             .child(lead(if working {
                 thinking(
                     ElementId::Name(format!("task-think-{}", task.id).into()),
@@ -3479,7 +3481,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(13.))
                             .text_color(rgb(if active {
                                 theme::text()
@@ -3491,7 +3493,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(line),
@@ -4596,9 +4598,11 @@ impl Workspace {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut threads: Vec<(usize, Instant)> = Vec::new();
         let mut workspace: Vec<usize> = Vec::new();
+        let settings = self.settings_tab();
         for (ix, tab) in self.tabs.iter().enumerate() {
-            // The control chat has its own row; a task's work, its task's.
-            if tab.pinned || self.is_task_tab(tab, cx) {
+            // The control chat has its own row; a task's work, its task's;
+            // Settings, the footer.
+            if tab.pinned || self.is_task_tab(tab, cx) || Some(ix) == settings {
                 continue;
             }
             match self.group(tab) {
@@ -4780,32 +4784,71 @@ impl Workspace {
                     .flex_none()
                     .px(u(theme::GUTTER))
                     .pb(u(theme::GUTTER))
+                    .child(self.render_settings_row(settings, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Settings, at the foot of the sidebar: opens it, and while it is open
+    /// is its row, selected like any other and closed the same way.
+    fn render_settings_row(&self, tab: Option<usize>, cx: &mut Context<Self>) -> AnyElement {
+        let active = tab == Some(self.active);
+        let tone = if active {
+            theme::text()
+        } else {
+            theme::text_2()
+        };
+        sidebar_row(div().id("open-settings"), active)
+            .group("settings-row")
+            .h(u(ROW_ONE_LINE))
+            .text_size(u(13.))
+            .text_color(rgb(tone))
+            .child(lead(icon(Icon::Settings, 15., tone)))
+            .child(div().flex_1().child("Settings"))
+            .child(
+                // The shortcut, swapped for close while hovered once open.
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .relative()
+                    .min_w(u(22.))
+                    .h(u(22.))
                     .child(
                         div()
-                            .id("open-settings")
-                            .flex()
-                            .items_center()
-                            .gap(u(10.))
-                            .h(u(32.))
-                            .px(u(theme::ROW_PAD))
-                            .rounded(u(theme::ROW_RADIUS))
-                            .text_size(u(13.))
-                            .text_color(rgb(theme::text_2()))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
-                            .child(icon(Icon::Settings, 15., theme::text_2()))
-                            .child(div().flex_1().child("Settings"))
-                            .child(
-                                div()
-                                    .text_size(u(11.))
-                                    .text_color(rgb(theme::dim()))
-                                    .child(hint("settings", &self.settings.keys)),
-                            )
-                            .on_click(
-                                cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)),
-                            ),
-                    ),
+                            .when(tab.is_some(), |d| {
+                                d.group_hover("settings-row", |s| s.opacity(0.))
+                            })
+                            .pr(u(4.))
+                            .text_size(u(11.))
+                            .text_color(rgb(theme::dim()))
+                            .child(hint("settings", &self.settings.keys)),
+                    )
+                    .when_some(tab, |d, ix| {
+                        d.child(
+                            icon_button("close-settings", Icon::Close)
+                                .absolute()
+                                .right_0()
+                                .size(u(22.))
+                                .opacity(0.)
+                                .group_hover("settings-row", |s| s.opacity(1.))
+                                .on_click(cx.listener(move |ws, _, window, cx| {
+                                    cx.stop_propagation();
+                                    ws.close_tab(ix, window, cx);
+                                })),
+                        )
+                    }),
             )
+            .on_click(cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)))
+            .when_some(tab, |d, ix| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
+                        ws.open_tab_menu(ix, ev.position, window, cx)
+                    }),
+                )
+            })
             .into_any_element()
     }
 
@@ -4866,19 +4909,9 @@ impl Workspace {
         } else {
             subtitle
         };
-        div()
-            .id("control")
+        sidebar_row(div().id("control"), active)
             .group("control-row")
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
             .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
             .child(lead(if working {
                 thinking("control-think", glyph, 15., theme::text())
             } else {
@@ -4900,7 +4933,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(subtitle),
@@ -4988,116 +5021,109 @@ impl Workspace {
         };
         let (state, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
-        div()
-            .id(ElementId::NamedInteger("tab".into(), ix as u64))
-            .group(group.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
-            .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-            .child(lead(if working {
-                thinking(
-                    ElementId::NamedInteger("thread-think".into(), ix as u64),
-                    glyph,
-                    15.,
-                    theme::text(),
+        sidebar_row(
+            div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
+            active,
+        )
+        .group(group.clone())
+        .h(u(ROW_TWO_LINE))
+        .child(lead(if working {
+            thinking(
+                ElementId::NamedInteger("thread-think".into(), ix as u64),
+                glyph,
+                15.,
+                theme::text(),
+            )
+        } else {
+            icon(
+                glyph,
+                15.,
+                if active || loud {
+                    theme::text()
+                } else {
+                    theme::text_2()
+                },
+            )
+        }))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .w_full()
+                        .one_line()
+                        .text_size(u(13.))
+                        .text_color(rgb(if active || loud {
+                            theme::text()
+                        } else {
+                            theme::text_2()
+                        }))
+                        .child(self.pane_title(tab.focused, cx)),
                 )
-            } else {
-                icon(
-                    glyph,
-                    15.,
-                    if active || loud {
-                        theme::text()
-                    } else {
-                        theme::text_2()
-                    },
+                .child(
+                    div()
+                        .w_full()
+                        .one_line()
+                        .text_size(u(11.))
+                        .text_color(rgb(theme::dim()))
+                        .child(who),
+                ),
+        )
+        .child(
+            // The state, swapped for the close button while hovered.
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .relative()
+                .child(
+                    div()
+                        .group_hover(group.clone(), |s| s.opacity(0.))
+                        .text_size(u(11.))
+                        .child(if working {
+                            shimmer(
+                                ElementId::NamedInteger("thread-shimmer".into(), ix as u64),
+                                state,
+                            )
+                        } else if wants {
+                            alert_pill().into_any_element()
+                        } else if loud {
+                            pill(state).into_any_element()
+                        } else {
+                            div()
+                                .text_size(u(11.))
+                                .text_color(rgb(theme::dim()))
+                                .child(state)
+                                .into_any_element()
+                        }),
                 )
-            }))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .w_full()
-                            .truncate()
-                            .text_size(u(13.))
-                            .text_color(rgb(if active || loud {
-                                theme::text()
-                            } else {
-                                theme::text_2()
-                            }))
-                            .child(self.pane_title(tab.focused, cx)),
+                .child(
+                    icon_button(
+                        ElementId::NamedInteger("close".into(), ix as u64),
+                        Icon::Close,
                     )
-                    .child(
-                        div()
-                            .w_full()
-                            .truncate()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(who),
-                    ),
-            )
-            .child(
-                // The state, swapped for the close button while hovered.
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .relative()
-                    .child(
-                        div()
-                            .group_hover(group.clone(), |s| s.opacity(0.))
-                            .text_size(u(11.))
-                            .child(if working {
-                                shimmer(
-                                    ElementId::NamedInteger("thread-shimmer".into(), ix as u64),
-                                    state,
-                                )
-                            } else if wants {
-                                alert_pill().into_any_element()
-                            } else if loud {
-                                pill(state).into_any_element()
-                            } else {
-                                div()
-                                    .text_size(u(11.))
-                                    .text_color(rgb(theme::dim()))
-                                    .child(state)
-                                    .into_any_element()
-                            }),
-                    )
-                    .child(
-                        icon_button(
-                            ElementId::NamedInteger("close".into(), ix as u64),
-                            Icon::Close,
-                        )
-                        .absolute()
-                        .right_0()
-                        .size(u(22.))
-                        .opacity(0.)
-                        .group_hover(group, |s| s.opacity(1.))
-                        .on_click(cx.listener(move |ws, _, window, cx| {
-                            cx.stop_propagation();
-                            ws.close_tab(ix, window, cx);
-                        })),
-                    ),
-            )
-            .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
-                    ws.open_tab_menu(ix, ev.position, window, cx)
-                }),
-            )
-            .into_any_element()
+                    .absolute()
+                    .right_0()
+                    .size(u(22.))
+                    .opacity(0.)
+                    .group_hover(group, |s| s.opacity(1.))
+                    .on_click(cx.listener(move |ws, _, window, cx| {
+                        cx.stop_propagation();
+                        ws.close_tab(ix, window, cx);
+                    })),
+                ),
+        )
+        .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
+                ws.open_tab_menu(ix, ev.position, window, cx)
+            }),
+        )
+        .into_any_element()
     }
 
     /// The agent launcher. A row starts a structured chat (the control
@@ -5252,87 +5278,80 @@ impl Workspace {
             _ => icon(glyph, 15., tone),
         };
 
-        div()
-            .id(ElementId::NamedInteger("tab".into(), ix as u64))
-            .group(group.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
-            .h(u(if subtitle.is_some() {
-                ROW_TWO_LINE
-            } else {
-                32.
-            }))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .text_size(u(13.))
-            .cursor_pointer()
-            .when(active, |d| {
-                d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
-            })
-            .when(!active, |d| {
-                d.text_color(rgb(theme::text_2()))
-                    .hover(|s| s.bg(rgb(theme::row_hover())))
-            })
-            .child(lead(mark))
-            // Definite-width boxes, so gpui knows where to put the ellipsis.
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(
-                        div()
-                            .w_full()
-                            .truncate()
-                            .child(self.pane_title(tab.focused, cx)),
-                    )
-                    .children(subtitle.map(|sub| {
-                        div()
-                            .w_full()
-                            .truncate()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(sub)
-                    })),
-            )
-            .when(count > 1, |d| {
-                d.child(
+        sidebar_row(
+            div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
+            active,
+        )
+        .group(group.clone())
+        .h(u(if subtitle.is_some() {
+            ROW_TWO_LINE
+        } else {
+            ROW_ONE_LINE
+        }))
+        .text_size(u(13.))
+        .text_color(rgb(if active {
+            theme::text()
+        } else {
+            theme::text_2()
+        }))
+        .child(lead(mark))
+        // Definite-width boxes, so gpui knows where to put the ellipsis.
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(u(3.))
+                        .w_full()
+                        .one_line()
+                        .child(self.pane_title(tab.focused, cx)),
+                )
+                .children(subtitle.map(|sub| {
+                    div()
+                        .w_full()
+                        .one_line()
                         .text_size(u(11.))
                         .text_color(rgb(theme::dim()))
-                        .child(icon(Icon::Split, 11., theme::dim()))
-                        .child(format!("{count}")),
-                )
-            })
-            // Something wants you: the bell. Idle needs no mark.
-            .when(status == Some(Status::Attention), |d| d.child(alert_pill()))
-            .child(
-                icon_button(
-                    ElementId::NamedInteger("close".into(), ix as u64),
-                    Icon::Close,
-                )
-                .size(u(22.))
-                .opacity(0.)
-                .group_hover(group, |s| s.opacity(1.))
-                .on_click(cx.listener(move |ws, _, window, cx| {
-                    cx.stop_propagation();
-                    ws.close_tab(ix, window, cx);
+                        .child(sub)
                 })),
+        )
+        .when(count > 1, |d| {
+            d.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(3.))
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::dim()))
+                    .child(icon(Icon::Split, 11., theme::dim()))
+                    .child(format!("{count}")),
             )
-            .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
-                    ws.open_tab_menu(ix, ev.position, window, cx)
-                }),
+        })
+        // Something wants you: the bell. Idle needs no mark.
+        .when(status == Some(Status::Attention), |d| d.child(alert_pill()))
+        .child(
+            icon_button(
+                ElementId::NamedInteger("close".into(), ix as u64),
+                Icon::Close,
             )
-            .into_any_element()
+            .size(u(22.))
+            .opacity(0.)
+            .group_hover(group, |s| s.opacity(1.))
+            .on_click(cx.listener(move |ws, _, window, cx| {
+                cx.stop_propagation();
+                ws.close_tab(ix, window, cx);
+            })),
+        )
+        .on_click(cx.listener(move |ws, _, window, cx| ws.activate(ix, window, cx)))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
+                ws.open_tab_menu(ix, ev.position, window, cx)
+            }),
+        )
+        .into_any_element()
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -5461,6 +5480,7 @@ const ROW_GAP: f32 = 10.;
 const ROW_END: f32 = 4.;
 /// A row with a title and a line under it.
 const ROW_TWO_LINE: f32 = 44.;
+const ROW_ONE_LINE: f32 = 32.;
 
 /// The leading mark of a sidebar row, centred in the shared slot, so icons,
 /// favicons and spinners of different sizes line up.
@@ -5472,6 +5492,38 @@ fn lead(mark: AnyElement) -> AnyElement {
         .w(u(ROW_SLOT))
         .child(mark)
         .into_any_element()
+}
+
+/// A sidebar row's frame, the same on every row. The open row is lifted onto
+/// its own tone with a hairline edge (and a soft shadow on a light sidebar),
+/// so it never reads as merely hovered. The edge is there at rest too, only
+/// transparent, so picking a row moves nothing by a pixel.
+fn sidebar_row(row: gpui::Stateful<gpui::Div>, active: bool) -> gpui::Stateful<gpui::Div> {
+    row.flex()
+        .items_center()
+        .gap(u(ROW_GAP))
+        // The edge takes a pixel; text stays on the section labels' line.
+        .pl(u(theme::ROW_PAD - 1.))
+        .pr(u(ROW_END - 1.))
+        .rounded(u(theme::ROW_RADIUS))
+        .border_1()
+        .cursor_pointer()
+        .when(active, |d| {
+            d.bg(rgb(theme::row_active()))
+                .border_color(rgba(theme::hairline()))
+                .when(!theme::is_dark(), |d| {
+                    d.shadow(vec![gpui::BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.06),
+                        offset: gpui::point(px(0.), px(1.)),
+                        blur_radius: px(2.),
+                        spread_radius: px(0.),
+                    }])
+                })
+        })
+        .when(!active, |d| {
+            d.border_color(gpui::transparent_black())
+                .hover(|s| s.bg(rgb(theme::row_hover())))
+        })
 }
 
 /// A part of the window chrome drawn as its own cached view.
@@ -5691,7 +5743,7 @@ impl Render for Workspace {
                 div().flex_1().min_w_0().child(
                     div()
                         .w_full()
-                        .truncate()
+                        .one_line()
                         .text_size(u(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(theme::text()))
