@@ -56,13 +56,13 @@ sign_bundle() {
         security list-keychains -d user -s $old "$KEYCHAIN"
         hash="$(security find-certificate -c "$IDENTITY" -Z "$KEYCHAIN" | awk '/SHA-1/ {print $3}')"
         ok=0
-        codesign --force --sign "$hash" "$1" >/dev/null 2>&1 && ok=1
+        codesign --force --entitlements packaging/Deck.entitlements --sign "$hash" "$1" >/dev/null 2>&1 && ok=1
         # shellcheck disable=SC2086
         security list-keychains -d user -s $old
         [ "$ok" = 1 ] && return 0
     fi
     echo "warning: signing with the local certificate failed; macOS will ask for permissions again" >&2
-    codesign --force --sign - "$1" >/dev/null
+    codesign --force --entitlements packaging/Deck.entitlements --sign - "$1" >/dev/null
 }
 
 STAGE="$(mktemp -d)"

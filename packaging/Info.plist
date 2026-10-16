@@ -35,6 +35,25 @@
 	<string>A page or a program in Deck wants to use the camera.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>A page or a program in Deck wants to use the microphone.</string>
+	<!-- Without these macOS refuses silently instead of asking. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Deck opens dev servers and devices on your local network in its browser and terminals.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>A page in Deck's browser wants to know your location.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>A page in Deck's browser wants to know your location.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>A script or program in a Deck terminal wants to control another app.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>A terminal or agent in Deck wants to use files on your Desktop.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>A terminal or agent in Deck wants to use files in Documents.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>A terminal or agent in Deck wants to use files in Downloads.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>A terminal or agent in Deck wants to use files on an external drive.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>A terminal or agent in Deck wants to use files on a network drive.</string>
 	<!-- What a terminal opens, so deck can be the default one. -->
 	<key>CFBundleDocumentTypes</key>
 	<array>

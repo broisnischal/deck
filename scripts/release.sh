@@ -95,10 +95,10 @@ notarize() {
 if [ -n "$SIGN_ID" ]; then
     say "Signing as $SIGN_ID"
     # The hardened runtime is what notarization asks for.
-    codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+    codesign --force --options runtime --timestamp --entitlements packaging/Deck.entitlements --sign "$SIGN_ID" "$APP"
 else
     say "No Developer ID certificate: signing ad hoc, for this Mac only"
-    codesign --force --sign - "$APP"
+    codesign --force --entitlements packaging/Deck.entitlements --sign - "$APP"
 fi
 codesign --verify --strict "$APP"
 
