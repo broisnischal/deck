@@ -14,7 +14,7 @@ use crate::field::{Field, FieldEvent};
 use crate::icon::Icon;
 use crate::menu::{self, Entry, Item};
 use crate::pasteboard::{self, Pasted};
-use crate::theme;
+use crate::theme::{self, OneLine};
 use crate::workspace::{
     icon_button, ClearTerminal, ClosePane, Copy, Find, FindNext, FindPrevious, Paste, SelectAll,
     SplitDown, SplitRight,
@@ -749,7 +749,7 @@ impl TerminalPane {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .one_line()
                             .font_family(self.look.family.clone())
                             .text_size(px(label_px))
                             .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
@@ -759,7 +759,7 @@ impl TerminalPane {
                         div()
                             .flex_none()
                             .max_w(px(120.))
-                            .truncate()
+                            .one_line()
                             .text_size(px(small))
                             .text_color(rgb(theme::dim()))
                             .child(d)
@@ -1543,7 +1543,7 @@ impl TerminalPane {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .one_line()
                             .text_color(rgb(theme::text()))
                             .child(crate::chat::one_line_pub(&command)),
                     )

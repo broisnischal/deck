@@ -13,7 +13,7 @@ use crate::palette::{Item, Kind, Palette, PaletteEvent};
 use crate::review::{ReviewEvent, ReviewPane};
 use crate::settings_pane::{SettingsEvent, SettingsPane};
 use crate::terminal::{TerminalEvent, TerminalPane};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
@@ -2798,22 +2798,22 @@ impl Workspace {
     fn render_usage_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let on = self.usage_open && self.usage_by_sidebar;
         let tone = if on { theme::text() } else { theme::text_2() };
-        div()
-            .id("open-usage")
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
-            .h(u(32.))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END + 4.))
-            .rounded(u(theme::ROW_RADIUS))
+        // Lifted like the open row while its panel is up.
+        sidebar_row(div().id("open-usage"), 0., on, false)
+            .group("usage-row")
+            .h(u(ROW_ONE_LINE))
+            .pr(u(ROW_END + 3.))
             .text_size(u(13.))
             .text_color(rgb(tone))
-            .cursor_pointer()
-            .when(on, |d| d.bg(rgb(theme::surface())))
-            .when(!on, |d| d.hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))))
             .child(lead(icon(Icon::Gauge, 15., tone)))
-            .child(div().flex_1().min_w_0().truncate().child("Usage"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .one_line()
+                    .group_hover("usage-row", |s| s.text_color(rgb(theme::text())))
+                    .child("Usage"),
+            )
             .children(self.usage_glance(cx).map(|(label, pct)| {
                 div()
                     .flex()
@@ -2897,7 +2897,7 @@ impl Workspace {
             let pct = s.context_used as f32 / s.context_window.max(1) as f32 * 100.;
             body = body
                 .child(section("This conversation"))
-                .child(div().truncate().text_color(rgb(theme::text())).child(title.clone()))
+                .child(div().one_line().text_color(rgb(theme::text())).child(title.clone()))
                 .child(row(
                     "Context".into(),
                     pct,
@@ -2929,7 +2929,7 @@ impl Workspace {
             };
             body = body
                 .child(section("This conversation"))
-                .child(div().truncate().text_color(rgb(theme::text())).child(c.title.clone()));
+                .child(div().one_line().text_color(rgb(theme::text())).child(c.title.clone()));
             body = match (u_.context_used(), u_.context_window) {
                 (Some(f), Some(w)) => body.child(row(
                     "Context".into(),
@@ -2985,7 +2985,7 @@ impl Workspace {
                         .when(focused == Some(pane), |d| d.bg(rgb(theme::surface())))
                         .when(focused != Some(pane), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
                         .child(icon(c.mark, 13., theme::text_2()))
-                        .child(div().flex_1().min_w_0().truncate().text_color(rgb(theme::text())).child(c.title.clone()))
+                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text())).child(c.title.clone()))
                         .child(div().flex_none().text_size(u(11.)).text_color(rgb(theme::text_2())).child(figure))
                         .on_click(cx.listener(move |ws, _, window, cx| {
                             ws.usage_open = false;
@@ -3045,7 +3045,7 @@ impl Workspace {
                     .id("usage-panel")
                     .absolute()
                     .when(by_sidebar, |d| {
-                        d.bottom(u(bar + theme::GUTTER + 32. * 2. + 6.)).left(u(theme::GUTTER))
+                        d.bottom(u(bar + theme::GUTTER + ROW_ONE_LINE * 2. + 2. + 6.)).left(u(theme::GUTTER))
                     })
                     .when(!by_sidebar, |d| d.bottom(u(bar + 6.)).right(u(theme::GUTTER)))
                     .w(u(320.))
@@ -4505,22 +4505,9 @@ impl Workspace {
         let id = task.id.clone();
         let review_id = task.id.clone();
         let key = SharedString::from(format!("task-{}", task.id));
-        div()
-            .id(ElementId::Name(key.clone()))
+        sidebar_row(div().id(ElementId::Name(key.clone())), 0., active, !working && !wants)
             .group(key.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
             .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active && (working || wants), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-            .when(!active && !working && !wants, |d| {
-                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
             .child(lead(if working {
                 thinking(
                     ElementId::Name(format!("task-think-{}", task.id).into()),
@@ -4548,7 +4535,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(13.))
                             .text_color(rgb(if active {
                                 theme::text()
@@ -4560,7 +4547,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(line),
@@ -6117,9 +6104,11 @@ impl Workspace {
     fn project_groups(&self, cx: &App) -> Vec<ProjectGroup> {
         let mut groups: Vec<ProjectGroup> = Vec::new();
         let mut loose = ProjectGroup { name: String::new(), root: None, threads: Vec::new(), others: Vec::new() };
+        let settings = self.settings_tab();
         for (ix, tab) in self.tabs.iter().enumerate() {
-            // The control chat has its own row; a task's work, its task's.
-            if tab.pinned || self.is_task_tab(tab, cx) {
+            // The control chat has its own row; a task's work, its task's;
+            // Settings, the footer.
+            if tab.pinned || self.is_task_tab(tab, cx) || Some(ix) == settings {
                 continue;
             }
             let (name, root) = self.tab_project(tab, cx);
@@ -6326,30 +6315,83 @@ impl Workspace {
             .child(
                 div()
                     .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(u(2.))
                     .px(u(theme::GUTTER))
                     .pb(u(theme::GUTTER))
                     .child(self.render_usage_row(cx))
-                    .child(
-                        div()
-                            .id("open-settings")
-                            .flex()
-                            .items_center()
-                            .gap(u(10.))
-                            .h(u(32.))
-                            .px(u(theme::ROW_PAD))
-                            .rounded(u(theme::ROW_RADIUS))
-                            .text_size(u(13.))
-                            .text_color(rgb(theme::text_2()))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
-                            .child(icon(Icon::Settings, 15., theme::text_2()))
-                            .child(div().flex_1().child("Settings"))
-                            .children(keycap(hint("settings", &self.settings.keys)))
-                            .on_click(
-                                cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)),
-                            ),
-                    ),
+                    .child(self.render_settings_row(cx)),
             )
+            .into_any_element()
+    }
+
+    /// The Settings tab while it is open on its own. The sidebar's footer
+    /// stands for it then, rather than a second Settings row in the list.
+    fn settings_tab(&self) -> Option<usize> {
+        self.tabs.iter().position(|t| match t.root {
+            Node::Leaf(id) => matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Settings(_))),
+            Node::Split(..) => false,
+        })
+    }
+
+    /// Settings, at the foot of the sidebar: opens it, and while it is open
+    /// is its row, lifted like any open row and closed the same way.
+    fn render_settings_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tab = self.settings_tab();
+        let active = tab == Some(self.active);
+        let tone = if active { theme::text() } else { theme::text_2() };
+        sidebar_row(div().id("open-settings"), 0., active, false)
+            .group("settings-row")
+            .h(u(ROW_ONE_LINE))
+            .text_size(u(13.))
+            .text_color(rgb(tone))
+            .child(lead(icon(Icon::Settings, 15., tone)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .one_line()
+                    .group_hover("settings-row", |s| s.text_color(rgb(theme::text())))
+                    .child("Settings"),
+            )
+            .child(
+                // The shortcut, swapped for close while hovered once open.
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .relative()
+                    .min_w(u(22.))
+                    .h(u(22.))
+                    .children(keycap(hint("settings", &self.settings.keys)).map(|k| {
+                        k.when(tab.is_some(), |d| d.group_hover("settings-row", |s| s.opacity(0.)))
+                    }))
+                    .when_some(tab, |d, ix| {
+                        d.child(
+                            icon_button("close-settings", Icon::Close)
+                                .absolute()
+                                .right_0()
+                                .size(u(22.))
+                                .opacity(0.)
+                                .group_hover("settings-row", |s| s.opacity(1.))
+                                .on_click(cx.listener(move |ws, _, window, cx| {
+                                    cx.stop_propagation();
+                                    ws.close_tab(ix, window, cx);
+                                })),
+                        )
+                    }),
+            )
+            .on_click(cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)))
+            .when_some(tab, |d, ix| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
+                        ws.open_tab_menu(ix, ev.position, window, cx)
+                    }),
+                )
+            })
             .into_any_element()
     }
 
@@ -6487,7 +6529,7 @@ impl Workspace {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
+                    .one_line()
                     .text_size(u(12.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
@@ -6661,22 +6703,9 @@ impl Workspace {
         } else {
             subtitle
         };
-        div()
-            .id("control")
+        sidebar_row(div().id("control"), 0., active, !working && !wants)
             .group("control-row")
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
             .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active && (working || wants), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-            .when(!active && !working && !wants, |d| {
-                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
             .child(lead(if working {
                 thinking("control-think", glyph, 15., live(glyph))
             } else {
@@ -6708,7 +6737,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(subtitle),
@@ -6794,22 +6823,14 @@ impl Workspace {
         };
         let (state, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
-        div()
-            .id(ElementId::NamedInteger("tab".into(), ix as u64))
-            .group(group.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
-            .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD + indent))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active && loud, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-            .when(!active && !loud, |d| {
-                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
+        sidebar_row(
+            div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
+            indent,
+            active,
+            !loud,
+        )
+        .group(group.clone())
+        .h(u(ROW_TWO_LINE))
             .child(lead(if working {
                 thinking(
                     ElementId::NamedInteger("thread-think".into(), ix as u64),
@@ -6839,7 +6860,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(13.))
                             .text_color(rgb(if active || loud {
                                 theme::text()
@@ -6851,7 +6872,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(who),
@@ -7042,30 +7063,20 @@ impl Workspace {
             _ => icon(glyph, 15., tone),
         };
 
-        div()
-            .id(ElementId::NamedInteger("tab".into(), ix as u64))
-            .group(group.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
-            .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD + indent))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .text_size(u(13.))
-            .cursor_pointer()
-            .when(active, |d| {
-                d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
-            })
-            .when(!active && (busy || wants), |d| {
-                d.text_color(rgb(theme::text()))
-                    .hover(|s| s.bg(rgb(theme::row_hover())))
-            })
-            .when(!active && !busy && !wants, |d| {
-                d.text_color(rgb(theme::text_2()))
-                    .opacity(IDLE_FADE)
-                    .hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
+        sidebar_row(
+            div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
+            indent,
+            active,
+            !busy && !wants,
+        )
+        .group(group.clone())
+        .h(u(ROW_TWO_LINE))
+        .text_size(u(13.))
+        .text_color(rgb(if active || busy || wants {
+            theme::text()
+        } else {
+            theme::text_2()
+        }))
             .child(lead(mark))
             // Definite-width boxes, so gpui knows where to put the ellipsis.
             .child(
@@ -7074,11 +7085,11 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .child(div().w_full().truncate().child(row_title))
+                    .child(div().w_full().one_line().child(row_title))
                     .children(subtitle.map(|sub| {
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(sub)
@@ -7185,7 +7196,7 @@ impl Workspace {
                         jobs.push(
                             item(ElementId::NamedInteger("bar-pane".into(), id), on)
                                 .child(dot(state))
-                                .child(div().max_w(u(200.)).truncate().child(label))
+                                .child(div().max_w(u(200.)).one_line().child(label))
                                 .on_click(cx.listener(move |ws, _, w, cx| ws.focus_pane(id, w, cx)))
                                 .into_any_element(),
                         );
@@ -7208,7 +7219,7 @@ impl Workspace {
                         jobs.push(
                             item(ElementId::NamedInteger("bar-pane".into(), id), on)
                                 .child(mark)
-                                .child(div().max_w(u(180.)).truncate().child(host))
+                                .child(div().max_w(u(180.)).one_line().child(host))
                                 .when(b.loading, |d| d.child(dot(theme::accent())))
                                 .on_click(cx.listener(move |ws, _, w, cx| ws.focus_pane(id, w, cx)))
                                 .into_any_element(),
@@ -7264,10 +7275,10 @@ impl Workspace {
                         .items_center()
                         .gap(u(5.))
                         .child(icon(Icon::Git, 12., theme::text_2()))
-                        .child(div().max_w(u(160.)).truncate().text_color(rgb(theme::text())).child(b))
+                        .child(div().max_w(u(160.)).one_line().text_color(rgb(theme::text())).child(b))
                 }))
                 .child(icon(Icon::Folder, 12., theme::dim()))
-                .child(div().max_w(u(160.)).truncate().child(project))
+                .child(div().max_w(u(160.)).one_line().child(project))
                 .on_click(cx.listener(|ws, _, w, cx| {
                     if let Err(e) = ws.open_editor("changes", None, None, w, cx) {
                         tracing::warn!("could not open the editor: {e}");
@@ -7442,6 +7453,8 @@ const ROW_INDENT: f32 = ROW_SLOT + ROW_GAP;
 /// Every sidebar row is this tall, a title and a line under it, so the list
 /// keeps one rhythm whatever is in it.
 const ROW_TWO_LINE: f32 = 44.;
+/// The sidebar footer's rows, Usage and Settings.
+const ROW_ONE_LINE: f32 = 32.;
 /// Rows with nothing going on step back; working ones keep full strength
 /// and their agent's colour.
 const IDLE_FADE: f32 = 0.9;
@@ -7569,6 +7582,53 @@ fn git_head(root: &std::path::Path) -> Option<String> {
 
 /// The leading mark of a sidebar row, centred in the shared slot, so icons,
 /// favicons and spinners of different sizes line up.
+/// A sidebar row's frame, the same on every row. The open row is lifted
+/// onto its own tone with a hairline edge (and a soft shadow on a light
+/// sidebar), so it never reads as merely hovered. The edge is there at rest
+/// too, only transparent, so picking a row moves nothing by a pixel. An
+/// idle row (`faded`) steps back until the pointer is on it. `indent` moves
+/// a project's rows in under its header.
+fn sidebar_row(
+    row: gpui::Stateful<gpui::Div>,
+    indent: f32,
+    active: bool,
+    faded: bool,
+) -> gpui::Stateful<gpui::Div> {
+    row.flex()
+        .items_center()
+        .gap(u(ROW_GAP))
+        // The edge takes a pixel; text stays on the headers' line.
+        .pl(u(theme::ROW_PAD + indent - 1.))
+        .pr(u(ROW_END - 1.))
+        .rounded(u(theme::ROW_RADIUS))
+        .border_1()
+        .cursor_pointer()
+        .when(active, |d| {
+            d.bg(rgb(theme::row_active()))
+                .border_color(rgba(theme::hairline()))
+                .when(!theme::is_dark(), |d| {
+                    d.shadow(vec![gpui::BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.06),
+                        offset: gpui::point(px(0.), px(1.)),
+                        blur_radius: px(2.),
+                        spread_radius: px(0.),
+                    }])
+                })
+        })
+        .when(!active, |d| {
+            d.border_color(gpui::transparent_black())
+                .when(faded, |d| d.opacity(IDLE_FADE))
+                .hover(move |s| {
+                    let s = s.bg(rgb(theme::row_hover()));
+                    if faded {
+                        s.opacity(1.)
+                    } else {
+                        s
+                    }
+                })
+        })
+}
+
 /// A shortcut from Settings › Shortcuts as a keycap, or nothing when it
 /// has none.
 fn keycap(keys: SharedString) -> Option<gpui::Div> {
@@ -7862,7 +7922,7 @@ impl Render for Workspace {
                 div().flex_1().min_w_0().child(
                     div()
                         .w_full()
-                        .truncate()
+                        .one_line()
                         .text_size(u(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(theme::text()))

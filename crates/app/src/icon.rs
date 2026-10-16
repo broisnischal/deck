@@ -176,14 +176,17 @@ pub fn thinking(_id: impl Into<gpui::ElementId>, glyph: Icon, size: f32, color: 
         .into_any_element()
 }
 
-/// Text with a band of light sweeping across it: "Working…" while an agent
-/// is busy.
+/// Text with a band of contrast sweeping across it: "Working…" while an
+/// agent is busy. It runs from the theme's dim label tone to its text
+/// colour, so on a light theme the band darkens instead of fading into the
+/// background, and on the warm and blue themes it stays in their tint.
 pub fn shimmer(_id: impl Into<gpui::ElementId>, text: SharedString) -> AnyElement {
     use gpui::{HighlightStyle, StyledText};
     let t = phase(1900);
     let n = text.chars().count() as f32;
     let band = 5.;
     let at = t * (n + band * 2.) - band;
+    let (base, peak) = (crate::theme::dim(), crate::theme::text());
     let lights: Vec<_> = text
         .char_indices()
         .enumerate()
@@ -192,7 +195,7 @@ pub fn shimmer(_id: impl Into<gpui::ElementId>, text: SharedString) -> AnyElemen
             (
                 byte..byte + ch.len_utf8(),
                 HighlightStyle {
-                    color: Some(rgb(mix(SHIMMER_BASE, SHIMMER_PEAK, k)).into()),
+                    color: Some(rgb(mix(base, peak, k)).into()),
                     ..Default::default()
                 },
             )
@@ -203,9 +206,6 @@ pub fn shimmer(_id: impl Into<gpui::ElementId>, text: SharedString) -> AnyElemen
         .child(StyledText::new(text.clone()).with_highlights(lights))
         .into_any_element()
 }
-
-const SHIMMER_BASE: u32 = 0x8a8a8a;
-const SHIMMER_PEAK: u32 = 0xffffff;
 
 fn ease_in_out(t: f32) -> f32 {
     if t < 0.5 {

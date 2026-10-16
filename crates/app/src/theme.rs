@@ -91,6 +91,10 @@ pub struct Colors {
     pub surface: u32,
     pub surface_hover: u32,
     pub row_hover: u32,
+    /// The open sidebar row: lifted clear of the hover tone (white on
+    /// Light, the surface on the dark themes), so a hovered row never
+    /// reads as the open one.
+    pub row_active: u32,
     pub border: u32,
     pub text: u32,
     pub text_2: u32,
@@ -159,6 +163,7 @@ static ALL: [Colors; 7] = [
         surface: 0x1c1c1c,
         surface_hover: 0x262626,
         row_hover: 0x141414,
+        row_active: 0x1c1c1c,
         border: 0x1a1a1a,
         text: 0xf5f5f5,
         text_2: 0xa3a3a3,
@@ -184,6 +189,7 @@ static ALL: [Colors; 7] = [
         surface: 0x353538,
         surface_hover: 0x3f3f43,
         row_hover: 0x2c2c2f,
+        row_active: 0x353538,
         border: 0x38383b,
         text: 0xf2f2f7,
         text_2: 0xb0b0b5,
@@ -209,6 +215,7 @@ static ALL: [Colors; 7] = [
         surface: 0x1e2431,
         surface_hover: 0x272e3e,
         row_hover: 0x181d28,
+        row_active: 0x1e2431,
         border: 0x202634,
         text: 0xe8ebf2,
         text_2: 0xa6aec0,
@@ -234,6 +241,7 @@ static ALL: [Colors; 7] = [
         surface: 0xe6e6e6,
         surface_hover: 0xdcdcdc,
         row_hover: 0xe8e8e8,
+        row_active: 0xffffff,
         border: 0xe2e2e2,
         text: 0x1d1d1f,
         text_2: 0x55555a,
@@ -259,6 +267,7 @@ static ALL: [Colors; 7] = [
         surface: 0x1a1a1a,
         surface_hover: 0x242424,
         row_hover: 0x101010,
+        row_active: 0x1a1a1a,
         border: 0x1c1c1c,
         text: 0xf0f0f0,
         text_2: 0xa1a1a1,
@@ -284,6 +293,7 @@ static ALL: [Colors; 7] = [
         surface: 0x282624,
         surface_hover: 0x312f2c,
         row_hover: 0x1f1d1b,
+        row_active: 0x282624,
         border: 0x262422,
         text: 0xece9e4,
         text_2: 0xb1aba4,
@@ -309,6 +319,7 @@ static ALL: [Colors; 7] = [
         surface: 0x16202d,
         surface_hover: 0x1d2938,
         row_hover: 0x0e1620,
+        row_active: 0x16202d,
         border: 0x151d29,
         text: 0xe7ecf1,
         text_2: 0xa4b1bf,
@@ -357,6 +368,9 @@ pub fn surface_hover() -> u32 {
 }
 pub fn row_hover() -> u32 {
     current().row_hover
+}
+pub fn row_active() -> u32 {
+    current().row_active
 }
 pub fn text() -> u32 {
     current().text
@@ -473,6 +487,20 @@ pub fn u(v: f32) -> gpui::Rems {
     gpui::rems(v / REM_PX)
 }
 
+/// One line of text that ends in "…" where it stops fitting.
+///
+/// gpui 0.2.2's `truncate()` sizes nowrap text once and keeps that size for
+/// the rest of the layout, so the "…" goes where the first, wider pass put
+/// it and the box then clips the line mid-letter. A one-line clamp is
+/// measured again at every width, so the ellipsis lands at the real edge.
+pub trait OneLine: gpui::Styled {
+    fn one_line(self) -> Self {
+        self.whitespace_normal().line_clamp(1).text_ellipsis()
+    }
+}
+
+impl<T: gpui::Styled> OneLine for T {}
+
 /// The rem size at 100% zoom.
 pub const REM_PX: f32 = 16.;
 
@@ -544,6 +572,15 @@ mod tests {
             assert!(contrast(c.pane, c.accent) >= 4.5, "{:06x}", c.accent);
             let edge = contrast(over(c.hairline, c.pane), c.pane);
             assert!((1.1..1.3).contains(&edge), "{:08x}: {edge:.2}", c.hairline);
+        }
+    }
+
+    #[test]
+    fn the_open_row_stands_apart_from_a_hovered_one() {
+        for c in &ALL {
+            let (open, hover) = (contrast(c.row_active, c.sidebar), contrast(c.row_hover, c.sidebar));
+            assert!(open > hover, "{:06x} vs {:06x} on {:06x}", c.row_active, c.row_hover, c.sidebar);
+            assert!(contrast(c.text, c.row_active) >= 7., "{:06x}", c.row_active);
         }
     }
 

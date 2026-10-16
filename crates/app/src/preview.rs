@@ -6,7 +6,7 @@
 //! the composer a click did nothing at all.
 
 use crate::icon::{icon, Icon};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use gpui::prelude::*;
 use gpui::{div, img, rgb, rgba, AnyElement, FontWeight, SharedString};
 use std::io::Read;
@@ -283,7 +283,7 @@ pub fn body(p: &Preview) -> AnyElement {
                             13.,
                             theme::dim(),
                         ))
-                        .child(div().min_w_0().truncate().child(name.clone())),
+                        .child(div().min_w_0().one_line().child(name.clone())),
                 );
             }
             if *more > 0 {

@@ -8,7 +8,7 @@ use crate::settings::{
     self, Access, Cursor, Scheme, Search, Settings, FONT_PX_RANGE, LINE_HEIGHT_RANGE, ZOOMS,
 };
 use crate::snippets::{self, Snippet};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use gpui::prelude::*;
 use gpui::{
     div, ease_in_out, relative, rgb, rgba, Animation, AnimationExt, AnyElement, ClickEvent,
@@ -1563,14 +1563,14 @@ impl SettingsPane {
                             .min_w_0()
                             .child(
                                 div()
-                                    .truncate()
+                                    .one_line()
                                     .text_size(u(13.))
                                     .text_color(rgb(theme::text()))
                                     .child(s.name.clone()),
                             )
                             .child(
                                 div()
-                                    .truncate()
+                                    .one_line()
                                     .text_size(u(11.))
                                     .text_color(rgb(theme::dim()))
                                     .child(snippets::detail(s)),

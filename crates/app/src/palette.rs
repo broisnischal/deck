@@ -8,7 +8,7 @@
 use crate::field::{Field, FieldEvent};
 use crate::fuzzy;
 use crate::icon::{icon, Icon};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use gpui::prelude::*;
 use gpui::{
     div, relative, rgb, rgba, Action, Context, ElementId, Entity, EventEmitter, FocusHandle,
@@ -455,7 +455,7 @@ impl Render for Palette {
                                 div()
                                     .flex_shrink()
                                     .min_w_0()
-                                    .truncate()
+                                    .one_line()
                                     .text_color(rgb(if selected { theme::text() } else { theme::text_2() }))
                                     .child(title),
                             )
@@ -463,7 +463,7 @@ impl Render for Palette {
                                 div()
                                     .flex_none()
                                     .max_w(u(200.))
-                                    .truncate()
+                                    .one_line()
                                     .text_size(u(12.))
                                     .text_color(rgb(theme::dim()))
                                     .child(detail),

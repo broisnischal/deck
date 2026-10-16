@@ -11,7 +11,7 @@ use crate::icon::{icon, Icon};
 use crate::local::{self, Kind, Route, Survey};
 use crate::menu::{self, Entry, Item};
 use crate::refine;
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
@@ -789,7 +789,7 @@ fn picker(id: ElementId, label: String) -> Stateful<Div> {
         .text_color(rgb(theme::text()))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(theme::surface_hover())))
-        .child(div().max_w(u(220.)).truncate().child(label))
+        .child(div().max_w(u(220.)).one_line().child(label))
         .child(icon(Icon::ChevronDown, 11., theme::dim()))
 }
 

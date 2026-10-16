@@ -15,7 +15,7 @@ use crate::menu::{self, Entry, Item};
 use crate::pasteboard::{self, Pasted};
 use crate::select;
 use crate::settings::Access;
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use crate::threads;
 use agent_core::{
     Action, AgentEvent, AgentId, AppliedKind, Attachment, AttachmentKind, Block, Decision,
@@ -2750,7 +2750,7 @@ impl ChatPane {
                     div().flex_1().min_w_0().child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_color(rgb(theme::dim()))
                             .child(meta),
                     ),
@@ -3002,7 +3002,7 @@ impl ChatPane {
                 div().flex_1().min_w_0().child(
                     div()
                         .w_full()
-                        .truncate()
+                        .one_line()
                         .font_family(theme::MONO)
                         .text_size(u(11.5))
                         .text_color(rgb(if running {
@@ -3187,7 +3187,7 @@ impl ChatPane {
                             .child(
                                 div()
                                     .min_w_0()
-                                    .truncate()
+                                    .one_line()
                                     .pl(u(8.))
                                     .text_color(rgb(theme::dim()))
                                     .child(dir),
@@ -3299,7 +3299,7 @@ impl ChatPane {
                             13.,
                             theme::dim(),
                         ))
-                        .child(div().min_w_0().truncate().child(file_name(path)))
+                        .child(div().min_w_0().one_line().child(file_name(path)))
                 }
             };
             let p = path.clone();
@@ -3392,7 +3392,7 @@ impl ChatPane {
                     .pl(u(2.))
                     .child(
                         div()
-                            .truncate()
+                            .one_line()
                             .text_size(u(13.))
                             .line_height(u(18.))
                             .font_weight(FontWeight::MEDIUM)
@@ -3401,7 +3401,7 @@ impl ChatPane {
                     )
                     .child(
                         div()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .line_height(u(15.))
                             .text_color(rgb(theme::dim()))
@@ -3537,7 +3537,7 @@ impl ChatPane {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .one_line()
                             .text_color(rgb(theme::dim()))
                             .child(parent.to_string()),
                     )
@@ -3772,7 +3772,7 @@ impl ChatPane {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(div().w_full().truncate().child(what)),
+                            .child(div().w_full().one_line().child(what)),
                     )
                     // Already handed over: the agent cannot give it back, so
                     // there is nothing to cancel; it reads it next.
@@ -4059,7 +4059,7 @@ impl ChatPane {
                         div().flex_1().min_w_0().child(
                             div()
                                 .w_full()
-                                .truncate()
+                                .one_line()
                                 .text_color(rgb(theme::dim()))
                                 .child(prompt),
                         ),
@@ -4104,7 +4104,7 @@ impl ChatPane {
                                     .child(self.agent_name())
                                     .child(div().text_color(rgb(theme::dim())).child("in"))
                                     .child(icon(Icon::Folder, 13., theme::dim()))
-                                    .child(div().min_w_0().truncate().child(place)),
+                                    .child(div().min_w_0().one_line().child(place)),
                             ),
                     )
                     .child(self.render_composer(window, cx))
