@@ -6,7 +6,7 @@
 
 use crate::icon::{icon, Icon};
 use crate::inspect::{self, Entry, GitInfo, Port, Proc};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use crate::workspace::Workspace;
 use gpui::prelude::*;
 use gpui::{
@@ -241,7 +241,7 @@ fn browser_info(title: SharedString, url: SharedString) -> AnyElement {
                 .pt(u(16.))
                 .text_size(u(14.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(div().w_full().truncate().child(title)),
+                .child(div().w_full().one_line().child(title)),
         )
         .child(header("Address", None))
         .child(
@@ -283,7 +283,7 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
                     .w_full()
                     .text_size(u(14.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .truncate()
+                    .one_line()
                     .child(title),
             )
             .when_some(pid, |c, pid| {
@@ -310,7 +310,7 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
                         .min_w_0()
                         .pl(u(4.))
                         .text_size(u(13.))
-                        .truncate()
+                        .one_line()
                         .child(tilde(&root)),
                 )
                 .child(
@@ -345,7 +345,7 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
                     div()
                         .flex_shrink()
                         .min_w_0()
-                        .truncate()
+                        .one_line()
                         .text_color(rgb(if level == 0 {
                             theme::text_2()
                         } else {
@@ -398,7 +398,7 @@ fn info(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) -> Any
                 .child(
                     div()
                         .text_color(rgb(theme::text_2()))
-                        .truncate()
+                        .one_line()
                         .child(port.process.clone()),
                 )
                 .child(div().flex_1())
@@ -472,7 +472,7 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(div().w_full().truncate().child(e.name.clone())),
+                        .child(div().w_full().one_line().child(e.name.clone())),
                 )
                 .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, window, cx| {
                     if is_dir {
@@ -543,7 +543,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .truncate()
+                            .one_line()
                             .text_size(u(14.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(g.branch.clone()),
@@ -597,7 +597,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                             .child(
                                 div()
                                     .min_w_0()
-                                    .truncate()
+                                    .one_line()
                                     .text_size(u(11.5))
                                     .text_color(rgb(theme::dim()))
                                     .child(w.branch.clone().unwrap_or_else(|| "detached".into())),
@@ -661,7 +661,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                             .child(
                                 div()
                                     .min_w_0()
-                                    .truncate()
+                                    .one_line()
                                     .text_size(u(11.5))
                                     .text_color(rgb(theme::dim()))
                                     .child(dir),
@@ -742,7 +742,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                                         div()
                                             .flex_1()
                                             .min_w_0()
-                                            .truncate()
+                                            .one_line()
                                             .text_size(u(12.5))
                                             .text_color(rgb(theme::text()))
                                             .child(c.subject.clone()),
@@ -763,7 +763,7 @@ fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                                     .text_size(u(11.))
                                     .text_color(rgb(theme::dim()))
                                     .child(div().font_family(theme::MONO).child(c.short.clone()))
-                                    .child(div().min_w_0().truncate().child(c.author.clone()))
+                                    .child(div().min_w_0().one_line().child(c.author.clone()))
                                     .children(refs.into_iter().map(ref_pill)),
                             ),
                     )

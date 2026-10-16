@@ -13,7 +13,7 @@ use crate::field::{Field, FieldEvent};
 use crate::history::{self, Visit};
 use crate::icon::{icon, spinner, Icon};
 use crate::settings::Search;
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use crate::workspace::icon_button;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
@@ -1874,7 +1874,7 @@ impl BrowserPane {
                     DownloadState::Done => icon(Icon::Download, 13., theme::text()),
                     DownloadState::Failed => icon(Icon::Close, 13., theme::dim()),
                 })
-                .child(div().max_w(u(150.)).truncate().child(d.name.clone()))
+                .child(div().max_w(u(150.)).one_line().child(d.name.clone()))
                 .on_click(move |_, _, _| {
                     // Show it in Finder, selected.
                     if let Some(p) = &path {
@@ -2059,7 +2059,7 @@ impl BrowserPane {
                                     div()
                                         .flex_shrink()
                                         .min_w_0()
-                                        .truncate()
+                                        .one_line()
                                         .text_color(rgb(theme::text()))
                                         .child(primary),
                                 )
@@ -2067,7 +2067,7 @@ impl BrowserPane {
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .truncate()
+                                        .one_line()
                                         .text_size(u(12.))
                                         .text_color(rgb(theme::dim()))
                                         .child(s)
@@ -2157,7 +2157,7 @@ impl BrowserPane {
                         .child(
                             div()
                                 .w(u(112.))
-                                .truncate()
+                                .one_line()
                                 .text_center()
                                 .text_size(u(12.))
                                 .text_color(rgb(theme::text_2()))

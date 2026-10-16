@@ -75,6 +75,8 @@ pub struct Style {
     pub code: bool,
     pub strike: bool,
     pub link: bool,
+    /// A key written in the text (`⌃O`, `⏎`), drawn as a keycap would be.
+    pub kbd: bool,
 }
 
 impl Style {
@@ -84,7 +86,26 @@ impl Style {
 }
 
 impl Spans {
+    /// Append `text`, keys in it marked as keys, unless it is code or a
+    /// link's label, which stay as written.
     fn push(&mut self, text: &str, style: Style) {
+        if style.code || style.link {
+            return self.push_run(text, style);
+        }
+        let mut at = 0;
+        for r in crate::kbd::find(text) {
+            self.push_run(&text[at..r.start], style);
+            // A text run can't be padded, so a narrow no-break space each
+            // side gives the key room inside its tint, and keeps it on one
+            // line.
+            let key = format!("\u{202F}{}\u{202F}", &text[r.clone()]);
+            self.push_run(&key, Style { kbd: true, ..style });
+            at = r.end;
+        }
+        self.push_run(&text[at..], style);
+    }
+
+    fn push_run(&mut self, text: &str, style: Style) {
         if text.is_empty() {
             return;
         }
@@ -964,6 +985,40 @@ mod tests {
     fn empty_label_links_fall_back_to_the_url() {
         match only_block("[](https://example.com)") {
             MdBlock::Paragraph(s) => assert_eq!(s.text, "https://example.com"),
+            b => panic!("{b:?}"),
+        }
+    }
+
+    #[test]
+    fn keys_in_text_are_marked_but_not_in_code_or_links() {
+        let kbd = Style {
+            kbd: true,
+            ..Style::default()
+        };
+        match only_block("Press ⌃O, then ⏎. In code: `⌃O`. [⌘K](https://x.dev)") {
+            MdBlock::Paragraph(s) => {
+                assert_eq!(styled(&s, kbd), ["\u{202F}⌃O\u{202F}", "\u{202F}⏎\u{202F}"]);
+                assert!(s.text.starts_with("Press \u{202F}⌃O\u{202F}, then"));
+                let code = Style {
+                    code: true,
+                    ..Style::default()
+                };
+                assert_eq!(styled(&s, code), ["⌃O"]);
+                assert_eq!(s.links.len(), 1);
+                assert_eq!(&s.text[s.links[0].0.clone()], "⌘K");
+            }
+            b => panic!("{b:?}"),
+        }
+        // Bold keys stay bold, as keys.
+        match only_block("**⇧⌘N** opens one") {
+            MdBlock::Paragraph(s) => {
+                let bold_kbd = Style {
+                    bold: true,
+                    kbd: true,
+                    ..Style::default()
+                };
+                assert_eq!(styled(&s, bold_kbd), ["\u{202F}⇧⌘N\u{202F}"]);
+            }
             b => panic!("{b:?}"),
         }
     }

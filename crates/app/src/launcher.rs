@@ -3,7 +3,7 @@
 //! takes the highlighted card, so ⌘N ⏎ is a shell too.
 
 use crate::icon::{icon, Icon};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use crate::workspace::Agent;
 use gpui::prelude::*;
 use gpui::{
@@ -167,7 +167,7 @@ impl LauncherPane {
                     .gap(u(1.))
                     .child(
                         div()
-                            .truncate()
+                            .one_line()
                             .text_size(u(13.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(tone))
@@ -175,7 +175,7 @@ impl LauncherPane {
                     )
                     .child(
                         div()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(c.detail.clone()),
@@ -279,12 +279,9 @@ impl Render for LauncherPane {
                     .when(!agents.is_empty(), |d| {
                         d.child(div().child(label("Agents")).child(team))
                     })
-                    .child(
-                        div()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child("↵ open · 1–9 pick · ⌥↵ agent in a terminal · esc close"),
-                    ),
+                    .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(
+                        crate::kbd::hints("↵ open · 1–9 pick · ⌥↵ agent in a terminal · esc close"),
+                    )),
             )
     }
 }

@@ -13,7 +13,7 @@ use crate::palette::{Item, Kind, Palette, PaletteEvent};
 use crate::review::{ReviewEvent, ReviewPane};
 use crate::settings_pane::{SettingsEvent, SettingsPane};
 use crate::terminal::{TerminalEvent, TerminalPane};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
@@ -717,6 +717,18 @@ struct UsageView {
     at: Option<Instant>,
 }
 
+/// A chat's numbers as its agent reported them, for the usage panel.
+struct ChatUse {
+    pane: PaneId,
+    title: SharedString,
+    mark: Icon,
+    /// "Claude", "OpenCode".
+    agent: SharedString,
+    /// The model it runs, as the product names it ("Opus 4.1").
+    model: Option<String>,
+    usage: agent_core::Usage,
+}
+
 struct ProjectGroup {
     /// Its folder's name; empty for the tabs in no project ("Web").
     name: String,
@@ -834,9 +846,13 @@ pub struct Workspace {
     /// Claude Code conversations' first asks by session id, read once: a
     /// title of their own when Claude Code titles several terminals alike.
     conv_titles: HashMap<String, Option<crate::session::ConvTitles>>,
-    /// AI usage for the status bar's meter and the panel it opens.
+    /// AI usage for the status bar's meter, the sidebar's Usage row and
+    /// the panel either opens.
     usage: UsageView,
     usage_open: bool,
+    /// The panel was opened from the sidebar's Usage row, so it hangs over
+    /// the sidebar instead of over the status bar's meter.
+    usage_by_sidebar: bool,
     pending_scroll: Option<String>,
     _tick: Task<()>,
     _animate: Task<()>,
@@ -951,6 +967,7 @@ impl Workspace {
             conv_titles: HashMap::new(),
             usage: UsageView::default(),
             usage_open: false,
+            usage_by_sidebar: false,
             pending_scroll: None,
             _tick: tick,
             _animate: animate,
@@ -2347,11 +2364,13 @@ impl Workspace {
         }
         if self.settings.status_bar {
             self.refresh_bar_git(cx);
-            // Limits move slowly and are cached a couple of minutes below;
-            // the open panel keeps the conversation's numbers fresh.
-            // The conversation's numbers are read incrementally (about a
-            // millisecond) and limits are cached below, so every few
-            // seconds keeps ctx in step with Claude Code's own line.
+        }
+        // The status bar's meter and the sidebar's Usage row read these.
+        // The conversation's numbers are read incrementally (about a
+        // millisecond) and limits are cached a couple of minutes below, so
+        // every few seconds keeps ctx in step with Claude Code's own line;
+        // the open panel keeps them fresher.
+        if self.settings.status_bar || self.sidebar || self.usage_open {
             let every = if self.usage_open { 3 } else { 5 };
             if self.ticks % every == 1 {
                 self.refresh_usage(cx);
@@ -2713,15 +2732,133 @@ impl Workspace {
                         .child(div().text_color(rgb(theme::dim())).child("ctx"))
                         .child(div().text_color(rgb(level_color(pct))).child(pct_text(pct)))
                 }))
-                .on_click(cx.listener(|ws, _, _, cx| {
-                    ws.usage_open = !ws.usage_open;
-                    if ws.usage_open {
-                        ws.refresh_usage(cx);
-                    }
-                    cx.notify();
-                }))
+                .on_click(cx.listener(|ws, _, _, cx| ws.toggle_usage(false, cx)))
                 .into_any_element(),
         )
+    }
+
+    /// Open the usage panel over the status bar's meter or over the
+    /// sidebar's Usage row, or shut it.
+    fn toggle_usage(&mut self, by_sidebar: bool, cx: &mut Context<Self>) {
+        let again = self.usage_open && self.usage_by_sidebar == by_sidebar;
+        self.usage_open = !again;
+        self.usage_by_sidebar = by_sidebar;
+        if self.usage_open {
+            self.refresh_usage(cx);
+        }
+        cx.notify();
+    }
+
+    /// The focused chat, when it is one, as its agent reported it: the
+    /// usage panel's conversation for any agent whose transcript deck
+    /// cannot read itself.
+    fn focused_chat_usage(&self, cx: &App) -> Option<ChatUse> {
+        let id = self.focused()?;
+        let PaneKind::Chat(c) = &self.panes.get(&id)?.kind else {
+            return None;
+        };
+        let c = c.read(cx);
+        let usage = *c.usage();
+        (usage.tokens() > 0 || usage.context > 0).then(|| ChatUse {
+            pane: id,
+            title: self.pane_title(id, cx),
+            mark: Icon::agent(c.agent.as_str()),
+            agent: c.agent_name(),
+            model: c.ran_model().map(crate::usage::model_name),
+            usage,
+        })
+    }
+
+    /// Every chat in this window that has spent anything, the heaviest
+    /// first, for the panel's list.
+    fn chat_spend(&self, cx: &App) -> Vec<ChatUse> {
+        let mut out: Vec<ChatUse> = self
+            .panes
+            .iter()
+            .filter_map(|(&id, p)| {
+                let PaneKind::Chat(c) = &p.kind else {
+                    return None;
+                };
+                let c = c.read(cx);
+                let usage = *c.usage();
+                (usage.tokens() > 0).then(|| ChatUse {
+                    pane: id,
+                    title: self.pane_title(id, cx),
+                    mark: Icon::agent(c.agent.as_str()),
+                    agent: c.agent_name(),
+                    model: c.ran_model().map(crate::usage::model_name),
+                    usage,
+                })
+            })
+            .collect();
+        out.sort_by_key(|t| std::cmp::Reverse(t.usage.tokens()));
+        out
+    }
+
+    /// What the sidebar's Usage row says shut: how full the focused
+    /// conversation's context is, else the plan limit nearest its cap for
+    /// the agent you are in, as the status bar's meter reads them.
+    fn usage_glance(&self, cx: &App) -> Option<(SharedString, f32)> {
+        let agent = self.focused_agent(cx).map(|(cmd, _)| cmd);
+        let ctx = self
+            .usage
+            .session
+            .as_ref()
+            .filter(|_| agent == Some("claude"))
+            .map(|(_, s)| s.context_used as f32 / s.context_window.max(1) as f32 * 100.)
+            .or_else(|| {
+                self.focused_chat_usage(cx)
+                    .and_then(|c| c.usage.context_used())
+                    .map(|f| f * 100.)
+            });
+        if let Some(pct) = ctx {
+            return Some(("ctx".into(), pct));
+        }
+        let limits = match agent {
+            Some("codex") => self.usage.codex.as_ref(),
+            _ => self.usage.claude.as_ref().and_then(|r| r.as_ref().ok()),
+        }?;
+        let five = limits.limits.iter().find(|x| x.label.starts_with('5'));
+        let top = five.or_else(|| limits.limits.iter().max_by(|a, b| a.used_pct.total_cmp(&b.used_pct)))?;
+        Some((short_limit(&top.label), top.used_pct))
+    }
+
+    /// Usage at the foot of the sidebar, above Settings: shut, how full the
+    /// conversation's context is (or the plan's 5-hour window); a click
+    /// opens the usage panel over it, with the context, the tokens and
+    /// what is left of the plan.
+    fn render_usage_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.usage_open && self.usage_by_sidebar;
+        let tone = if on { theme::text() } else { theme::text_2() };
+        // Lifted like the open row while its panel is up.
+        sidebar_row(div().id("open-usage"), 0., on, false)
+            .group("usage-row")
+            .h(u(ROW_ONE_LINE))
+            .pr(u(ROW_END + 3.))
+            .text_size(u(13.))
+            .text_color(rgb(tone))
+            .child(lead(icon(Icon::Gauge, 15., tone)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .one_line()
+                    .group_hover("usage-row", |s| s.text_color(rgb(theme::text())))
+                    .child("Usage"),
+            )
+            .children(self.usage_glance(cx).map(|(label, pct)| {
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(u(6.))
+                    .text_size(u(11.))
+                    .child(div().text_color(rgb(theme::dim())).child(label))
+                    .child(meter_bar(pct, 28.))
+                    .child(div().text_color(rgb(level_color(pct))).child(pct_text(pct)))
+            }))
+            .on_click(cx.listener(|ws, _, _, cx| ws.toggle_usage(true, cx)))
+            .into_any_element()
     }
 
     /// The usage panel over the status bar's end: plan limits with when
@@ -2785,15 +2922,23 @@ impl Workspace {
             }
             None => body = body.child(div().pt(u(4.)).text_color(rgb(theme::dim())).child("Reading usage…")),
         }
+        // A chat whose agent deck cannot read the transcript of (OpenCode,
+        // Codex, Gemini) speaks for itself: its own reports.
+        let reported = us.session.is_none().then(|| self.focused_chat_usage(cx)).flatten();
         if let Some((title, s)) = &us.session {
             let pct = s.context_used as f32 / s.context_window.max(1) as f32 * 100.;
             body = body
                 .child(section("This conversation"))
-                .child(div().truncate().text_color(rgb(theme::text())).child(title.clone()))
+                .child(div().one_line().text_color(rgb(theme::text())).child(title.clone()))
                 .child(row(
                     "Context".into(),
                     pct,
-                    Some(format!("{} of {}{}", tokens(s.context_used), tokens(s.context_window), s.model.as_deref().map(|m| format!(" · {m}")).unwrap_or_default())),
+                    Some(format!(
+                        "{} of {}{}",
+                        tokens(s.context_used),
+                        tokens(s.context_window),
+                        s.model.as_deref().map(|m| format!(" · {}", crate::usage::model_name(m))).unwrap_or_default()
+                    )),
                 ))
                 .child(
                     div()
@@ -2808,6 +2953,80 @@ impl Workspace {
                             s.cost_usd.map(|c| format!(" · ${c:.2}")).unwrap_or_default()
                         )),
                 );
+        } else if let Some(c) = &reported {
+            let u_ = &c.usage;
+            let who = match &c.model {
+                Some(m) => format!("{} · {m}", c.agent),
+                None => c.agent.to_string(),
+            };
+            body = body
+                .child(section("This conversation"))
+                .child(div().one_line().text_color(rgb(theme::text())).child(c.title.clone()));
+            body = match (u_.context_used(), u_.context_window) {
+                (Some(f), Some(w)) => body.child(row(
+                    "Context".into(),
+                    f * 100.,
+                    Some(format!("{} of {} · {who}", tokens(u_.context), tokens(w))),
+                )),
+                _ if u_.context > 0 => body.child(
+                    div()
+                        .py(u(5.))
+                        .text_color(rgb(theme::text_2()))
+                        .child(format!("{} in context · {who}", tokens(u_.context))),
+                ),
+                _ => body.child(div().py(u(5.)).text_color(rgb(theme::text_2())).child(who)),
+            };
+            body = body.child(
+                div()
+                    .text_size(u(11.))
+                    .text_color(rgb(theme::dim()))
+                    .child(format!(
+                        "{} in · {} out · {} cached{}",
+                        tokens(u_.input),
+                        tokens(u_.output),
+                        tokens(u_.cache_read + u_.cache_write),
+                        u_.cost_usd.filter(|c| *c > 0.).map(|c| format!(" · ${c:.2}")).unwrap_or_default()
+                    )),
+            );
+        }
+        // Every chat open here, by what it spent: one click to the one
+        // that costs the most.
+        let spend = self.chat_spend(cx);
+        if spend.len() > 1 {
+            let focused = self.focused();
+            let mut list = div().flex().flex_col().gap(u(1.));
+            for c in spend.iter().take(5) {
+                let pane = c.pane;
+                let figure = match c.usage.cost_usd.filter(|v| *v > 0.) {
+                    Some(v) => format!("${v:.2}"),
+                    None => tokens(c.usage.tokens()),
+                };
+                list = list.child(
+                    div()
+                        .id(ElementId::NamedInteger("usage-chat".into(), pane))
+                        .flex()
+                        .items_center()
+                        .gap(u(8.))
+                        .h(u(28.))
+                        // Rows bleed into the panel's padding so their hover
+                        // has room.
+                        .mx(u(-6.))
+                        .px(u(6.))
+                        .rounded(u(6.))
+                        .cursor_pointer()
+                        .when(focused == Some(pane), |d| d.bg(rgb(theme::surface())))
+                        .when(focused != Some(pane), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+                        .child(icon(c.mark, 13., theme::text_2()))
+                        .child(div().flex_1().min_w_0().one_line().text_color(rgb(theme::text())).child(c.title.clone()))
+                        .child(div().flex_none().text_size(u(11.)).text_color(rgb(theme::text_2())).child(figure))
+                        .on_click(cx.listener(move |ws, _, window, cx| {
+                            ws.usage_open = false;
+                            ws.focus_pane(pane, window, cx);
+                            cx.notify();
+                        })),
+                );
+            }
+            body = body.child(section("Chats in this window")).child(list);
         }
         if let Some(t) = &us.today {
             body = body.child(section("Today, all projects")).child(
@@ -2836,6 +3055,10 @@ impl Workspace {
             s if s < 120 => format!("Updated {s}s ago"),
             s => format!("Updated {}m ago", s / 60),
         });
+        // Over the row that opened it: the sidebar's Usage row (above
+        // Settings, under the list) or the status bar's meter.
+        let bar = if self.settings.status_bar { 26. } else { 0. };
+        let by_sidebar = self.usage_by_sidebar && self.sidebar;
         div()
             .absolute()
             .top_0()
@@ -2853,8 +3076,10 @@ impl Workspace {
                 div()
                     .id("usage-panel")
                     .absolute()
-                    .bottom(u(26. + 6.))
-                    .right(u(theme::GUTTER))
+                    .when(by_sidebar, |d| {
+                        d.bottom(u(bar + theme::GUTTER + ROW_ONE_LINE * 2. + 2. + 6.)).left(u(theme::GUTTER))
+                    })
+                    .when(!by_sidebar, |d| d.bottom(u(bar + 6.)).right(u(theme::GUTTER)))
                     .w(u(320.))
                     .max_h(gpui::relative(0.8))
                     .overflow_y_scroll()
@@ -4314,22 +4539,9 @@ impl Workspace {
         let id = task.id.clone();
         let review_id = task.id.clone();
         let key = SharedString::from(format!("task-{}", task.id));
-        div()
-            .id(ElementId::Name(key.clone()))
+        sidebar_row(div().id(ElementId::Name(key.clone())), 0., active, !working && !wants)
             .group(key.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
             .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active && (working || wants), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-            .when(!active && !working && !wants, |d| {
-                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
             .child(lead(if working {
                 thinking(
                     ElementId::Name(format!("task-think-{}", task.id).into()),
@@ -4357,7 +4569,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(13.))
                             .text_color(rgb(if active {
                                 theme::text()
@@ -4369,7 +4581,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(line),
@@ -5926,9 +6138,11 @@ impl Workspace {
     fn project_groups(&self, cx: &App) -> Vec<ProjectGroup> {
         let mut groups: Vec<ProjectGroup> = Vec::new();
         let mut loose = ProjectGroup { name: String::new(), root: None, threads: Vec::new(), others: Vec::new() };
+        let settings = self.settings_tab();
         for (ix, tab) in self.tabs.iter().enumerate() {
-            // The control chat has its own row; a task's work, its task's.
-            if tab.pinned || self.is_task_tab(tab, cx) {
+            // The control chat has its own row; a task's work, its task's;
+            // Settings, the footer.
+            if tab.pinned || self.is_task_tab(tab, cx) || Some(ix) == settings {
                 continue;
             }
             let (name, root) = self.tab_project(tab, cx);
@@ -6031,15 +6245,11 @@ impl Workspace {
                     .hover(|s| s.bg(rgb(theme::surface())))
                     .child(lead(icon(Icon::Plus, 14., theme::text())))
                     .child(div().flex_1().child("New chat"))
-                    .child(
-                        div()
-                            .text_size(u(11.))
-                            .font_weight(FontWeight::NORMAL)
-                            .text_color(rgb(theme::dim()))
+                    .children(keycap(hint("new-chat", &self.settings.keys)).map(|k| {
+                        k.font_weight(FontWeight::NORMAL)
                             .invisible()
                             .group_hover("new-chat", |s| s.visible())
-                            .child(hint("new-chat", &self.settings.keys)),
-                    )
+                    }))
                     .on_click(cx.listener(|ws, _, window, cx| {
                         let what = Open::Chat {
                             agent: None,
@@ -6139,34 +6349,83 @@ impl Workspace {
             .child(
                 div()
                     .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(u(2.))
                     .px(u(theme::GUTTER))
                     .pb(u(theme::GUTTER))
-                    .child(
-                        div()
-                            .id("open-settings")
-                            .flex()
-                            .items_center()
-                            .gap(u(10.))
-                            .h(u(32.))
-                            .px(u(theme::ROW_PAD))
-                            .rounded(u(theme::ROW_RADIUS))
-                            .text_size(u(13.))
-                            .text_color(rgb(theme::text_2()))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
-                            .child(icon(Icon::Settings, 15., theme::text_2()))
-                            .child(div().flex_1().child("Settings"))
-                            .child(
-                                div()
-                                    .text_size(u(11.))
-                                    .text_color(rgb(theme::dim()))
-                                    .child(hint("settings", &self.settings.keys)),
-                            )
-                            .on_click(
-                                cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)),
-                            ),
-                    ),
+                    .child(self.render_usage_row(cx))
+                    .child(self.render_settings_row(cx)),
             )
+            .into_any_element()
+    }
+
+    /// The Settings tab while it is open on its own. The sidebar's footer
+    /// stands for it then, rather than a second Settings row in the list.
+    fn settings_tab(&self) -> Option<usize> {
+        self.tabs.iter().position(|t| match t.root {
+            Node::Leaf(id) => matches!(self.panes.get(&id).map(|p| &p.kind), Some(PaneKind::Settings(_))),
+            Node::Split(..) => false,
+        })
+    }
+
+    /// Settings, at the foot of the sidebar: opens it, and while it is open
+    /// is its row, lifted like any open row and closed the same way.
+    fn render_settings_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tab = self.settings_tab();
+        let active = tab == Some(self.active);
+        let tone = if active { theme::text() } else { theme::text_2() };
+        sidebar_row(div().id("open-settings"), 0., active, false)
+            .group("settings-row")
+            .h(u(ROW_ONE_LINE))
+            .text_size(u(13.))
+            .text_color(rgb(tone))
+            .child(lead(icon(Icon::Settings, 15., tone)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .one_line()
+                    .group_hover("settings-row", |s| s.text_color(rgb(theme::text())))
+                    .child("Settings"),
+            )
+            .child(
+                // The shortcut, swapped for close while hovered once open.
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .relative()
+                    .min_w(u(22.))
+                    .h(u(22.))
+                    .children(keycap(hint("settings", &self.settings.keys)).map(|k| {
+                        k.when(tab.is_some(), |d| d.group_hover("settings-row", |s| s.opacity(0.)))
+                    }))
+                    .when_some(tab, |d, ix| {
+                        d.child(
+                            icon_button("close-settings", Icon::Close)
+                                .absolute()
+                                .right_0()
+                                .size(u(22.))
+                                .opacity(0.)
+                                .group_hover("settings-row", |s| s.opacity(1.))
+                                .on_click(cx.listener(move |ws, _, window, cx| {
+                                    cx.stop_propagation();
+                                    ws.close_tab(ix, window, cx);
+                                })),
+                        )
+                    }),
+            )
+            .on_click(cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)))
+            .when_some(tab, |d, ix| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |ws, ev: &gpui::MouseDownEvent, window, cx| {
+                        ws.open_tab_menu(ix, ev.position, window, cx)
+                    }),
+                )
+            })
             .into_any_element()
     }
 
@@ -6188,7 +6447,7 @@ impl Workspace {
                 .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                 .child(icon(glyph, 14., theme::text_2()))
                 .child(div().flex_1().child(label))
-                .children(key.map(|k| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(k)))
+                .children(key.and_then(keycap))
         };
         let keys = &self.settings.keys;
         div()
@@ -6304,7 +6563,7 @@ impl Workspace {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
+                    .one_line()
                     .text_size(u(12.5))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
@@ -6478,22 +6737,9 @@ impl Workspace {
         } else {
             subtitle
         };
-        div()
-            .id("control")
+        sidebar_row(div().id("control"), 0., active, !working && !wants)
             .group("control-row")
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
             .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active && (working || wants), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-            .when(!active && !working && !wants, |d| {
-                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
             .child(lead(if working {
                 thinking("control-think", glyph, 15., live(glyph))
             } else {
@@ -6525,7 +6771,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(subtitle),
@@ -6611,22 +6857,14 @@ impl Workspace {
         };
         let (state, loud) = self.thread_state(first, cx);
         let group = SharedString::from(format!("tab-{ix}"));
-        div()
-            .id(ElementId::NamedInteger("tab".into(), ix as u64))
-            .group(group.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
-            .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD + indent))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .cursor_pointer()
-            .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active && loud, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
-            .when(!active && !loud, |d| {
-                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
+        sidebar_row(
+            div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
+            indent,
+            active,
+            !loud,
+        )
+        .group(group.clone())
+        .h(u(ROW_TWO_LINE))
             .child(lead(if working {
                 thinking(
                     ElementId::NamedInteger("thread-think".into(), ix as u64),
@@ -6656,7 +6894,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(13.))
                             .text_color(rgb(if active || loud {
                                 theme::text()
@@ -6668,7 +6906,7 @@ impl Workspace {
                     .child(
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(who),
@@ -6859,30 +7097,20 @@ impl Workspace {
             _ => icon(glyph, 15., tone),
         };
 
-        div()
-            .id(ElementId::NamedInteger("tab".into(), ix as u64))
-            .group(group.clone())
-            .flex()
-            .items_center()
-            .gap(u(ROW_GAP))
-            .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD + indent))
-            .pr(u(ROW_END))
-            .rounded(u(theme::ROW_RADIUS))
-            .text_size(u(13.))
-            .cursor_pointer()
-            .when(active, |d| {
-                d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
-            })
-            .when(!active && (busy || wants), |d| {
-                d.text_color(rgb(theme::text()))
-                    .hover(|s| s.bg(rgb(theme::row_hover())))
-            })
-            .when(!active && !busy && !wants, |d| {
-                d.text_color(rgb(theme::text_2()))
-                    .opacity(IDLE_FADE)
-                    .hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
-            })
+        sidebar_row(
+            div().id(ElementId::NamedInteger("tab".into(), ix as u64)),
+            indent,
+            active,
+            !busy && !wants,
+        )
+        .group(group.clone())
+        .h(u(ROW_TWO_LINE))
+        .text_size(u(13.))
+        .text_color(rgb(if active || busy || wants {
+            theme::text()
+        } else {
+            theme::text_2()
+        }))
             .child(lead(mark))
             // Definite-width boxes, so gpui knows where to put the ellipsis.
             .child(
@@ -6891,11 +7119,11 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .child(div().w_full().truncate().child(row_title))
+                    .child(div().w_full().one_line().child(row_title))
                     .children(subtitle.map(|sub| {
                         div()
                             .w_full()
-                            .truncate()
+                            .one_line()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
                             .child(sub)
@@ -7017,7 +7245,7 @@ impl Workspace {
                         jobs.push(
                             item(ElementId::NamedInteger("bar-pane".into(), id), on)
                                 .child(dot(state))
-                                .child(div().max_w(u(200.)).truncate().child(label))
+                                .child(div().max_w(u(200.)).one_line().child(label))
                                 .on_click(cx.listener(move |ws, _, w, cx| ws.focus_pane(id, w, cx)))
                                 .into_any_element(),
                         );
@@ -7040,7 +7268,7 @@ impl Workspace {
                         jobs.push(
                             item(ElementId::NamedInteger("bar-pane".into(), id), on)
                                 .child(mark)
-                                .child(div().max_w(u(180.)).truncate().child(host))
+                                .child(div().max_w(u(180.)).one_line().child(host))
                                 .when(b.loading, |d| d.child(dot(theme::accent())))
                                 .on_click(cx.listener(move |ws, _, w, cx| ws.focus_pane(id, w, cx)))
                                 .into_any_element(),
@@ -7096,10 +7324,10 @@ impl Workspace {
                         .items_center()
                         .gap(u(5.))
                         .child(icon(Icon::Git, 12., theme::text_2()))
-                        .child(div().max_w(u(160.)).truncate().text_color(rgb(theme::text())).child(b))
+                        .child(div().max_w(u(160.)).one_line().text_color(rgb(theme::text())).child(b))
                 }))
                 .child(icon(Icon::Folder, 12., theme::dim()))
-                .child(div().max_w(u(160.)).truncate().child(project))
+                .child(div().max_w(u(160.)).one_line().child(project))
                 .on_click(cx.listener(|ws, _, w, cx| {
                     if let Err(e) = ws.open_editor("changes", None, None, w, cx) {
                         tracing::warn!("could not open the editor: {e}");
@@ -7274,6 +7502,8 @@ const ROW_INDENT: f32 = ROW_SLOT + ROW_GAP;
 /// Every sidebar row is this tall, a title and a line under it, so the list
 /// keeps one rhythm whatever is in it.
 const ROW_TWO_LINE: f32 = 44.;
+/// The sidebar footer's rows, Usage and Settings.
+const ROW_ONE_LINE: f32 = 32.;
 /// Rows with nothing going on step back; working ones keep full strength
 /// and their agent's colour.
 const IDLE_FADE: f32 = 0.9;
@@ -7435,6 +7665,59 @@ fn git_head(root: &std::path::Path) -> Option<String> {
 
 /// The leading mark of a sidebar row, centred in the shared slot, so icons,
 /// favicons and spinners of different sizes line up.
+/// A sidebar row's frame, the same on every row. The open row is lifted
+/// onto its own tone with a hairline edge (and a soft shadow on a light
+/// sidebar), so it never reads as merely hovered. The edge is there at rest
+/// too, only transparent, so picking a row moves nothing by a pixel. An
+/// idle row (`faded`) steps back until the pointer is on it. `indent` moves
+/// a project's rows in under its header.
+fn sidebar_row(
+    row: gpui::Stateful<gpui::Div>,
+    indent: f32,
+    active: bool,
+    faded: bool,
+) -> gpui::Stateful<gpui::Div> {
+    row.flex()
+        .items_center()
+        .gap(u(ROW_GAP))
+        // The edge takes a pixel; text stays on the headers' line.
+        .pl(u(theme::ROW_PAD + indent - 1.))
+        .pr(u(ROW_END - 1.))
+        .rounded(u(theme::ROW_RADIUS))
+        .border_1()
+        .cursor_pointer()
+        .when(active, |d| {
+            d.bg(rgb(theme::row_active()))
+                .border_color(rgba(theme::hairline()))
+                .when(!theme::is_dark(), |d| {
+                    d.shadow(vec![gpui::BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.06),
+                        offset: gpui::point(px(0.), px(1.)),
+                        blur_radius: px(2.),
+                        spread_radius: px(0.),
+                    }])
+                })
+        })
+        .when(!active, |d| {
+            d.border_color(gpui::transparent_black())
+                .when(faded, |d| d.opacity(IDLE_FADE))
+                .hover(move |s| {
+                    let s = s.bg(rgb(theme::row_hover()));
+                    if faded {
+                        s.opacity(1.)
+                    } else {
+                        s
+                    }
+                })
+        })
+}
+
+/// A shortcut from Settings › Shortcuts as a keycap, or nothing when it
+/// has none.
+fn keycap(keys: SharedString) -> Option<gpui::Div> {
+    (!keys.is_empty()).then(|| crate::kbd::key(keys))
+}
+
 fn lead(mark: AnyElement) -> AnyElement {
     div()
         .flex()
@@ -7722,7 +8005,7 @@ impl Render for Workspace {
                 div().flex_1().min_w_0().child(
                     div()
                         .w_full()
-                        .truncate()
+                        .one_line()
                         .text_size(u(13.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(rgb(theme::text()))
@@ -8018,9 +8301,7 @@ impl Render for Workspace {
                             .child(p.clone()),
                     )
             }))
-            .when(self.usage_open && self.settings.status_bar, |d| {
-                d.child(self.render_usage_panel(cx))
-            })
+            .when(self.usage_open, |d| d.child(self.render_usage_panel(cx)))
             .children(self.notice.as_ref().map(|n| self.render_notice(n, cx)))
             .children(self.toast.as_ref().map(|(text, _)| {
                 div()

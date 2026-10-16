@@ -4,7 +4,7 @@
 
 use crate::icon::{icon, spinner, Icon};
 use crate::tasks::{self, FileDiff, Line};
-use crate::theme::{self, u};
+use crate::theme::{self, u, OneLine};
 use gpui::prelude::*;
 use gpui::{
     div, rgb, rgba, AnyElement, Context, ElementId, EventEmitter, FocusHandle, FontWeight,
@@ -178,7 +178,7 @@ impl ReviewPane {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
+                    .one_line()
                     .font_family(theme::MONO)
                     .text_size(u(12.))
                     .text_color(rgb(theme::text()))

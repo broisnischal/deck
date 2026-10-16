@@ -241,12 +241,18 @@ pub struct Usage {
     pub cache_write: u64,
     /// Backends that report cost directly; otherwise the UI prices it locally.
     pub cost_usd: Option<f64>,
+    /// Tokens the model's context held at its latest call. A reading, not a
+    /// count: the newest wins, and 0 means none came.
+    #[serde(default)]
+    pub context: u64,
+    /// How many tokens that context can hold, when the backend says.
+    #[serde(default)]
+    pub context_window: Option<u64>,
 }
 
 impl Usage {
-    /// Usage arrives as cumulative snapshots from some backends and as deltas
-    /// from others. Adapters normalize to cumulative-per-turn; this folds a
-    /// turn into a session total.
+    /// Adapters report tokens and cost per turn; this folds a turn into a
+    /// session total. Readings (context and its window) replace the last.
     pub fn accumulate(&mut self, other: &Usage) {
         self.input += other.input;
         self.output += other.output;
@@ -257,6 +263,23 @@ impl Usage {
             (None, Some(b)) => self.cost_usd = Some(b),
             _ => {}
         }
+        if other.context > 0 {
+            self.context = other.context;
+        }
+        if other.context_window.is_some() {
+            self.context_window = other.context_window;
+        }
+    }
+
+    /// Tokens through the model, cached reads included.
+    pub fn tokens(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+
+    /// How full the context is, 0.0 to 1.0, when both sides are known.
+    pub fn context_used(&self) -> Option<f32> {
+        let window = self.context_window.filter(|w| *w > 0)?;
+        (self.context > 0).then(|| (self.context as f32 / window as f32).min(1.))
     }
 }
 
