@@ -42,7 +42,7 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub type Rgb = u32;
@@ -111,6 +111,16 @@ impl Palette {
             N::DimCyan => self.ansi[6],
             N::DimWhite => self.ansi[7],
             N::DimForeground => self.fg,
+        }
+    }
+
+    /// Dark or light, as `CSI ? 997 ; n` reports it: 1 dark, 2 light.
+    fn scheme(&self) -> u8 {
+        let ch = |shift: u32| ((self.bg >> shift) & 0xff) as f32;
+        if 0.299 * ch(16) + 0.587 * ch(8) + 0.114 * ch(0) < 128. {
+            1
+        } else {
+            2
         }
     }
 
@@ -190,7 +200,39 @@ pub struct Run {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Row {
     pub runs: Vec<Run>,
+    /// The block whose prompt or command line this row shows, when the
+    /// shell marks them (see [`Block`]).
+    pub block: Option<u64>,
 }
+
+/// One command at the shell, from its prompt to the next: what deck knows
+/// about it besides its text on screen. The shell's marks (OSC 133, sent by
+/// deck's zsh integration) number them; see `tap.rs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Block {
+    /// The command line, once it runs.
+    pub command: Option<String>,
+    /// The folder it ran in.
+    pub cwd: Option<String>,
+    pub started: Option<std::time::Instant>,
+    pub finished: Option<std::time::Instant>,
+    pub exit: Option<i32>,
+}
+
+impl Block {
+    pub fn running(&self) -> bool {
+        self.started.is_some() && self.finished.is_none()
+    }
+
+    /// How long it ran, or has run so far.
+    pub fn took(&self) -> Option<std::time::Duration> {
+        let start = self.started?;
+        Some(self.finished.unwrap_or_else(std::time::Instant::now) - start)
+    }
+}
+
+/// Blocks kept per terminal; the oldest go first.
+const MAX_BLOCKS: usize = 5000;
 
 /// The cursor shape a program asked for with DECSCUSR (`ESC [ n SP q`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -227,6 +269,12 @@ pub struct Snapshot {
     /// How far the view is scrolled back, in lines. Non-zero means the user is
     /// looking at history rather than the live tail.
     pub scrolled_back: usize,
+    /// A full-screen program (an editor, a TUI) has the screen: no blocks.
+    pub alt_screen: bool,
+    /// The blocks on screen, and the one the top row belongs to when its
+    /// prompt has scrolled out above (`above`), by number.
+    pub blocks: Vec<(u64, Block)>,
+    pub above: Option<u64>,
 }
 
 /// Something that happened that the UI has to react to, rather than just
@@ -240,8 +288,21 @@ pub enum TermEvent {
         title: Option<String>,
         body: String,
     },
-    /// OSC 9;4 progress: `Some(state)` while working, `None` when cleared.
-    Progress(Option<u8>),
+    /// OSC 9;4 progress: `Some(state)` while working, `None` when cleared,
+    /// and the percentage when the program gives one.
+    Progress(Option<u8>, Option<u8>),
+    /// "# …" at the prompt: a command wanted for this.
+    Ask(String),
+    /// The line being edited at the prompt and the cursor in it (characters),
+    /// or `None` when it was entered or abandoned.
+    Line(Option<(usize, String)>),
+    /// A command at the shell finished.
+    CommandDone {
+        block: u64,
+        command: Option<String>,
+        exit: Option<i32>,
+        took: std::time::Duration,
+    },
     Exited(Option<i32>),
 }
 
@@ -267,6 +328,13 @@ struct Shared {
     /// `wake_pending` coalesces a burst of output into one wakeup per UI turn.
     wake: Mutex<Option<futures::channel::mpsc::UnboundedSender<()>>>,
     wake_pending: AtomicBool,
+    /// The shell's commands by block number, and its folder (OSC 7).
+    blocks: Mutex<std::collections::BTreeMap<u64, Block>>,
+    cwd: Mutex<Option<String>>,
+    /// Whether the program asked to hear when the theme turns dark or light
+    /// (DEC mode 2031), and which it is: 0 not yet known, else 1 dark, 2 light.
+    scheme_updates: AtomicBool,
+    scheme: AtomicU8,
 }
 
 impl Shared {
@@ -280,7 +348,91 @@ impl Shared {
             palette: Mutex::new(None),
             wake: Mutex::new(None),
             wake_pending: AtomicBool::new(false),
+            blocks: Mutex::new(std::collections::BTreeMap::new()),
+            cwd: Mutex::new(None),
+            scheme_updates: AtomicBool::new(false),
+            scheme: AtomicU8::new(0),
         }
+    }
+
+    /// Bytes to the program, as if typed: the emulator's answers to its queries.
+    fn send(&self, bytes: Vec<u8>) {
+        if let Ok(mut w) = self.writer.lock() {
+            if let Some(sender) = w.as_mut() {
+                let _ = sender.send(Msg::Input(Cow::Owned(bytes)));
+            }
+        }
+    }
+
+    /// `CSI ? 997 ; n`: the theme is dark (1) or light (2). Before the first
+    /// frame it isn't known yet; deck's default theme is dark.
+    fn send_scheme(&self, scheme: u8) {
+        let scheme = if scheme == 2 { 2 } else { 1 };
+        self.send(format!("\x1b[?997;{scheme}n").into_bytes());
+    }
+
+    /// What the scanner heard on its way to the emulator.
+    fn signals(&self, found: impl Iterator<Item = tap::Signal>) {
+        use tap::Signal;
+        let mut events = Vec::new();
+        {
+            let mut blocks = self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+            for signal in found {
+                match signal {
+                    Signal::Notify { title, body } => events.push(TermEvent::Notify { title, body }),
+                    Signal::Progress(p, pct) => events.push(TermEvent::Progress(p, pct)),
+                    Signal::Prompt(n) => {
+                        // The shell has the terminal back: whatever asked for
+                        // theme updates has gone, and a report now would land
+                        // on the command line as typing.
+                        self.scheme_updates.store(false, Ordering::Relaxed);
+                        let cwd = self.cwd.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        blocks.insert(n, Block { cwd, ..Default::default() });
+                        while blocks.len() > MAX_BLOCKS {
+                            blocks.pop_first();
+                        }
+                    }
+                    Signal::Command(n, command) => {
+                        if let Some(b) = blocks.get_mut(&n) {
+                            b.command = Some(command);
+                        }
+                    }
+                    Signal::Started(n) => {
+                        if let Some(b) = blocks.get_mut(&n) {
+                            b.started = Some(std::time::Instant::now());
+                        }
+                    }
+                    Signal::Finished(n, exit) => {
+                        if let Some(b) = blocks.get_mut(&n).filter(|b| b.running()) {
+                            let now = std::time::Instant::now();
+                            b.finished = Some(now);
+                            b.exit = exit;
+                            events.push(TermEvent::CommandDone {
+                                block: n,
+                                command: b.command.clone(),
+                                exit,
+                                took: b.took().unwrap_or_default(),
+                            });
+                        }
+                    }
+                    Signal::Cwd(path) => *self.cwd.lock().unwrap_or_else(|e| e.into_inner()) = Some(path),
+                    Signal::Ask(text) => events.push(TermEvent::Ask(text)),
+                    Signal::Line(line) => {
+                        // Only the newest edit matters; drop older ones still queued.
+                        events.retain(|e| !matches!(e, TermEvent::Line(_)));
+                        events.push(TermEvent::Line(line));
+                    }
+                    Signal::SchemeUpdates(on) => self.scheme_updates.store(on, Ordering::Relaxed),
+                    Signal::SchemeQuery => self.send_scheme(self.scheme.load(Ordering::Relaxed)),
+                }
+            }
+        }
+        if !events.is_empty() {
+            if let Ok(mut q) = self.events.lock() {
+                q.extend(events);
+            }
+        }
+        self.mark_dirty();
     }
 
     fn mark_dirty(&self) {
@@ -313,6 +465,12 @@ impl EventListener for Proxy {
             // the next thing it prints lands in the wrong column. That was the
             // symptom that led here: zsh rendered `printfX1` where a plain `sh`
             // rendered `X1`, because only zsh asks.
+            // alacritty doesn't know mode 2031 and says so when a program asks
+            // (DECRQM); deck does, and answers with its state instead.
+            AlacEvent::PtyWrite(text) if text == "\x1b[?2031;0$y" => {
+                let state = if self.0.scheme_updates.load(Ordering::Relaxed) { 1 } else { 2 };
+                self.reply(format!("\x1b[?2031;{state}$y").into_bytes());
+            }
             AlacEvent::PtyWrite(text) => self.reply(text.into_bytes()),
 
             AlacEvent::TextAreaSizeRequest(format) => {
@@ -373,11 +531,7 @@ impl Proxy {
     }
 
     fn reply(&self, bytes: Vec<u8>) {
-        if let Ok(mut w) = self.0.writer.lock() {
-            if let Some(sender) = w.as_mut() {
-                let _ = sender.send(Msg::Input(Cow::Owned(bytes)));
-            }
-        }
+        self.0.send(bytes);
     }
 }
 
@@ -795,6 +949,84 @@ pub struct Terminal {
     selected: Mutex<Option<String>>,
 }
 
+/// The block a cell's prompt belongs to: its hyperlink, when the scanner
+/// put one there (see `tap.rs`).
+fn block_of(cell: &alacritty_terminal::term::cell::Cell) -> Option<u64> {
+    let link = cell.hyperlink()?;
+    link.uri().strip_prefix(tap::BLOCK_LINK)?.parse().ok()
+}
+
+/// A prompt's mark is where the shell started drawing it: the first columns.
+const MARK_COLUMNS: usize = 4;
+
+fn line_block(term: &Term<Proxy>, line: Line) -> Option<u64> {
+    let row = &term.grid()[line];
+    let cols = term.columns().min(MARK_COLUMNS);
+    (0..cols).find_map(|c| block_of(&row[Column(c)]))
+}
+
+/// The nearest prompt above `from`, looking at most `limit` lines up.
+fn block_above(term: &Term<Proxy>, from: Line, limit: usize) -> Option<u64> {
+    let top = term.topmost_line().0;
+    (top..from.0).rev().take(limit).find_map(|l| line_block(term, Line(l)))
+}
+
+/// The SGR parameters (each with its leading `;`) that draw `cell`.
+fn sgr_of(cell: &alacritty_terminal::term::cell::Cell) -> String {
+    let mut s = String::new();
+    let f = cell.flags;
+    for (flag, code) in [
+        (Flags::BOLD, "1"),
+        (Flags::DIM, "2"),
+        (Flags::ITALIC, "3"),
+        (Flags::UNDERLINE, "4"),
+        (Flags::INVERSE, "7"),
+        (Flags::HIDDEN, "8"),
+        (Flags::STRIKEOUT, "9"),
+    ] {
+        if f.contains(flag) {
+            s.push(';');
+            s.push_str(code);
+        }
+    }
+    let color = |c: AnsiColor, fg: bool, s: &mut String| match c {
+        AnsiColor::Named(n) => {
+            let i = n as usize;
+            let base = if fg { 30 } else { 40 };
+            if i < 8 {
+                s.push_str(&format!(";{}", base + i));
+            } else if i < 16 {
+                s.push_str(&format!(";{}", base + 60 + i - 8));
+            }
+        }
+        AnsiColor::Indexed(i) => s.push_str(&format!(";{};5;{i}", if fg { 38 } else { 48 })),
+        AnsiColor::Spec(rgb) => s.push_str(&format!(";{};2;{};{};{}", if fg { 38 } else { 48 }, rgb.r, rgb.g, rgb.b)),
+    };
+    color(cell.fg, true, &mut s);
+    color(cell.bg, false, &mut s);
+    s
+}
+
+/// Whether any cell on `line` belongs to block `n`'s prompt or command line.
+fn line_has_block(term: &Term<Proxy>, line: Line, n: u64) -> bool {
+    let row = &term.grid()[line];
+    (0..term.columns()).any(|c| block_of(&row[Column(c)]) == Some(n))
+}
+
+/// Every prompt in the scrollback and on screen, top to bottom: the line
+/// it starts on and its block.
+fn prompt_lines(term: &Term<Proxy>) -> Vec<(i32, u64)> {
+    let mut out: Vec<(i32, u64)> = Vec::new();
+    for l in term.topmost_line().0..=term.bottommost_line().0 {
+        if let Some(n) = line_block(term, Line(l)) {
+            if out.last().map(|(_, m)| *m) != Some(n) {
+                out.push((l, n));
+            }
+        }
+    }
+    out
+}
+
 /// Select every line, leaving out the blank rows below the prompt so a copy
 /// does not end in a run of empty lines.
 fn select_everything(term: &mut Term<Proxy>) {
@@ -962,6 +1194,192 @@ impl Terminal {
     /// The process the PTY started (on macOS, `login`, whose child is the shell).
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// What deck knows about block `n`.
+    pub fn block(&self, n: u64) -> Option<Block> {
+        self.shared.blocks.lock().ok()?.get(&n).cloned()
+    }
+
+    /// The newest block, the one the prompt at the bottom belongs to.
+    pub fn last_block(&self) -> Option<(u64, Block)> {
+        let blocks = self.shared.blocks.lock().ok()?;
+        blocks.last_key_value().map(|(n, b)| (*n, b.clone()))
+    }
+
+    /// The newest block that ran a command: the one running now, or the
+    /// last one to finish.
+    pub fn last_command(&self) -> Option<Block> {
+        let blocks = self.shared.blocks.lock().ok()?;
+        blocks.values().rev().find(|b| b.command.is_some()).cloned()
+    }
+
+    /// The last `lines` lines of scrollback and screen, as text, without
+    /// the blank rows under the prompt.
+    pub fn tail_text(&self, lines: usize) -> String {
+        let term = self.term.lock();
+        let top = term.topmost_line();
+        let mut bottom = term.bottommost_line();
+        while bottom > top && term.grid()[bottom].is_clear() {
+            bottom -= 1;
+        }
+        let first = Line((bottom.0 - lines as i32 + 1).max(top.0));
+        term.bounds_to_string(Point::new(first, Column(0)), Point::new(bottom, term.last_column()))
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The command lines run at this shell, newest first.
+    pub fn commands(&self) -> Vec<String> {
+        let Ok(blocks) = self.shared.blocks.lock() else {
+            return Vec::new();
+        };
+        blocks.values().rev().filter_map(|b| b.command.clone()).collect()
+    }
+
+    /// Whether the shell marks its prompts (deck's integration is loaded).
+    pub fn has_blocks(&self) -> bool {
+        self.shared.blocks.lock().is_ok_and(|b| !b.is_empty())
+    }
+
+    /// The shell's folder, as it last said (OSC 7).
+    pub fn shell_cwd(&self) -> Option<String> {
+        self.shared.cwd.lock().ok()?.clone()
+    }
+
+    /// Scroll so the previous (`up`) or next prompt is at the top. Past
+    /// the last one, back to the live tail. Whether anything moved.
+    pub fn jump_block(&mut self, up: bool) -> bool {
+        use alacritty_terminal::grid::Scroll;
+        let mut term = self.term.lock();
+        let marks = prompt_lines(&term);
+        let offset = term.grid().display_offset() as i32;
+        let top = -offset;
+        let target = if up {
+            marks.iter().rev().find(|(l, _)| *l < top)
+        } else {
+            marks.iter().find(|(l, _)| *l > top)
+        };
+        let want = match target {
+            Some(&(line, _)) => (-line).max(0),
+            None if up => return false,
+            None => 0,
+        };
+        if want == offset {
+            return false;
+        }
+        term.scroll_display(Scroll::Delta(want - offset));
+        drop(term);
+        self.shared.mark_dirty();
+        true
+    }
+
+    /// The scrollback and screen above the cursor's line, as text with its
+    /// colours (SGR), at most `max_lines` of it, to show again under a new
+    /// shell after a relaunch. Palette colours stay palette colours, so a
+    /// theme change still applies; soft-wrapped lines stay joined, so they
+    /// reflow at a new width. `None` while a full-screen program runs.
+    pub fn history_ansi(&self, max_lines: usize) -> Option<String> {
+        let term = self.term.lock();
+        if term.mode().contains(alacritty_terminal::term::TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = term.grid();
+        let cursor = grid.cursor.point.line;
+        let mut last = cursor.0 - 1;
+        while last >= term.topmost_line().0 && grid[Line(last)].is_clear() {
+            last -= 1;
+        }
+        let first = term.topmost_line().0.max(last - max_lines as i32 + 1);
+        if last < first {
+            return Some(String::new());
+        }
+        let cols = term.columns();
+        let mut out = String::new();
+        let mut style = String::new();
+        for l in first..=last {
+            let row = &grid[Line(l)];
+            // Trailing blank cells say nothing; a wrapped line has none.
+            let wrapped = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+            let mut end = cols;
+            if !wrapped {
+                while end > 0 && {
+                    let c = &row[Column(end - 1)];
+                    (c.c == ' ' || c.c == '\0') && c.bg == AnsiColor::Named(NamedColor::Background)
+                } {
+                    end -= 1;
+                }
+            }
+            for c in 0..end {
+                let cell = &row[Column(c)];
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let sgr = sgr_of(cell);
+                if sgr != style {
+                    out.push_str("\x1b[0");
+                    out.push_str(&sgr);
+                    out.push('m');
+                    style = sgr;
+                }
+                out.push(if cell.c == '\0' { ' ' } else { cell.c });
+                for z in cell.zerowidth().unwrap_or(&[]) {
+                    out.push(*z);
+                }
+            }
+            if !wrapped {
+                if !style.is_empty() {
+                    out.push_str("\x1b[0m");
+                    style.clear();
+                }
+                out.push_str("\r\n");
+            }
+        }
+        if !style.is_empty() {
+            out.push_str("\x1b[0m\r\n");
+        }
+        Some(out)
+    }
+
+    /// Scroll so block `n`'s prompt is at the top.
+    pub fn scroll_to_block(&mut self, n: u64) -> bool {
+        use alacritty_terminal::grid::Scroll;
+        let mut term = self.term.lock();
+        let Some(&(line, _)) = prompt_lines(&term).iter().find(|(_, m)| *m == n) else {
+            return false;
+        };
+        let offset = term.grid().display_offset() as i32;
+        let want = (-line).max(0);
+        term.scroll_display(Scroll::Delta(want - offset));
+        drop(term);
+        self.shared.mark_dirty();
+        true
+    }
+
+    /// Block `n`'s output, as text: the lines between its command line and
+    /// the next prompt, without the blank ones at the end. `None` once it
+    /// has left the scrollback.
+    pub fn block_output(&self, n: u64) -> Option<String> {
+        let term = self.term.lock();
+        let marks = prompt_lines(&term);
+        let at = marks.iter().position(|(_, m)| *m == n)?;
+        // The command line ends where the prompt's link does.
+        let mut last = marks[at].0;
+        let bottom = term.bottommost_line().0;
+        while last < bottom && line_has_block(&term, Line(last + 1), n) {
+            last += 1;
+        }
+        let end = marks.get(at + 1).map(|(l, _)| l - 1).unwrap_or(bottom);
+        if end <= last {
+            return Some(String::new());
+        }
+        let text = term.bounds_to_string(
+            Point::new(Line(last + 1), Column(0)),
+            Point::new(Line(end), term.last_column()),
+        );
+        Some(text.trim_end().to_string())
     }
 
     /// A stream that yields whenever the screen changed or an event arrived.
@@ -1206,6 +1624,14 @@ impl Terminal {
         if let Ok(mut p) = self.shared.palette.lock() {
             *p = Some(*palette);
         }
+        // A switch between a dark and a light theme, told to a program that
+        // asked to hear of one, so its colours follow instead of going
+        // unreadable on the new background.
+        let scheme = palette.scheme();
+        let was = self.shared.scheme.swap(scheme, Ordering::Relaxed);
+        if was != 0 && was != scheme && self.shared.scheme_updates.load(Ordering::Relaxed) {
+            self.shared.send_scheme(scheme);
+        }
         if !self.shared.dirty.swap(false, Ordering::AcqRel) && !force {
             return false;
         }
@@ -1233,7 +1659,11 @@ impl Terminal {
         self.scratch.rows.truncate(rows);
         for row in &mut self.scratch.rows {
             row.runs.clear();
+            row.block = None;
         }
+        let alt = content
+            .mode
+            .contains(alacritty_terminal::term::TermMode::ALT_SCREEN);
         self.scratch.columns = columns;
         self.scratch.scrolled_back = content.display_offset;
 
@@ -1253,6 +1683,9 @@ impl Terminal {
             }
             let flags = cell.flags;
             let row = &mut self.scratch.rows[row_ix as usize];
+            if row.block.is_none() && !alt {
+                row.block = block_of(&cell);
+            }
             // The right half of a wide char has no glyph of its own, but it is
             // still a column: emit `'\0'` in the wide char's run so every later
             // column lines up and its background spans both cells.
@@ -1315,6 +1748,39 @@ impl Terminal {
                     text: ch.to_string(),
                     style,
                 }),
+            }
+        }
+
+        // Which commands are on screen, and which one the top row belongs to
+        // when its prompt is above: the one before the first prompt shown;
+        // the newest when no prompt is shown at the live tail; else found by
+        // looking up the scrollback.
+        self.scratch.alt_screen = alt;
+        self.scratch.blocks.clear();
+        self.scratch.above = None;
+        if !alt {
+            let blocks = self.shared.blocks.lock().unwrap_or_else(|e| e.into_inner());
+            if !blocks.is_empty() {
+                let first = self.scratch.rows.iter().position(|r| r.block.is_some());
+                self.scratch.above = match first {
+                    Some(0) => None,
+                    Some(ix) => self.scratch.rows[ix]
+                        .block
+                        .and_then(|n| n.checked_sub(1))
+                        .filter(|n| blocks.contains_key(n)),
+                    None if self.scratch.scrolled_back == 0 => blocks.last_key_value().map(|(n, _)| *n),
+                    None => block_above(&term, Line(top), 4000),
+                };
+                let mut seen: Vec<u64> = self.scratch.above.into_iter().collect();
+                for n in self.scratch.rows.iter().filter_map(|r| r.block) {
+                    if seen.last() != Some(&n) && !seen.contains(&n) {
+                        seen.push(n);
+                    }
+                }
+                self.scratch.blocks = seen
+                    .into_iter()
+                    .filter_map(|n| blocks.get(&n).map(|b| (n, b.clone())))
+                    .collect();
             }
         }
 
@@ -1462,6 +1928,15 @@ mod tests {
     }
 
     #[test]
+    fn the_scheme_follows_the_background() {
+        let mut p = palette();
+        for (bg, scheme) in [(0x000000, 1), (0x0a0a0a, 1), (0x1e1f2b, 1), (0xffffff, 2), (0xf5f5f7, 2)] {
+            p.bg = bg;
+            assert_eq!(p.scheme(), scheme, "{bg:06x}");
+        }
+    }
+
+    #[test]
     fn a_direct_rgb_spec_passes_through_untouched() {
         let rgb = alacritty_terminal::vte::ansi::Rgb {
             r: 0x12,
@@ -1527,6 +2002,121 @@ mod tests {
             text.contains("hello-from-pty"),
             "shell output never reached the grid; got {text:?}"
         );
+    }
+
+    /// A program that asks to hear of theme switches, through a real PTY: it
+    /// is told the scheme when it asks, that the mode is on when it checks,
+    /// and that the theme turned light when the palette does.
+    #[test]
+    fn a_program_hears_the_theme_turn_light() {
+        let read = |n: u32| format!("$(dd bs=1 count={n} 2>/dev/null | od -An -c | tr -d ' \\n')");
+        let script = format!(
+            "stty -echo -icanon min 1; printf '\\033[?2031h\\033[?996n'; printf 'first:%s;' \"{}\"; \
+             printf '\\033[?2031$p'; printf 'mode:%s;' \"{}\"; printf 'second:%s;' \"{}\"; sleep 1",
+            read(9),
+            read(11),
+            read(9)
+        );
+        let spawn = Spawn {
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), script],
+            cwd: Some(PathBuf::from("/tmp")),
+            env: HashMap::new(),
+        };
+        let Ok(mut term) = Terminal::spawn(spawn, 80, 8) else {
+            return;
+        };
+        let mut wait_for = |p: &Palette, what: &str| {
+            let mut text = String::new();
+            for _ in 0..150 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                term.snapshot(p, true);
+                text = term
+                    .last()
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.runs.iter().map(|run| run.text.as_str()))
+                    .collect();
+                if text.contains(what) {
+                    break;
+                }
+            }
+            text
+        };
+        let dark = palette();
+        let text = wait_for(&dark, "mode:");
+        assert!(text.contains("first:033[?997;1n;"), "{text:?}");
+        assert!(text.contains("mode:033[?2031;1$y;"), "{text:?}");
+        let light = Palette { bg: 0xffffff, ..dark };
+        let text = wait_for(&light, "second:");
+        assert!(text.contains("second:033[?997;2n;"), "{text:?}");
+    }
+
+    /// The shell's marks, through a real PTY: each prompt's row carries its
+    /// block, the table has the command and its status, the output reads
+    /// back, and jumping moves between prompts.
+    #[test]
+    fn marked_commands_become_blocks_in_the_grid() {
+        // As a shell does it: the Enter that ran the command is echoed (the
+        // newline) before preexec marks it.
+        let script = r"printf '\033]133;A\007$ echo one\r\n\033]633;E;echo one\007\033]133;C\007one\r\n\033]133;D;0\007'; \
+            printf '\033]133;A\007$ false\r\n\033]633;E;false\007\033]133;C\007two\r\nthree\r\n\033]133;D;1\007'; \
+            printf '\033]133;A\007$ '; sleep 2";
+        let spawn = Spawn {
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), script.into()],
+            cwd: Some(PathBuf::from("/tmp")),
+            env: HashMap::new(),
+        };
+        let Ok(mut term) = Terminal::spawn(spawn, 40, 10) else {
+            return;
+        };
+        let p = palette();
+        for _ in 0..150 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            term.snapshot(&p, true);
+            if term.last().rows.iter().filter(|r| r.block.is_some()).count() >= 3 {
+                break;
+            }
+        }
+        let rows: Vec<Option<u64>> = term.last().rows.iter().map(|r| r.block).collect();
+        assert_eq!(&rows[..6], &[Some(1), None, Some(2), None, None, Some(3)], "rows: {rows:?}");
+        let first = term.block(1).unwrap();
+        assert_eq!(first.command.as_deref(), Some("echo one"));
+        assert_eq!(first.exit, Some(0));
+        let second = term.block(2).unwrap();
+        assert_eq!((second.command.as_deref(), second.exit), (Some("false"), Some(1)));
+        assert!(term.block(3).unwrap().started.is_none());
+        assert_eq!(term.block_output(2).as_deref(), Some("two\nthree"));
+        assert_eq!(term.block_output(1).as_deref(), Some("one"));
+        // Nothing hidden on screen: every char the program printed is there.
+        let text: String = term.last().rows[2].runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(text.starts_with("$ "), "{text:?}");
+    }
+
+    #[test]
+    fn history_comes_back_with_its_colours() {
+        let spawn = Spawn {
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), r"printf 'plain\r\n\033[1;31mred\033[0m and \033[38;2;1;2;3mrgb\033[0m\r\n'; sleep 2".into()],
+            cwd: Some(PathBuf::from("/tmp")),
+            env: HashMap::new(),
+        };
+        let Ok(mut term) = Terminal::spawn(spawn, 30, 6) else {
+            return;
+        };
+        let p = palette();
+        let mut text = String::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            term.snapshot(&p, true);
+            text = term.history_ansi(100).unwrap_or_default();
+            if text.contains("rgb") {
+                break;
+            }
+        }
+        assert!(text.starts_with("plain\r\n"), "{text:?}");
+        assert!(text.contains("\x1b[0;1;31mred\x1b[0m and \x1b[0;38;2;1;2;3mrgb\x1b[0m\r\n"), "{text:?}");
     }
 
     #[test]
