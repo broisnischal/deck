@@ -9,6 +9,7 @@ name = "deck"
 path = "src/main.rs"
 
 [dependencies]
+smol_str.workspace = true
 term.workspace = true
 agent-core.workspace = true
 agent-claude.workspace = true
@@ -31,3 +32,6 @@ objc2-core-graphics = "0.3"
 block2 = "0.6"
 objc2 = "0.6"
 objc2-user-notifications = "0.3"
+# Code colouring in chats: bat's grammars, on a pure-Rust regex engine.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }

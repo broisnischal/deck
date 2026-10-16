@@ -54,11 +54,38 @@ const TOOLS: &[Tool] = &[
         &[],
     ),
     (
+        "deck_run",
+        "pane.run",
+        "Run a command in a terminal split beside you that the user can watch live: a dev server, a watcher, tests. Give it a name (dev, test) and running it again reuses that pane (Ctrl-C, then the command). Then deck_wait for it to be ready and deck_read with lines for its logs.",
+        || {
+            json!({
+                "cmd": {"type": "string"},
+                "name": {"type": "string", "description": "a short handle for the pane, e.g. dev"},
+                "dir": {"type": "string", "enum": ["right", "down"]},
+                "cwd": {"type": "string"}
+            })
+        },
+        &["cmd"],
+    ),
+    (
+        "deck_wait",
+        "pane.wait",
+        "Wait until a terminal pane prints some text (alternatives separated by |, e.g. \"ready|Local:|error\"). Returns the matching line, or an error with the pane's last lines on timeout.",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "for": {"type": "string"},
+                "timeout": {"type": "integer", "description": "seconds, default 120"}
+            })
+        },
+        &["for"],
+    ),
+    (
         "deck_read",
         "pane.read",
-        "Read what a pane shows: a terminal's screen and recent scrollback, a page's text, or a chat's messages.",
-        || json!({"pane": {"type": "integer"}}),
-        &["pane"],
+        "Read what a pane shows: a terminal's screen and recent scrollback, a page's text, or a chat's messages. For a terminal, lines gives just its last N lines (logs).",
+        || json!({"pane": {"type": "integer"}, "name": {"type": "string"}, "lines": {"type": "integer"}}),
+        &[],
     ),
     (
         "deck_send",
@@ -90,16 +117,146 @@ const TOOLS: &[Tool] = &[
     (
         "deck_open",
         "browser.open",
-        "Open a URL in deck's browser, beside you (or in the given browser pane).",
-        || json!({"url": {"type": "string"}, "pane": {"type": "integer"}}),
+        "Open a URL in deck's browser, beside you (or in the given browser pane). Give it a name (app, docs) and opening that name again navigates the same pane; the other browser tools then take the name. new_tab opens it in a tab of its own.",
+        || {
+            json!({
+                "url": {"type": "string"},
+                "pane": {"type": "integer"},
+                "name": {"type": "string", "description": "a short handle for the page, e.g. app"},
+                "new_tab": {"type": "boolean"}
+            })
+        },
         &["url"],
     ),
     (
         "deck_eval",
         "browser.eval",
-        "Run JavaScript in a browser pane's page and get its result (document.title, the text of an element, whether a selector exists).",
-        || json!({"pane": {"type": "integer"}, "js": {"type": "string"}}),
-        &["pane", "js"],
+        "Run JavaScript in a browser pane's page and get its result (document.title, the text of an element, whether a selector exists). Without pane or name it is the page in your tab.",
+        || json!({"pane": {"type": "integer"}, "name": {"type": "string"}, "js": {"type": "string"}}),
+        &["js"],
+    ),
+    (
+        "deck_browser_snapshot",
+        "browse.snapshot",
+        "Read a page the way you would use it: its title, headings, and its visible links, buttons and fields, each numbered [N] with its name, value and state. Use the numbers with deck_click and deck_type. Take a new one after the page changes.",
+        || json!({"pane": {"type": "integer"}, "name": {"type": "string"}}),
+        &[],
+    ),
+    (
+        "deck_click",
+        "browse.click",
+        "Click something on a page: a [N] from deck_browser_snapshot, text=Some text (the control that says it), or a CSS selector. Waits for a navigation it starts. Dialogs it raises are answered OK unless dismiss is set; they are in the result.",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "target": {"type": "string", "description": "3, text=Sign in, or a CSS selector"},
+                "dismiss": {"type": "boolean", "description": "cancel confirm/prompt dialogs instead of accepting them"}
+            })
+        },
+        &["target"],
+    ),
+    (
+        "deck_type",
+        "browse.type",
+        "Type into a field on a page (a [N] from deck_browser_snapshot, text=its label, or a CSS selector), replacing its text unless append. A <select> picks the option with that value or text. enter presses Enter after (submits a form).",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "target": {"type": "string"}, "text": {"type": "string"},
+                "enter": {"type": "boolean"}, "append": {"type": "boolean"}
+            })
+        },
+        &["target", "text"],
+    ),
+    (
+        "deck_press_key",
+        "browse.key",
+        "Press a key in a page, sent to whatever has focus: Enter, Escape, Tab, Shift+Tab, ArrowDown, Backspace, PageDown, or one character.",
+        || json!({"pane": {"type": "integer"}, "name": {"type": "string"}, "key": {"type": "string"}}),
+        &["key"],
+    ),
+    (
+        "deck_scroll",
+        "browse.scroll",
+        "Scroll a page: up, down, top, bottom, or to a target ([N], text=…, or a CSS selector).",
+        || json!({"pane": {"type": "integer"}, "name": {"type": "string"}, "to": {"type": "string"}}),
+        &[],
+    ),
+    (
+        "deck_browser_nav",
+        "browse.nav",
+        "Go back, forward, or reload a page, and wait for it to load.",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "action": {"type": "string", "enum": ["back", "forward", "reload"]}
+            })
+        },
+        &["action"],
+    ),
+    (
+        "deck_browser_wait",
+        "browse.wait",
+        "Wait until a page shows some text (alternatives separated by |, any case) or a CSS selector matches something visible; with gone, until it no longer does. Errors on timeout with the page's title and address.",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "for": {"type": "string"}, "selector": {"type": "string"},
+                "gone": {"type": "boolean"},
+                "timeout": {"type": "integer", "description": "seconds, default 30"}
+            })
+        },
+        &[],
+    ),
+    (
+        "deck_console",
+        "browse.console",
+        "A page's console: its log lines, uncaught errors and rejections, dialogs and navigations, oldest first, numbered by seq. kind errors gives just errors (console.error, uncaught, failed or >= 400 requests). Pass the last_seq you got as since to see only what is new.",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "kind": {"type": "string", "enum": ["console", "errors", "network", "all"]},
+                "since": {"type": "integer"}, "limit": {"type": "integer"},
+                "failed": {"type": "boolean"},
+                "filter": {"type": "string", "description": "only entries whose url or text has this"},
+                "clear": {"type": "boolean"}
+            })
+        },
+        &[],
+    ),
+    (
+        "deck_network",
+        "browse.network",
+        "A page's network requests: fetch and XHR calls with method, status, time, and request and response bodies (clipped to 2 KB), plus scripts, styles, images and the document. failed gives only failed or >= 400 requests. Pass last_seq back as since for what is new.",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "since": {"type": "integer"}, "limit": {"type": "integer"},
+                "failed": {"type": "boolean"}, "filter": {"type": "string"},
+                "clear": {"type": "boolean"}
+            })
+        },
+        &[],
+    ),
+    (
+        "deck_browser_dialog",
+        "browser.dialog",
+        "The alert, confirm, prompt or login box a page has up (a page with one runs nothing until it is answered), or with action, its answer: accept (with text for a prompt, user and password for a login) or dismiss.",
+        || {
+            json!({
+                "pane": {"type": "integer"}, "name": {"type": "string"},
+                "action": {"type": "string", "enum": ["accept", "dismiss"]},
+                "text": {"type": "string"}, "user": {"type": "string"}, "password": {"type": "string"}
+            })
+        },
+        &[],
+    ),
+    (
+        "deck_browser_shot",
+        "browser.shot",
+        "See one page as it is on screen now: an image of just that browser pane.",
+        || json!({"pane": {"type": "integer"}, "name": {"type": "string"}}),
+        &[],
     ),
     (
         "deck_task_new",
@@ -214,7 +371,7 @@ fn handle(method: &str, params: &Value) -> Result<Value, (i64, String)> {
                 .unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "deck", "version": crate::updates::VERSION},
-            "instructions": "Tools that drive the deck window this agent runs in: terminals, pages, chats and sub-agent tasks. Pane ids come from deck_panes."
+            "instructions": "Tools that drive the deck window this agent runs in: terminals, pages, chats and sub-agent tasks. Pane ids come from deck_panes. To work in a web page: deck_open it (with a name), deck_browser_snapshot to read it, deck_click and deck_type with the snapshot's [N] numbers, deck_browser_wait for what should appear, and deck_console and deck_network for what it logged, threw and fetched."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(
@@ -242,8 +399,45 @@ fn handle(method: &str, params: &Value) -> Result<Value, (i64, String)> {
 /// Run one tool through the control socket; a failure is the tool's
 /// answer (`isError`), not a protocol error, so the agent can read it.
 fn call(rpc: &str, args: Value) -> Value {
-    if rpc == "window.shot" {
-        return screenshot();
+    if rpc == "window.shot" || rpc == "browser.shot" {
+        return screenshot(rpc, args);
+    }
+    if let Some(verb) = rpc.strip_prefix("browse.") {
+        let r = match verb {
+            "console" | "network" => {
+                let mut a = args;
+                if verb == "network" || a.get("kind").is_none() {
+                    a["kind"] = verb.into();
+                }
+                crate::control::call("browser.logs", a)
+            }
+            "nav" => match args.get("action").and_then(Value::as_str) {
+                Some(a @ ("back" | "forward" | "reload")) => {
+                    let a = a.to_string();
+                    crate::browse::run(&a, args)
+                }
+                _ => Err("action is back, forward or reload".into()),
+            },
+            v => crate::browse::run(v, args),
+        };
+        return match r {
+            Ok(v) => json!({"content": [{"type": "text", "text": pretty(&v)}]}),
+            Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
+        };
+    }
+    if rpc == "pane.wait" {
+        let want = args.get("for").and_then(Value::as_str).unwrap_or_default().to_string();
+        let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(120).min(1800);
+        let mut target = json!({});
+        for k in ["pane", "name"] {
+            if let Some(v) = args.get(k) {
+                target[k] = v.clone();
+            }
+        }
+        return match crate::cli::wait_text(target, &want, timeout) {
+            Ok(v) => json!({"content": [{"type": "text", "text": pretty(&v)}]}),
+            Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
+        };
     }
     match crate::control::call(rpc, args) {
         Ok(v) => json!({"content": [{"type": "text", "text": pretty(&v)}]}),
@@ -255,11 +449,16 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
-/// The window as an image, scaled to at most 1600 px so it costs the agent a
-/// sensible number of tokens.
-fn screenshot() -> Value {
+/// The window (`window.shot`) or one page (`browser.shot`) as an image,
+/// scaled to at most 1600 px so it costs the agent a sensible number of
+/// tokens.
+fn screenshot(rpc: &str, mut args: Value) -> Value {
     let path = std::env::temp_dir().join(format!("deck-mcp-shot-{}.png", std::process::id()));
-    let shot = crate::control::call("window.shot", json!({ "out": path }));
+    if !args.is_object() {
+        args = json!({});
+    }
+    args["out"] = json!(path);
+    let shot = crate::control::call(rpc, args);
     if let Err(e) = shot {
         return json!({"content": [{"type": "text", "text": e.to_string()}], "isError": true});
     }
@@ -330,7 +529,40 @@ mod tests {
         let tools = list["tools"].as_array().unwrap();
         assert_eq!(tools.len(), TOOLS.len());
         let read = tools.iter().find(|t| t["name"] == "deck_read").unwrap();
-        assert_eq!(read["inputSchema"]["required"], json!(["pane"]));
+        assert_eq!(read["inputSchema"]["required"], json!([]));
+        let run = tools.iter().find(|t| t["name"] == "deck_run").unwrap();
+        assert_eq!(run["inputSchema"]["required"], json!(["cmd"]));
+        for name in [
+            "deck_browser_snapshot",
+            "deck_click",
+            "deck_type",
+            "deck_press_key",
+            "deck_browser_wait",
+            "deck_console",
+            "deck_network",
+            "deck_browser_shot",
+        ] {
+            let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}"));
+            // Every page tool can name its pane either way.
+            assert_eq!(t["inputSchema"]["properties"]["pane"]["type"], "integer", "{name}");
+            assert_eq!(t["inputSchema"]["properties"]["name"]["type"], "string", "{name}");
+        }
+        let click = tools.iter().find(|t| t["name"] == "deck_click").unwrap();
+        assert_eq!(click["inputSchema"]["required"], json!(["target"]));
+        let open = tools.iter().find(|t| t["name"] == "deck_open").unwrap();
+        assert_eq!(open["inputSchema"]["properties"]["new_tab"]["type"], "boolean");
+        assert_eq!(open["inputSchema"]["properties"]["name"]["type"], "string");
+        // Every required field is one the tool describes.
+        for t in tools {
+            for r in t["inputSchema"]["required"].as_array().unwrap() {
+                assert!(t["inputSchema"]["properties"].get(r.as_str().unwrap()).is_some(), "{}", t["name"]);
+            }
+        }
+        let names: std::collections::HashSet<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), tools.len());
+        // A bad action is the tool's answer, not a protocol error.
+        let nav = call("browse.nav", json!({"action": "sideways"}));
+        assert_eq!(nav["isError"], true);
         assert!(handle("tools/call", &json!({"name": "nope"})).is_err());
         assert_eq!(handle("bogus", &Value::Null).unwrap_err().0, -32601);
     }

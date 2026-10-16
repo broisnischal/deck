@@ -4,10 +4,13 @@
 //! `deck pane list` (and friends), run from a terminal inside it, drives it.
 
 mod account;
+mod browse;
 mod browser;
 mod chat;
 mod checkpoint;
 mod cli;
+mod code;
+mod complete;
 mod control;
 mod favicon;
 mod field;
@@ -19,6 +22,7 @@ mod inspect;
 mod inspector;
 mod keys;
 mod launcher;
+mod local;
 mod lock;
 mod markdown;
 mod mcp;
@@ -34,14 +38,17 @@ mod select;
 mod session;
 mod settings;
 mod settings_pane;
+mod shell;
 mod shot;
 mod snippets;
+mod syntax;
 mod tasks;
 mod terminal;
 mod textbuf;
 mod theme;
 mod threads;
 mod updates;
+mod usage;
 mod workspace;
 
 use gpui::prelude::*;
@@ -75,6 +82,9 @@ fn main() {
     // terminal) open in new tabs; the window picks them up when it exists.
     app.on_open_urls(handler::opened);
     app.run(move |cx: &mut App| {
+        theme::add_fonts(cx);
+        let skill = settings::load().agent_skill;
+        std::thread::spawn(move || shell::install_skill(skill));
         workspace::install(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

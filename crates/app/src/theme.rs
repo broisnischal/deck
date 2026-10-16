@@ -3,8 +3,9 @@
 //! the terminal's own palette, and the appearance of native views (pages,
 //! traffic lights, scrollbars).
 //!
-//! Every theme is monochrome: hierarchy comes from lightness alone, and
-//! colour is left to content (terminal output, web pages). Edges are drawn in
+//! Every theme is quiet: hierarchy comes from lightness alone, and colour is
+//! left to content (terminal output, web pages). A theme may carry one
+//! accent, kept to the caret, focus and selection. Edges are drawn in
 //! translucent text colour, so they sit right on any surface.
 
 use serde::{Deserialize, Serialize};
@@ -24,13 +25,24 @@ pub enum Theme {
     Light,
     /// Black or Light, following the system's appearance.
     System,
+    /// True black for OLED: #000 everywhere, cards drawn by their edges,
+    /// white for the caret.
+    Obsidian,
+    /// A soft, warm black with one amber accent.
+    Carbon,
+    /// A deep blue-black with one cyan accent.
+    Abyss,
 }
 
 impl Theme {
-    pub const ALL: [Theme; 5] = [
+    /// In the order Settings shows them: System, then dark to light.
+    pub const ALL: [Theme; 8] = [
         Theme::System,
+        Theme::Obsidian,
         Theme::Black,
+        Theme::Carbon,
         Theme::Graphite,
+        Theme::Abyss,
         Theme::Midnight,
         Theme::Light,
     ];
@@ -42,6 +54,9 @@ impl Theme {
             Theme::Midnight => "Midnight",
             Theme::Light => "Light",
             Theme::System => "System",
+            Theme::Obsidian => "Obsidian",
+            Theme::Carbon => "Carbon",
+            Theme::Abyss => "Abyss",
         }
     }
 
@@ -58,6 +73,9 @@ impl Theme {
             Theme::Light => 3,
             Theme::System if system_dark => 0,
             Theme::System => 3,
+            Theme::Obsidian => 4,
+            Theme::Carbon => 5,
+            Theme::Abyss => 6,
         }
     }
 }
@@ -81,6 +99,8 @@ pub struct Colors {
     /// Focus, carets, the cursor: the one emphasis colour.
     pub accent: u32,
     pub selection: u32,
+    /// Fill behind the terminal's find matches; the current one is the accent.
+    pub search: u32,
     /// Structural edges (cards, panes), RGBA.
     pub hairline: u32,
     /// The edge of something you type into, RGBA.
@@ -110,7 +130,26 @@ const LIGHT_ANSI: [u32; 16] = [
     0xd1242f, 0x1f883d, 0xb08800, 0x0969da, 0x8a63d2, 0x3192aa, 0x8c959f,
 ];
 
-static ALL: [Colors; 4] = [
+/// Clean, saturated hues that hold on pure black, every one 7:1 or better.
+const OBSIDIAN_ANSI: [u32; 16] = [
+    0x262626, 0xfe6b6b, 0x5ddb8b, 0xf4cf5a, 0x5ea3fd, 0xd28ae8, 0x5ed8e8, 0xc6c6c6, 0x636363,
+    0xfe9b97, 0x9beeb3, 0xfbe194, 0x8dbdfe, 0xe2aef2, 0x9eedf9, 0xffffff,
+];
+
+/// Earthy and soft for the warm black: terracotta, sage, wheat, slate, rose,
+/// sea glass.
+const CARBON_ANSI: [u32; 16] = [
+    0x35322f, 0xe97e6e, 0x9cc779, 0xeec46e, 0x7db1dd, 0xd891b9, 0x80cbc3, 0xc1bdb7, 0x746d67,
+    0xf6998a, 0xb5da98, 0xffdb93, 0x99c5eb, 0xe7a9cc, 0x9fded7, 0xf6f3ef,
+];
+
+/// Cool and luminous for the blue-black: rose, mint, periwinkle, lavender, sky.
+const ABYSS_ANSI: [u32; 16] = [
+    0x232c38, 0xf37984, 0x67dba7, 0xf3cc75, 0x78a7fc, 0xc49cf1, 0x75d7f3, 0xb4bfca, 0x5e6d80,
+    0xfc9aa1, 0x98edc3, 0xfedf9e, 0x9bbffe, 0xd6b8fb, 0xa7eafe, 0xf0f4f9,
+];
+
+static ALL: [Colors; 7] = [
     // Black
     Colors {
         dark: true,
@@ -126,6 +165,7 @@ static ALL: [Colors; 4] = [
         dim: 0x737373,
         accent: 0xffffff,
         selection: 0x3a3a3a,
+        search: 0x575757,
         hairline: 0xffffff0f,
         input_edge: 0xffffff1a,
         focus_edge: 0xffffff29,
@@ -150,6 +190,7 @@ static ALL: [Colors; 4] = [
         dim: 0x8e8e93,
         accent: 0xffffff,
         selection: 0x4c4c51,
+        search: 0x575757,
         hairline: 0xffffff12,
         input_edge: 0xffffff1f,
         focus_edge: 0xffffff33,
@@ -174,6 +215,7 @@ static ALL: [Colors; 4] = [
         dim: 0x76809a,
         accent: 0xffffff,
         selection: 0x313b55,
+        search: 0x575757,
         hairline: 0xffffff10,
         input_edge: 0xffffff1c,
         focus_edge: 0xffffff2e,
@@ -198,6 +240,7 @@ static ALL: [Colors; 4] = [
         dim: 0x76767b,
         accent: 0x000000,
         selection: 0xcfcfd4,
+        search: 0xc8c8cc,
         hairline: 0x0000001a,
         input_edge: 0x00000026,
         focus_edge: 0x00000040,
@@ -206,6 +249,81 @@ static ALL: [Colors; 4] = [
         menu: 0xffffff,
         tint: 0x0000000a,
         ansi: LIGHT_ANSI,
+    },
+    // Obsidian
+    Colors {
+        dark: true,
+        sidebar: 0x000000,
+        pane: 0x000000,
+        raised: 0x0a0a0a,
+        surface: 0x1a1a1a,
+        surface_hover: 0x242424,
+        row_hover: 0x101010,
+        border: 0x1c1c1c,
+        text: 0xf0f0f0,
+        text_2: 0xa1a1a1,
+        dim: 0x777777,
+        accent: 0xffffff,
+        selection: 0x343434,
+        search: 0x525252,
+        hairline: 0xffffff17,
+        input_edge: 0xffffff24,
+        focus_edge: 0xffffff38,
+        strong_edge: 0xffffff40,
+        veil: 0x00000059,
+        menu: 0x0f0f0f,
+        tint: 0xffffff0f,
+        ansi: OBSIDIAN_ANSI,
+    },
+    // Carbon
+    Colors {
+        dark: true,
+        sidebar: 0x0f0e0c,
+        pane: 0x161513,
+        raised: 0x1c1b18,
+        surface: 0x282624,
+        surface_hover: 0x312f2c,
+        row_hover: 0x1f1d1b,
+        border: 0x262422,
+        text: 0xece9e4,
+        text_2: 0xb1aba4,
+        dim: 0x857f78,
+        accent: 0xf3ae5f,
+        selection: 0x4d3c2b,
+        search: 0x5b564f,
+        hairline: 0xece9e412,
+        input_edge: 0xece9e41f,
+        focus_edge: 0xece9e433,
+        strong_edge: 0xece9e438,
+        veil: 0x0000004d,
+        menu: 0x1f1d1b,
+        tint: 0xece9e40f,
+        ansi: CARBON_ANSI,
+    },
+    // Abyss
+    Colors {
+        dark: true,
+        sidebar: 0x04060b,
+        pane: 0x080e16,
+        raised: 0x0d141e,
+        surface: 0x16202d,
+        surface_hover: 0x1d2938,
+        row_hover: 0x0e1620,
+        border: 0x151d29,
+        text: 0xe7ecf1,
+        text_2: 0xa4b1bf,
+        dim: 0x768596,
+        accent: 0x5acdf9,
+        selection: 0x1e3b5a,
+        search: 0x425163,
+        hairline: 0xe7ecf112,
+        input_edge: 0xe7ecf11f,
+        focus_edge: 0xe7ecf133,
+        strong_edge: 0xe7ecf138,
+        veil: 0x00000052,
+        menu: 0x101823,
+        tint: 0xe7ecf10f,
+        ansi: ABYSS_ANSI,
     },
 ];
 
@@ -240,9 +358,6 @@ pub fn surface_hover() -> u32 {
 pub fn row_hover() -> u32 {
     current().row_hover
 }
-pub fn border() -> u32 {
-    current().border
-}
 pub fn text() -> u32 {
     current().text
 }
@@ -254,6 +369,14 @@ pub fn dim() -> u32 {
 }
 pub fn accent() -> u32 {
     current().accent
+}
+
+/// Text that reads on the accent: black on a light one (white, amber,
+/// cyan), white on a dark one.
+pub fn on_accent() -> u32 {
+    let a = accent();
+    let luma = 0.299 * ((a >> 16) & 0xff) as f32 + 0.587 * ((a >> 8) & 0xff) as f32 + 0.114 * (a & 0xff) as f32;
+    if luma > 150. { 0x111111 } else { 0xffffff }
 }
 /// Red for what takes something away (Lock, Delete), readable on every
 /// theme's menu.
@@ -274,9 +397,6 @@ pub fn focus_edge() -> u32 {
 pub fn strong_edge() -> u32 {
     current().strong_edge
 }
-pub fn veil() -> u32 {
-    current().veil
-}
 pub fn menu() -> u32 {
     current().menu
 }
@@ -290,6 +410,40 @@ pub fn is_dark() -> bool {
 /// A theme colour (RGB) at an alpha, for `rgba`.
 pub fn alpha(rgb: u32, a: u8) -> u32 {
     (rgb << 8) | a as u32
+}
+
+/// The terminal's own face, shipped inside Deck, and the default.
+pub const TERM_FONT: &str = "JetBrains Mono";
+
+/// Nerd Font symbols (powerline arrows, file and git icons in prompts),
+/// shipped inside Deck and tried after the chosen face for any glyph it
+/// lacks, then Apple's emoji.
+pub const SYMBOLS_FONT: &str = "Symbols Nerd Font Mono";
+
+/// Make the shipped faces available, before anything draws.
+pub fn add_fonts(cx: &gpui::App) {
+    use std::borrow::Cow;
+    let fonts: Vec<Cow<'static, [u8]>> = vec![
+        Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-Italic.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf")),
+        Cow::Borrowed(include_bytes!("../assets/fonts/SymbolsNerdFontMono-Regular.ttf")),
+    ];
+    if let Err(e) = cx.text_system().add_fonts(fonts) {
+        tracing::warn!("could not load the shipped fonts: {e}");
+    }
+}
+
+/// A terminal face with the symbol and emoji fallbacks behind it.
+pub fn term_font(family: impl Into<gpui::SharedString>) -> gpui::Font {
+    gpui::Font {
+        fallbacks: Some(gpui::FontFallbacks::from_fonts(vec![
+            SYMBOLS_FONT.into(),
+            "Apple Color Emoji".into(),
+        ])),
+        ..gpui::font(family)
+    }
 }
 
 pub const UI: &str = ".SystemUIFont";
@@ -329,7 +483,7 @@ pub fn palette() -> term::Palette {
         fg: c.text,
         bg: c.pane,
         selection: c.selection,
-        search: if c.dark { 0x575757 } else { 0xc8c8cc },
+        search: c.search,
         search_focus: c.accent,
         ansi: c.ansi,
     }
@@ -369,6 +523,58 @@ mod tests {
                 assert!(contrast(c.dim, bg) >= 3.9, "{:06x} on {bg:06x}", c.dim);
             }
         }
+    }
+
+    /// `rgba` laid over `rgb`, as the GPU blends it.
+    fn over(rgba: u32, rgb: u32) -> u32 {
+        let a = (rgba & 0xff) as f64 / 255.;
+        let ch = |s: u32| {
+            let (f, b) = ((rgba >> (s + 8)) & 0xff, (rgb >> s) & 0xff);
+            ((f as f64 * a + b as f64 * (1. - a)).round() as u32) << s
+        };
+        ch(16) | ch(8) | ch(0)
+    }
+
+    #[test]
+    fn selection_matches_and_edges_show_without_shouting() {
+        for c in &ALL {
+            assert!(contrast(c.selection, c.pane) >= 1.5, "{:06x}", c.selection);
+            assert!(contrast(c.text, c.selection) >= 7., "{:06x}", c.selection);
+            assert_ne!(c.search, c.selection);
+            assert!(contrast(c.pane, c.accent) >= 4.5, "{:06x}", c.accent);
+            let edge = contrast(over(c.hairline, c.pane), c.pane);
+            assert!((1.1..1.3).contains(&edge), "{:08x}: {edge:.2}", c.hairline);
+        }
+    }
+
+    #[test]
+    fn dark_terminal_colours_read_on_their_pane() {
+        for c in ALL.iter().filter(|c| c.dark) {
+            for (i, &a) in c.ansi.iter().enumerate() {
+                if i % 8 != 0 {
+                    assert!(contrast(a, c.pane) >= 4.5, "{a:06x} on {:06x}", c.pane);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_theme_is_listed_once_and_keeps_its_name() {
+        for (i, t) in Theme::ALL.iter().enumerate() {
+            assert!(!Theme::ALL[..i].contains(t), "{t:?} twice");
+            let json = serde_json::to_string(t).unwrap();
+            assert_eq!(json, format!("\"{}\"", t.name().to_lowercase()));
+            assert_eq!(serde_json::from_str::<Theme>(&json).unwrap(), *t);
+        }
+        // Each named theme wears its own colours.
+        let mut seen: Vec<u8> = Theme::ALL
+            .iter()
+            .filter(|t| **t != Theme::System)
+            .map(|t| t.index(true))
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), ALL.len());
     }
 
     #[test]

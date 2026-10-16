@@ -22,7 +22,10 @@ use gpui::{
     canvas, div, img, relative, rgb, rgba, AnyElement, Bounds, Context, ElementId, Entity,
     EventEmitter, FontWeight, Image, MouseButton, Pixels, SharedString, Subscription, Task, Window,
 };
+use objc2::rc::Retained;
+use objc2_app_kit::NSView;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +40,9 @@ pub enum BrowserEvent {
     /// The title, address or icon changed: things the sidebar shows.
     Retitled,
     Close,
+    /// The editor asked to open a folder (a worktree) in Deck: as an editor
+    /// (`terminal: false`) or a terminal.
+    OpenFolder { path: PathBuf, terminal: bool },
 }
 
 pub enum Msg {
@@ -53,6 +59,11 @@ pub enum Msg {
     Icon(String),
     DownloadStarted(PathBuf),
     DownloadDone(Option<PathBuf>, bool),
+    /// The editor's `{deck: "open", kind, path}`.
+    OpenFolder(PathBuf, bool),
+    /// The recorder's `{deck: "log", entries}`: console lines, errors and
+    /// requests, each a flat object.
+    Log(Vec<Value>),
 }
 
 /// Safari's own, so sites serve their current code instead of the fallback
@@ -99,6 +110,349 @@ const PAGE_SCRIPT: &str = r#"(() => {
   addEventListener('auxclick', (e) => { if (e.button === 1) tab(e); }, true);
 })();"#;
 
+/// Runs in every web page (not the editor) before its own scripts, and
+/// records what devtools would show an agent: console output, uncaught
+/// errors and rejections, failed loads, `fetch` and XHR calls with their
+/// bodies clipped, other resources, and the document itself. Entries go to
+/// deck in batches over `window.ipc` at most every 200 ms. It keeps the
+/// page's behaviour as it was and never throws into it.
+///
+/// It also logs `alert`, `confirm` and `prompt`, and answers them itself
+/// for a moment after an agent's click or keypress (`window.__deckAct`, set
+/// by `browse.rs`), so a dialog never leaves the agent's call hanging.
+pub(crate) const RECORDER_SCRIPT: &str = r#"(() => {
+  const W = window;
+  if (W.__deckRecorder) return;
+  try { Object.defineProperty(W, '__deckRecorder', { value: true }); } catch (_) { return; }
+  try {
+    const setT = W.setTimeout.bind(W), stringify = JSON.stringify, perf = W.performance;
+    const MAX = 500, BATCH = 100, CLIP = 2048, TEXT = 4096;
+    const q = [];
+    let timer = 0, dropped = 0;
+    const flush = () => {
+      timer = 0;
+      if (dropped) { q.push({ t: 'console', level: 'warn', text: 'deck: ' + dropped + ' log entries dropped' }); dropped = 0; }
+      while (q.length) {
+        const m = stringify({ deck: 'log', entries: q.splice(0, BATCH) });
+        try { W.ipc.postMessage(m); } catch (_) {}
+      }
+    };
+    const push = (e) => {
+      try {
+        if (q.length >= MAX) { q.shift(); dropped++; }
+        q.push(e);
+        if (!timer) timer = setT(flush, 200);
+      } catch (_) {}
+    };
+    W.addEventListener('pagehide', () => { try { flush(); } catch (_) {} }, true);
+    document.addEventListener('visibilitychange', () => {
+      try { if (document.visibilityState === 'hidden') flush(); } catch (_) {}
+    }, true);
+
+    const clip = (s, n) => { s = String(s); return s.length > n ? s.slice(0, n) + '… [' + s.length + ' chars]' : s; };
+    const errText = (e) => {
+      try {
+        const head = (e.name || 'Error') + ': ' + e.message, st = e.stack ? String(e.stack) : '';
+        return st.indexOf(head) === 0 ? st : st ? head + '\n' + st : head;
+      } catch (_) { return String(e); }
+    };
+    const nodeText = (n) => {
+      if (n.nodeType !== 1) return '#' + String(n.nodeName || 'node').toLowerCase().replace(/^#/, '');
+      let s = '<' + n.tagName.toLowerCase();
+      if (n.id) s += '#' + n.id;
+      if (typeof n.className === 'string' && n.className.trim()) s += '.' + n.className.trim().split(/\s+/).join('.');
+      return s + '>';
+    };
+    const isNode = (v) => typeof Node !== 'undefined' && v instanceof Node;
+    const show = (v) => {
+      try {
+        if (typeof v === 'string') return v;
+        if (v === undefined) return 'undefined';
+        if (v === null || typeof v !== 'object' && typeof v !== 'function') return String(v);
+        if (typeof v === 'function') return 'function ' + (v.name || 'anonymous') + '()';
+        if (v instanceof Error) return errText(v);
+        if (isNode(v)) return nodeText(v);
+        const seen = new WeakSet();
+        let budget = 1000;
+        const out = stringify(v, function (k, x) {
+          if (--budget < 0) return undefined;
+          if (typeof x === 'bigint') return x + 'n';
+          if (typeof x === 'function') return 'function ' + (x.name || 'anonymous') + '()';
+          if (x === undefined) return 'undefined';
+          if (x && typeof x === 'object') {
+            if (x instanceof Error) return errText(x);
+            if (isNode(x)) return nodeText(x);
+            if (x instanceof Map) return 'Map(' + x.size + ')';
+            if (x instanceof Set) return 'Set(' + x.size + ')';
+            if (seen.has(x)) return '[Circular]';
+            seen.add(x);
+          }
+          return x;
+        });
+        return out === undefined ? String(v) : out;
+      } catch (_) {
+        try { return String(v); } catch (_) { return '[unprintable]'; }
+      }
+    };
+    const fmt = (args) => {
+      const out = [];
+      let i = 0;
+      if (typeof args[0] === 'string' && args[0].indexOf('%') >= 0) {
+        i = 1;
+        out.push(args[0].replace(/%([sdifoOc%])/g, (m, c) => {
+          if (c === '%') return '%';
+          if (i >= args.length) return m;
+          const a = args[i++];
+          if (c === 'c') return '';
+          if (c === 'd' || c === 'i') return String(parseInt(a, 10));
+          if (c === 'f') return String(parseFloat(a));
+          return show(a);
+        }));
+      }
+      for (; i < args.length; i++) out.push(show(args[i]));
+      return clip(out.join(' '), TEXT);
+    };
+
+    // The console, as the page uses it.
+    const C = W.console;
+    if (C) {
+      for (const level of ['log', 'info', 'warn', 'error', 'debug', 'trace']) {
+        const orig = C[level];
+        if (typeof orig !== 'function') continue;
+        C[level] = function () {
+          try { push({ t: 'console', level: level === 'trace' ? 'log' : level, text: fmt(Array.from(arguments)) }); } catch (_) {}
+          return orig.apply(this, arguments);
+        };
+      }
+      const assert = C.assert;
+      if (typeof assert === 'function') {
+        C.assert = function (ok) {
+          try {
+            if (!ok) {
+              const rest = Array.from(arguments).slice(1);
+              push({ t: 'console', level: 'error', text: 'Assertion failed' + (rest.length ? ': ' + fmt(rest) : '') });
+            }
+          } catch (_) {}
+          return assert.apply(this, arguments);
+        };
+      }
+    }
+
+    // Uncaught errors, and elements that failed to load (capture phase:
+    // those events do not bubble).
+    const failedUrls = new Set();
+    const failedRes = (type, url) => {
+      if (failedUrls.size > 500) failedUrls.clear();
+      failedUrls.add(url);
+      for (const x of q) {
+        if (x.t === 'net' && x.url === url && !x.failed) { x.failed = true; x.error = 'failed to load'; return; }
+      }
+      push({ t: 'net', type, url, failed: true, error: 'failed to load' });
+    };
+    W.addEventListener('error', (ev) => {
+      try {
+        const el = ev.target;
+        if (el && el !== W && el.nodeType === 1) {
+          const url = el.currentSrc || el.src || el.href;
+          if (url && typeof url === 'string') failedRes(el.tagName.toLowerCase(), url);
+          return;
+        }
+        const e = { t: 'error', kind: 'error', text: clip(ev.message || (ev.error ? errText(ev.error) : 'error'), TEXT) };
+        if (ev.filename) e.src = ev.filename + ':' + ev.lineno + ':' + ev.colno;
+        if (ev.error && ev.error.stack) e.stack = clip(String(ev.error.stack), TEXT);
+        push(e);
+      } catch (_) {}
+    }, true);
+    W.addEventListener('unhandledrejection', (ev) => {
+      try {
+        const r = ev.reason;
+        const e = { t: 'error', kind: 'rejection', text: clip('Unhandled rejection: ' + (r instanceof Error ? (r.name || 'Error') + ': ' + r.message : show(r)), TEXT) };
+        if (r && r.stack) e.stack = clip(String(r.stack), TEXT);
+        push(e);
+      } catch (_) {}
+    });
+
+    // fetch and XHR, with their bodies clipped.
+    const ms = (t0) => Math.round(perf.now() - t0);
+    const abs = (u) => { try { return new URL(String(u), location.href).href; } catch (_) { return String(u); } };
+    const textual = (ct) => /json|text|xml|javascript|graphql|form/i.test(ct) && !/event-stream/i.test(ct);
+    const bodyText = (b) => {
+      if (typeof b === 'string') return clip(b, CLIP);
+      const is = (name) => typeof W[name] === 'function' && b instanceof W[name];
+      if (is('URLSearchParams')) return clip(b.toString(), CLIP);
+      if (is('FormData')) return '[FormData]';
+      if (is('Blob')) return '[Blob ' + b.size + ' bytes]';
+      if (is('ArrayBuffer') || (typeof ArrayBuffer === 'function' && ArrayBuffer.isView(b))) return '[binary ' + b.byteLength + ' bytes]';
+      if (is('ReadableStream')) return '[stream]';
+      if (is('Document')) return '[Document]';
+      return '[' + Object.prototype.toString.call(b).slice(8, -1) + ']';
+    };
+    const failure = (e, err, t0) => {
+      e.failed = true;
+      e.error = clip(String((err && err.message) || err), 300);
+      if (err && err.name === 'AbortError') e.aborted = true;
+      e.ms = ms(t0);
+      push(e);
+    };
+    // The start of a response's body, read from a copy and then let go.
+    const peek = (res) => new Promise((resolve) => {
+      let over = false;
+      const end = (v) => { if (!over) { over = true; resolve(v); } };
+      setT(() => end(null), 3000);
+      try {
+        const c = res.clone();
+        if (c.body && c.body.getReader && typeof TextDecoder === 'function') {
+          const rd = c.body.getReader(), dec = new TextDecoder();
+          let s = '';
+          const pump = () => rd.read().then((r) => {
+            if (r.value) s += dec.decode(r.value, { stream: !r.done });
+            if (r.done || s.length > CLIP || over) {
+              if (!r.done) { try { rd.cancel(); } catch (_) {} }
+              end(s.length > CLIP || !r.done ? s.slice(0, CLIP) + '…' : s);
+              return;
+            }
+            return pump();
+          }, () => end(s ? s.slice(0, CLIP) : null));
+          pump();
+        } else {
+          c.text().then((t) => end(clip(t, CLIP)), () => end(null));
+        }
+      } catch (_) { end(null); }
+    });
+    const ofetch = W.fetch;
+    if (typeof ofetch === 'function') {
+      W.fetch = function (input, init) {
+        const t0 = perf.now();
+        const e = { t: 'net', type: 'fetch', method: 'GET', url: '' };
+        try {
+          const req = typeof Request === 'function' && input instanceof Request;
+          e.url = abs(req ? input.url : input);
+          e.method = String((init && init.method) || (req && input.method) || 'GET').toUpperCase();
+          if (init && init.body != null) e.req = bodyText(init.body);
+        } catch (_) {}
+        let p;
+        try { p = ofetch.apply(this, arguments); } catch (err) { failure(e, err, t0); throw err; }
+        try {
+          p.then((res) => {
+            try {
+              e.status = res.status;
+              e.ms = ms(t0);
+              const ct = (res.headers && res.headers.get('content-type')) || '';
+              if (ct) e.ctype = ct;
+              if (res.redirected && res.url) e.final = res.url;
+              if (res.type === 'opaque' || res.type === 'opaqueredirect') { e.opaque = true; push(e); return; }
+              if (textual(ct) && res.body !== null) {
+                peek(res).then((t) => { if (t != null) e.res = t; push(e); });
+              } else {
+                push(e);
+              }
+            } catch (_) { push(e); }
+          }, (err) => failure(e, err, t0));
+        } catch (_) {}
+        return p;
+      };
+    }
+    const X = W.XMLHttpRequest && W.XMLHttpRequest.prototype;
+    if (X && typeof X.open === 'function' && typeof X.send === 'function') {
+      const xopen = X.open, xsend = X.send, pending = new WeakMap();
+      X.open = function (method, url) {
+        try { pending.set(this, { t: 'net', type: 'xhr', method: String(method || 'GET').toUpperCase(), url: abs(url) }); } catch (_) {}
+        return xopen.apply(this, arguments);
+      };
+      X.send = function (body) {
+        try {
+          const x = this, e = pending.get(x);
+          if (e) {
+            pending.delete(x);
+            const t0 = perf.now();
+            if (body != null) e.req = bodyText(body);
+            let why = '';
+            for (const k of ['abort', 'timeout', 'error']) x.addEventListener(k, () => { why = k; }, { once: true });
+            x.addEventListener('loadend', () => {
+              try {
+                e.ms = ms(t0);
+                e.status = x.status;
+                const ct = x.getResponseHeader('content-type') || '';
+                if (ct) e.ctype = ct;
+                if (!x.status) {
+                  e.failed = true;
+                  e.error = why === 'abort' ? 'aborted' : why || 'network error';
+                  if (why === 'abort') e.aborted = true;
+                } else if (textual(ct)) {
+                  const rt = x.responseType;
+                  if (rt === '' || rt === 'text') e.res = clip(x.responseText, CLIP);
+                  else if (rt === 'json') e.res = clip(stringify(x.response), CLIP);
+                }
+                push(e);
+              } catch (_) {}
+            }, { once: true });
+          }
+        } catch (_) {}
+        return xsend.apply(this, arguments);
+      };
+    }
+
+    // Everything else the page loads (fetch and XHR are covered above).
+    const resource = (en) => {
+      try {
+        if (en.initiatorType === 'fetch' || en.initiatorType === 'xmlhttprequest' || failedUrls.has(en.name)) return;
+        const e = { t: 'net', type: en.initiatorType || 'other', url: en.name, ms: Math.max(0, Math.round(en.duration)) };
+        if (en.transferSize) e.size = en.transferSize;
+        if (en.responseStatus) e.status = en.responseStatus;
+        push(e);
+      } catch (_) {}
+    };
+    try {
+      const po = new PerformanceObserver((list) => { for (const en of list.getEntries()) resource(en); });
+      try { po.observe({ type: 'resource', buffered: true }); } catch (_) { po.observe({ entryTypes: ['resource'] }); }
+    } catch (_) {}
+    W.addEventListener('load', () => setT(() => {
+      try {
+        const n = perf.getEntriesByType && perf.getEntriesByType('navigation')[0];
+        const e = { t: 'net', type: 'document', method: 'GET', url: (n && n.name) || location.href };
+        if (n) {
+          e.ms = Math.round(n.duration || 0);
+          if (n.responseStatus) e.status = n.responseStatus;
+          if (n.transferSize) e.size = n.transferSize;
+        }
+        push(e);
+      } catch (_) {}
+    }, 0));
+
+    // Dialogs: logged, and answered for an agent while its action runs.
+    for (const kind of ['alert', 'confirm', 'prompt']) {
+      const orig = W[kind];
+      if (typeof orig !== 'function') continue;
+      W[kind] = function (message, value) {
+        const e = { t: 'dialog', kind, text: clip(message === undefined ? '' : String(message), TEXT) };
+        const act = W.__deckAct;
+        if (act && act.until > Date.now()) {
+          const r = kind === 'alert' ? undefined
+            : kind === 'confirm' ? !!act.accept
+            : !act.accept ? null
+            : act.prompt != null ? String(act.prompt) : value === undefined ? '' : String(value);
+          e.answer = kind === 'alert' ? 'ok' : r;
+          e.auto = true;
+          push(e);
+          try { act.dialogs.push({ kind, text: e.text, answer: e.answer }); } catch (_) {}
+          return r;
+        }
+        const r = orig.apply(this, arguments);
+        if (kind !== 'alert') e.answer = r;
+        push(e);
+        return r;
+      };
+    }
+
+    push({ t: 'page', url: location.href });
+  } catch (_) {}
+})();"#;
+
+/// The most entries one `{deck: "log"}` message may carry, and how many a
+/// pane keeps.
+const LOG_BATCH: usize = 200;
+const LOG_KEEP: usize = 2000;
+
 const PAGE_TEXT: &str =
     "document.title + '\\n' + location.href + '\\n\\n' + (document.body ? document.body.innerText : '')";
 
@@ -131,7 +485,141 @@ fn parse_ipc(body: &str) -> Option<Msg> {
     if let Some(url) = body.strip_prefix("tab:") {
         return is_web(url).then(|| Msg::LinkTab(url.to_string()));
     }
+    // A recorder batch is at most 100 entries of a few KB; anything far
+    // past that is not one.
+    if body.starts_with('{') && body.len() <= 4 << 20 {
+        let v: serde_json::Value = serde_json::from_str(body).ok()?;
+        match v.get("deck")?.as_str()? {
+            // The editor's requests; heeded only when this pane is the editor.
+            "open" => {
+                let path = PathBuf::from(v.get("path")?.as_str()?);
+                let terminal = v.get("kind").and_then(|k| k.as_str()) == Some("terminal");
+                return path.is_absolute().then_some(Msg::OpenFolder(path, terminal));
+            }
+            // Any page may log, so what it sends is trimmed to flat,
+            // bounded entries.
+            "log" => {
+                let entries: Vec<Value> = v
+                    .get("entries")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(log_entry)
+                    .take(LOG_BATCH)
+                    .collect();
+                return (!entries.is_empty()).then_some(Msg::Log(entries));
+            }
+            _ => {}
+        }
+    }
     None
+}
+
+/// One recorded entry as kept: an object of at most 16 plain fields, each
+/// string clipped to 4 KB. `None` for anything that is not an object.
+fn log_entry(v: &Value) -> Option<Value> {
+    const FIELD: usize = 4096;
+    let mut out = serde_json::Map::new();
+    for (k, v) in v.as_object()?.iter().take(16) {
+        if k.len() > 32 || k == "seq" || k == "at" {
+            continue;
+        }
+        let v = match v {
+            Value::String(s) if s.len() > FIELD => {
+                let mut end = FIELD;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                Value::String(format!("{}…", &s[..end]))
+            }
+            Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => v.clone(),
+            _ => continue,
+        };
+        out.insert(k.clone(), v);
+    }
+    out.get("t").and_then(Value::as_str)?;
+    Some(Value::Object(out))
+}
+
+/// What `browser.logs` reads: entries after `since` of one `kind`, the
+/// last `limit` of them.
+pub struct LogQuery {
+    pub kind: LogKind,
+    pub since: u64,
+    pub limit: usize,
+    pub failed: bool,
+    pub filter: Option<String>,
+    pub clear: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LogKind {
+    All,
+    /// Console lines, uncaught errors, dialogs and page markers.
+    Console,
+    Network,
+    /// Uncaught errors, `console.error`, and failed or >= 400 requests.
+    Errors,
+}
+
+impl LogQuery {
+    pub fn from_params(p: &Value) -> Result<Self, String> {
+        let num = |k: &str| {
+            p.get(k)
+                .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
+        };
+        let flag = |k: &str| {
+            p.get(k)
+                .is_some_and(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+        };
+        let kind = match p.get("kind").and_then(Value::as_str).unwrap_or("all") {
+            "all" | "logs" => LogKind::All,
+            "console" => LogKind::Console,
+            "network" | "net" => LogKind::Network,
+            "errors" | "error" => LogKind::Errors,
+            k => return Err(format!("kind is console, network, errors or all, got {k:?}")),
+        };
+        Ok(Self {
+            kind,
+            since: num("since").unwrap_or(0),
+            limit: num("limit").unwrap_or(100).clamp(1, 1000) as usize,
+            failed: flag("failed"),
+            filter: p
+                .get("filter")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(str::to_lowercase),
+            clear: flag("clear"),
+        })
+    }
+
+    fn wants(&self, e: &Value) -> bool {
+        let t = e.get("t").and_then(Value::as_str).unwrap_or("");
+        let failed = t == "net"
+            && (e.get("failed").and_then(Value::as_bool).unwrap_or(false)
+                || e.get("status").and_then(Value::as_u64).is_some_and(|s| s >= 400));
+        let kind = match self.kind {
+            LogKind::All => true,
+            LogKind::Console => matches!(t, "console" | "error" | "page" | "nav" | "dialog"),
+            LogKind::Network => t == "net",
+            LogKind::Errors => {
+                t == "error"
+                    || failed
+                    || (t == "console" && e.get("level").and_then(Value::as_str) == Some("error"))
+            }
+        };
+        if !kind || (self.failed && !failed) {
+            return false;
+        }
+        match &self.filter {
+            None => true,
+            Some(f) => ["url", "text"].iter().any(|k| {
+                e.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_lowercase().contains(f))
+            }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -172,6 +660,16 @@ struct Download {
 
 pub struct BrowserPane {
     webview: wry::WebView,
+    /// The view the webview fills, placed where the pane is. Dropped after
+    /// the webview, which takes itself out of it first.
+    host: Option<Host>,
+    /// What the page logged and fetched (see `RECORDER_SCRIPT`), oldest
+    /// first. It outlives navigations.
+    logs: VecDeque<Value>,
+    log_seq: u64,
+    /// Set when this pane is Deck's code editor (see `code.rs`): the page
+    /// may then use the editor API.
+    code: crate::code::Shared,
     pub url: SharedString,
     pub title: SharedString,
     pub loading: bool,
@@ -191,7 +689,6 @@ pub struct BrowserPane {
     /// hidden and the pane shows black instead of WebKit's white.
     revealed: bool,
     shown: bool,
-    dimmed: bool,
     /// Something floats over the window (the command palette) that a
     /// native view would cover.
     covered: bool,
@@ -233,15 +730,23 @@ impl BrowserPane {
     /// The fallible half: create the native view inside `window`.
     pub fn build(
         url: &str,
+        editor: Option<crate::code::Editor>,
         window: &Window,
-    ) -> anyhow::Result<(wry::WebView, UnboundedReceiver<Msg>, String)> {
-        let url = if is_blank(url) {
+    ) -> anyhow::Result<(wry::WebView, UnboundedReceiver<Msg>, String, crate::code::Shared)> {
+        // An editor comes from Deck, or back from the session by its address.
+        let editor = editor.or_else(|| crate::code::Editor::from_url(url));
+        let url = if let Some(e) = &editor {
+            e.url()
+        } else if is_blank(url) || crate::code::is_editor_url(url) {
             "about:blank".to_string()
         } else {
             normalize_url(url)
         };
+        let is_editor = editor.is_some();
+        let code: crate::code::Shared = std::sync::Arc::new(std::sync::Mutex::new(editor));
         let (tx, rx) = futures::channel::mpsc::unbounded::<Msg>();
-        let (tx_title, tx_load, tx_ipc, tx_new, tx_dl, tx_done) = (
+        let (tx_title, tx_load, tx_ipc, tx_new, tx_dl, tx_done, tx_nav) = (
+            tx.clone(),
             tx.clone(),
             tx.clone(),
             tx.clone(),
@@ -250,7 +755,7 @@ impl BrowserPane {
             tx,
         );
 
-        let webview = wry::WebViewBuilder::new()
+        let mut builder = wry::WebViewBuilder::new()
             .with_url(&url)
             .with_bounds(rect(Bounds::default()))
             .with_visible(false)
@@ -259,7 +764,29 @@ impl BrowserPane {
             .with_devtools(true)
             .with_back_forward_navigation_gestures(true)
             .with_accept_first_mouse(true)
-            .with_initialization_script(PAGE_SCRIPT)
+            // Camera and microphone: WebKit asks per site, as Safari does,
+            // instead of wry's default of granting every request.
+            .with_permission_handler(|_| wry::PermissionResponse::Default)
+            .with_initialization_script(PAGE_SCRIPT);
+        // The editor is Deck's own page; agents read the pages they test.
+        if !is_editor {
+            builder = builder.with_initialization_script(RECORDER_SCRIPT);
+        }
+        let webview = builder
+            .with_asynchronous_custom_protocol(
+                crate::code::SCHEME.into(),
+                crate::code::protocol(code.clone()),
+            )
+            // The editor stays the editor: a link it shows opens in a tab of
+            // its own. No other page may load the editor's scheme.
+            .with_navigation_handler(move |to| {
+                let to_editor = crate::code::is_editor_url(&to);
+                if is_editor && !to_editor && !to.starts_with("about:") {
+                    let _ = tx_nav.unbounded_send(Msg::NewWindow(to));
+                    return false;
+                }
+                !to_editor || is_editor
+            })
             .with_ipc_handler(move |req| {
                 if let Some(msg) = parse_ipc(req.body()) {
                     let _ = tx_ipc.unbounded_send(msg);
@@ -285,14 +812,15 @@ impl BrowserPane {
                 let _ = tx_done.unbounded_send(Msg::DownloadDone(path, ok));
             })
             .build_as_child(window)?;
-        style_native(&webview, theme::CARD_RADIUS - 1.);
-        Ok((webview, rx, url))
+        add_page_dialogs(&webview);
+        Ok((webview, rx, url, code))
     }
 
     pub fn new(
         webview: wry::WebView,
         mut rx: UnboundedReceiver<Msg>,
         url: String,
+        code: crate::code::Shared,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -319,8 +847,17 @@ impl BrowserPane {
         let focus = address.read(cx).focus.clone();
         let blur = cx.on_blur(&focus, window, |p, _, cx| p.stop_editing(cx));
 
+        let host = Host::new(&webview);
+        let all_corners = code.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if let Some(h) = &host {
+            style_native(&h.0, theme::CARD_RADIUS - 1., all_corners);
+        }
         let mut pane = Self {
             webview,
+            host,
+            logs: VecDeque::new(),
+            log_seq: 0,
+            code,
             url: SharedString::default(),
             title: SharedString::default(),
             loading: !is_blank(&url),
@@ -334,7 +871,6 @@ impl BrowserPane {
             tab_visible: true,
             revealed: false,
             shown: false,
-            dimmed: false,
             covered: false,
             favicon: None,
             typed: String::new(),
@@ -367,8 +903,165 @@ impl BrowserPane {
         pane
     }
 
+    /// What this pane edits, when it is Deck's code editor.
+    pub fn editor(&self) -> Option<crate::code::Editor> {
+        self.code.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn is_editor(&self) -> bool {
+        self.code.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Ask the editor page to open `path` (relative to its project), at
+    /// `line`, with its changes shown when `diff`.
+    pub fn editor_open(&self, path: &str, line: Option<u32>, diff: bool) {
+        let opts = serde_json::json!({ "line": line, "diff": diff });
+        let js = format!(
+            "window.deck&&window.deck.open({},{})",
+            serde_json::to_string(path).unwrap_or_default(),
+            opts
+        );
+        let _ = self.webview.evaluate_script(&js);
+    }
+
+    /// A shortcut Deck took that the editor page acts on itself:
+    /// "quickopen", "find" or "save".
+    pub fn editor_key(&self, name: &str) {
+        let _ = self
+            .webview
+            .evaluate_script(&format!("window.deck&&window.deck.key({name:?})"));
+    }
+
+    /// Show commit `hash` in the editor's History.
+    pub fn editor_commit(&self, hash: &str) {
+        let _ = self.webview.evaluate_script(&format!(
+            "window.deck&&window.deck.commit&&window.deck.commit({})",
+            serde_json::to_string(hash).unwrap_or_default()
+        ));
+    }
+
+    /// Switch the editor's sidebar to "files" or "changes".
+    pub fn editor_show(&self, view: &str) {
+        let _ = self
+            .webview
+            .evaluate_script(&format!("window.deck&&window.deck.show({view:?})"));
+    }
+
+    /// Hand the editor the current theme and font after a change.
+    pub fn editor_restyle(&self) {
+        if !self.is_editor() {
+            return;
+        }
+        let look = crate::code::look();
+        let _ = self.webview.evaluate_script(&format!(
+            "window.deck&&(window.deck.setTheme({}),window.deck.setFont({}))",
+            look["theme"], look["font"]
+        ));
+    }
+
+    /// Keep `e` in the log, numbered and stamped with when it arrived.
+    fn record(&mut self, mut e: Value) {
+        self.log_seq += 1;
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        e["seq"] = self.log_seq.into();
+        e["at"] = at.into();
+        if self.logs.len() >= LOG_KEEP {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(e);
+    }
+
+    /// What the page logged and loaded, for `browser.logs`.
+    pub fn logs(&mut self, q: &LogQuery) -> Value {
+        let hits: Vec<&Value> = self
+            .logs
+            .iter()
+            .filter(|e| e.get("seq").and_then(Value::as_u64).unwrap_or(0) > q.since)
+            .filter(|e| q.wants(e))
+            .collect();
+        let more = hits.len().saturating_sub(q.limit);
+        let entries: Vec<Value> = hits[more..].iter().map(|e| (*e).clone()).collect();
+        let mut out = serde_json::json!({
+            "url": self.url.as_ref(),
+            "last_seq": self.log_seq,
+            "entries": entries,
+            "more": more,
+        });
+        // The page is stopped until it is answered.
+        if let Some((kind, text)) = self.pending_dialog() {
+            out["dialog"] = serde_json::json!({ "kind": kind, "text": text });
+        }
+        if q.clear {
+            self.logs.clear();
+        }
+        out
+    }
+
+    fn webview_ptr(&self) -> usize {
+        use wry::WebViewExtMacOS;
+        Retained::as_ptr(&self.webview.webview()) as usize
+    }
+
+    /// The dialog this page has up (see `ask`): its kind and text.
+    pub fn pending_dialog(&self) -> Option<(&'static str, String)> {
+        let me = self.webview_ptr();
+        DIALOGS.with(|d| {
+            d.borrow()
+                .iter()
+                .find(|p| p.webview == me)
+                .map(|p| (p.kind, p.text.clone()))
+        })
+    }
+
+    /// Answer the page's dialog for an agent: OK or Cancel, with `values`
+    /// for its fields (a prompt's text; a login's name and password).
+    pub fn answer_dialog(&self, accept: bool, values: &[String]) -> Result<Value, String> {
+        use objc2_app_kit::{NSAlertFirstButtonReturn, NSAlertSecondButtonReturn};
+        let me = self.webview_ptr();
+        let found = DIALOGS.with(|d| {
+            d.borrow()
+                .iter()
+                .find(|p| p.webview == me)
+                .map(|p| (p.kind, p.text.clone(), p.alert.clone(), p.fields.clone()))
+        });
+        let (kind, text, alert, fields) = found.ok_or("no dialog is open on this page")?;
+        for (f, v) in fields.iter().zip(values) {
+            f.setStringValue(&objc2_foundation::NSString::from_str(v));
+        }
+        let sheet = alert.window();
+        let parent = sheet
+            .sheetParent()
+            .ok_or("the dialog is waiting behind another one; answer that first")?;
+        let ok = accept || kind == "alert";
+        // Ends the sheet, which answers the page (see `ask`).
+        parent.endSheet_returnCode(
+            &sheet,
+            if ok { NSAlertFirstButtonReturn } else { NSAlertSecondButtonReturn },
+        );
+        Ok(serde_json::json!({ "dialog": kind, "text": text, "answer": if ok { "ok" } else { "cancel" } }))
+    }
+
+    /// Where the page is in the window while it is on screen, for a
+    /// picture of just this pane.
+    pub fn page_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.bounds.filter(|_| self.shown)
+    }
+
     fn on_msg(&mut self, msg: Msg, cx: &mut Context<Self>) {
+        // Nothing on screen changes for a log line.
+        let msg = match msg {
+            Msg::Log(entries) => {
+                for e in entries {
+                    self.record(e);
+                }
+                return;
+            }
+            msg => msg,
+        };
         match msg {
+            Msg::Log(_) => {}
             Msg::Title(t) => {
                 history::set_title(&self.url, &t);
                 self.title = t.into();
@@ -384,6 +1077,9 @@ impl BrowserPane {
                     self.set_url(&u, cx);
                 }
                 if committed {
+                    if !is_blank(&u) && !self.is_editor() {
+                        self.record(serde_json::json!({ "t": "nav", "url": u }));
+                    }
                     cx.emit(BrowserEvent::Retitled);
                     self.loading = true;
                     self.watch_load(cx);
@@ -404,6 +1100,11 @@ impl BrowserPane {
                 }
             }
             Msg::Focused => cx.emit(BrowserEvent::Focused),
+            Msg::OpenFolder(path, terminal) => {
+                if self.is_editor() && path.is_dir() {
+                    cx.emit(BrowserEvent::OpenFolder { path, terminal });
+                }
+            }
             Msg::NewWindow(u) => cx.emit(BrowserEvent::OpenTab(u)),
             Msg::LinkTab(u) => {
                 // The page can post this itself; a click is never faster
@@ -933,7 +1634,13 @@ impl BrowserPane {
             && !self.covered;
         if show != self.shown {
             self.shown = show;
-            let _ = self.webview.set_visible(show);
+            // The host, so a docked inspector hides with its page.
+            match &self.host {
+                Some(h) => h.0.setHidden(!show),
+                None => {
+                    let _ = self.webview.set_visible(show);
+                }
+            }
         }
     }
 
@@ -941,18 +1648,6 @@ impl BrowserPane {
         if covered != self.covered {
             self.covered = covered;
             self.sync_visibility();
-        }
-    }
-
-    /// An unfocused pane of a split steps back. gpui cannot paint a veil
-    /// over a native view, so the view fades itself.
-    pub fn set_dimmed(&mut self, dimmed: bool) {
-        if dimmed != self.dimmed {
-            self.dimmed = dimmed;
-            use wry::WebViewExtMacOS;
-            let wk = self.webview.webview();
-            let view: &objc2_app_kit::NSView = &wk;
-            view.setAlphaValue(if dimmed { 0.72 } else { 1.0 });
         }
     }
 
@@ -1000,8 +1695,19 @@ impl BrowserPane {
     /// errors instead of never calling back.
     pub fn eval(&self, js: &str, done: impl FnOnce(Result<Value, String>) + Send + 'static) {
         let src = serde_json::to_string(js).unwrap_or_default();
+        self.run_js(&format!("(0, eval)({src})"), done);
+    }
+
+    /// Like `eval`, for one expression, run as written instead of through
+    /// `eval()`, so it also runs on pages whose Content Security Policy
+    /// forbids `unsafe-eval`. Deck's page actions (`browse.rs`) use this.
+    pub fn eval_expr(&self, js: &str, done: impl FnOnce(Result<Value, String>) + Send + 'static) {
+        self.run_js(&format!("({js}\n)"), done);
+    }
+
+    fn run_js(&self, expr: &str, done: impl FnOnce(Result<Value, String>) + Send + 'static) {
         let wrapped = format!(
-            "(() => {{ try {{ const v = (0, eval)({src}); \
+            "(() => {{ try {{ const v = {expr}; \
              return JSON.stringify({{ ok: v === undefined ? null : v }}); }} \
              catch (e) {{ return JSON.stringify({{ err: String(e) }}); }} }})()"
         );
@@ -1026,7 +1732,12 @@ impl BrowserPane {
             return;
         }
         self.bounds = Some(bounds);
-        let _ = self.webview.set_bounds(rect(bounds));
+        match &self.host {
+            Some(h) => h.place(bounds),
+            None => {
+                let _ = self.webview.set_bounds(rect(bounds));
+            }
+        }
     }
 
     // -- rendering ------------------------------------------------------------
@@ -1046,20 +1757,21 @@ impl BrowserPane {
             .flex_1()
             .min_w_0()
             .items_center()
-            .h(u(30.))
+            .gap(u(8.))
+            .h(u(28.))
             .pl(u(10.))
             .rounded(u(8.))
-            .bg(rgb(if editing {
-                theme::surface_hover()
-            } else {
-                theme::surface()
-            }))
-            .border_1()
-            .border_color(rgba(if editing {
-                theme::input_edge()
-            } else {
-                0xffffff00
-            }))
+            // Quiet at rest, a tint the address sits in; raised with a thin
+            // edge only while you type in it.
+            .when(!editing, |d| {
+                d.bg(rgba(theme::tint()))
+                    .border_1()
+                    .border_color(rgba(0xffffff00))
+                    .hover(|s| s.bg(rgb(theme::surface())))
+            })
+            .when(editing, |d| {
+                d.bg(rgb(theme::raised())).border_1().border_color(rgba(theme::focus_edge()))
+            })
             .cursor_text()
             // The first click into the address selects all of it, as in
             // Safari; the unfocused text is a shortened address anyway, so a
@@ -1137,7 +1849,7 @@ impl BrowserPane {
                         Icon::Refresh
                     },
                 )
-                .mr(u(6.))
+                .mr(u(4.))
                 .on_click(cx.listener(|p, _, _, cx| {
                     p.reload();
                     cx.notify();
@@ -1147,7 +1859,9 @@ impl BrowserPane {
             .children(download)
             .child(
                 icon_button("close-pane", Icon::Close)
-                    .ml(u(4.))
+                    .ml(u(2.))
+                    .opacity(0.7)
+                    .hover(|s| s.opacity(1.).bg(rgb(theme::surface())).text_color(rgb(theme::text())))
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(BrowserEvent::Close))),
             )
             // Real progress along the toolbar's bottom edge while loading.
@@ -1496,6 +2210,20 @@ impl BrowserPane {
 impl Render for BrowserPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        // The editor draws its own chrome; the page is the whole pane.
+        if self.is_editor() {
+            return div()
+                .size_full()
+                .bg(rgb(theme::pane()))
+                .child(
+                    canvas(
+                        move |bounds, _, cx| entity.update(cx, |p, _| p.sync_bounds(bounds)),
+                        |_, _, _, _| {},
+                    )
+                    .size_full(),
+                )
+                .into_any_element();
+        }
         let toolbar = self.render_toolbar(window, cx);
         let find = self.render_find(cx);
         let body = if self.suggest.is_some() {
@@ -1524,6 +2252,7 @@ impl Render for BrowserPane {
             .children(find)
             .child(div().flex_none().h(u(1.)).bg(rgba(theme::hairline())))
             .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 }
 
@@ -1543,22 +2272,386 @@ pub fn site_image(image: Arc<Image>, size: f32) -> AnyElement {
         .into_any_element()
 }
 
-/// The webview sits inside the card: round its bottom corners (the card's
-/// own clipping does not reach a native view). Its appearance comes from the
-/// app, which wears the theme's, so pages that follow `prefers-color-scheme`,
-/// their scrollbars and form controls match deck.
-fn style_native(webview: &wry::WebView, radius: f32) {
-    use objc2_quartz_core::CACornerMask;
+// -- page dialogs ----------------------------------------------------------
+
+/// WKWebView shows nothing for `alert`, `confirm`, `prompt` or an HTTP login
+/// unless its delegates answer them, and wry's do not: `confirm()` came back
+/// false and a password-protected page just failed. Their classes learn
+/// them once; each webview then sets its delegates again, since WebKit
+/// notes what a delegate can do only when it is set.
+fn add_page_dialogs(webview: &wry::WebView) {
+    use objc2::runtime::{AnyClass, AnyObject, Imp};
+    use objc2::{msg_send, sel};
     use wry::WebViewExtMacOS;
+    static UI: std::sync::Once = std::sync::Once::new();
+    static NAV: std::sync::Once = std::sync::Once::new();
     let wk = webview.webview();
-    let view: &objc2_app_kit::NSView = &wk;
+    // SAFETY: main thread; the delegates are plain property reads.
+    let ui: Option<Retained<AnyObject>> = unsafe { msg_send![&*wk, UIDelegate] };
+    let nav: Option<Retained<AnyObject>> = unsafe { msg_send![&*wk, navigationDelegate] };
+    let add = |obj: &AnyObject, name, imp: Imp, types: &std::ffi::CStr| {
+        let cls = obj.class() as *const AnyClass as *mut AnyClass;
+        // SAFETY: each function has the signature its selector and type
+        // encoding describe; a method the class already has is kept.
+        unsafe { objc2::ffi::class_addMethod(cls, name, imp, types.as_ptr()) };
+    };
+    if let Some(ui) = &ui {
+        UI.call_once(|| unsafe {
+            add(ui, sel!(webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:),
+                std::mem::transmute::<AlertFn, Imp>(js_alert), c"v@:@@@@?");
+            add(ui, sel!(webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:),
+                std::mem::transmute::<ConfirmFn, Imp>(js_confirm), c"v@:@@@@?");
+            add(ui, sel!(webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:),
+                std::mem::transmute::<PromptFn, Imp>(js_prompt), c"v@:@@@@@?");
+        });
+        // SAFETY: the same delegate, which wry keeps alive.
+        let _: () = unsafe { msg_send![&*wk, setUIDelegate: &**ui] };
+    }
+    if let Some(nav) = &nav {
+        NAV.call_once(|| unsafe {
+            add(nav, sel!(webView:didReceiveAuthenticationChallenge:completionHandler:),
+                std::mem::transmute::<AuthFn, Imp>(http_login), c"v@:@@@?");
+        });
+        // SAFETY: as above.
+        let _: () = unsafe { msg_send![&*wk, setNavigationDelegate: &**nav] };
+    }
+}
+
+type Obj = *mut objc2::runtime::AnyObject;
+type Str = *mut objc2_foundation::NSString;
+type Sel = objc2::runtime::Sel;
+type Block<F> = *mut block2::Block<F>;
+type AlertFn = unsafe extern "C-unwind" fn(Obj, Sel, Obj, Str, Obj, Block<dyn Fn()>);
+type ConfirmFn = unsafe extern "C-unwind" fn(Obj, Sel, Obj, Str, Obj, Block<dyn Fn(objc2::runtime::Bool)>);
+type PromptFn = unsafe extern "C-unwind" fn(Obj, Sel, Obj, Str, Str, Obj, Block<dyn Fn(Str)>);
+type AuthFn = unsafe extern "C-unwind" fn(Obj, Sel, Obj, Obj, Block<dyn Fn(isize, Obj)>);
+
+fn ns_string(s: Str) -> String {
+    // SAFETY: an NSString WebKit handed over, or null.
+    unsafe { s.as_ref() }.map(|m| m.to_string()).unwrap_or_default()
+}
+
+unsafe extern "C-unwind" fn js_alert(_: Obj, _: Sel, webview: Obj, message: Str, frame: Obj, done: Block<dyn Fn()>) {
+    // SAFETY: WebKit's completion handler, copied so it outlives this call.
+    let Some(done) = (unsafe { block2::RcBlock::copy(done) }) else { return };
+    let title = says(frame);
+    ask(webview, "alert", &title, &ns_string(message), Vec::new(), Box::new(move |_, _| done.call(())));
+}
+
+unsafe extern "C-unwind" fn js_confirm(
+    _: Obj,
+    _: Sel,
+    webview: Obj,
+    message: Str,
+    frame: Obj,
+    done: Block<dyn Fn(objc2::runtime::Bool)>,
+) {
+    // SAFETY: as in `js_alert`.
+    let Some(done) = (unsafe { block2::RcBlock::copy(done) }) else { return };
+    let title = says(frame);
+    ask(webview, "confirm", &title, &ns_string(message), Vec::new(), Box::new(move |ok, _| {
+        done.call((objc2::runtime::Bool::new(ok),))
+    }));
+}
+
+unsafe extern "C-unwind" fn js_prompt(
+    _: Obj,
+    _: Sel,
+    webview: Obj,
+    prompt: Str,
+    default: Str,
+    frame: Obj,
+    done: Block<dyn Fn(Str)>,
+) {
+    // SAFETY: as in `js_alert`.
+    let Some(done) = (unsafe { block2::RcBlock::copy(done) }) else { return };
+    let Some(field) = text_field(&ns_string(default), false) else {
+        return done.call((std::ptr::null_mut(),));
+    };
+    let title = says(frame);
+    ask(webview, "prompt", &title, &ns_string(prompt), vec![field], Box::new(move |ok, values| {
+        if ok {
+            let answer = objc2_foundation::NSString::from_str(values.first().map_or("", String::as_str));
+            done.call((Retained::as_ptr(&answer) as Str,));
+        } else {
+            done.call((std::ptr::null_mut(),));
+        }
+    }));
+}
+
+/// An HTTP login (Basic, Digest, NTLM) asks for a name and password, as
+/// Safari does; anything else (a server's certificate) is left to WebKit.
+unsafe extern "C-unwind" fn http_login(_: Obj, _: Sel, webview: Obj, challenge: Obj, done: Block<dyn Fn(isize, Obj)>) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::NSString;
+    const USE_CREDENTIAL: isize = 0;
+    const DEFAULT: isize = 1;
+    // SAFETY: as in `js_alert`.
+    let Some(done) = (unsafe { block2::RcBlock::copy(done) }) else { return };
+    let Some(challenge) = (unsafe { challenge.as_ref() }) else {
+        return done.call((DEFAULT, std::ptr::null_mut()));
+    };
+    // SAFETY: an NSURLAuthenticationChallenge and its protection space;
+    // plain property reads on the main thread.
+    let (method, host, port, realm, failures, user) = unsafe {
+        let space: Option<Retained<AnyObject>> = msg_send![challenge, protectionSpace];
+        let Some(space) = space else {
+            return done.call((DEFAULT, std::ptr::null_mut()));
+        };
+        let method: Option<Retained<NSString>> = msg_send![&*space, authenticationMethod];
+        let host: Option<Retained<NSString>> = msg_send![&*space, host];
+        let port: isize = msg_send![&*space, port];
+        let realm: Option<Retained<NSString>> = msg_send![&*space, realm];
+        let failures: isize = msg_send![challenge, previousFailureCount];
+        let proposed: Option<Retained<AnyObject>> = msg_send![challenge, proposedCredential];
+        let user: Option<Retained<NSString>> = match &proposed {
+            Some(c) => msg_send![&**c, user],
+            None => None,
+        };
+        let s = |s: Option<Retained<NSString>>| s.map(|s| s.to_string()).unwrap_or_default();
+        (s(method), s(host), port, s(realm), failures, s(user))
+    };
+    if !matches!(
+        method.as_str(),
+        "NSURLAuthenticationMethodDefault"
+            | "NSURLAuthenticationMethodHTTPBasic"
+            | "NSURLAuthenticationMethodHTTPDigest"
+            | "NSURLAuthenticationMethodNTLM"
+    ) {
+        return done.call((DEFAULT, std::ptr::null_mut()));
+    }
+    let (Some(name), Some(pass)) = (text_field(&user, false), text_field("", true)) else {
+        return done.call((DEFAULT, std::ptr::null_mut()));
+    };
+    let site = if port > 0 && port != 80 && port != 443 { format!("{host}:{port}") } else { host };
+    let mut text = if realm.is_empty() {
+        "Your name and password are sent to the site.".to_string()
+    } else {
+        format!("{realm:?} asks for a name and password.")
+    };
+    if failures > 0 {
+        text = format!("That name or password did not work. {text}");
+    }
+    ask(webview, "login", &format!("Log in to {site}"), &text, vec![name, pass], Box::new(move |ok, values| {
+        if !ok {
+            // The site's own 401 page.
+            return done.call((DEFAULT, std::ptr::null_mut()));
+        }
+        let get = |i: usize| NSString::from_str(values.get(i).map_or("", String::as_str));
+        // SAFETY: +[NSURLCredential credentialWithUser:password:persistence:],
+        // kept for this session only.
+        let cred: Retained<AnyObject> = unsafe {
+            msg_send![class!(NSURLCredential), credentialWithUser: &*get(0), password: &*get(1), persistence: 1isize]
+        };
+        done.call((USE_CREDENTIAL, Retained::as_ptr(&cred) as Obj));
+    }));
+}
+
+/// "localhost:3000 says", as Safari heads a page's dialog.
+fn says(frame: Obj) -> String {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    let origin = (|| {
+        let frame = unsafe { frame.as_ref() }?;
+        // SAFETY: a WKFrameInfo; its origin's host and port are plain
+        // property reads on the main thread.
+        unsafe {
+            let origin: Option<Retained<AnyObject>> = msg_send![frame, securityOrigin];
+            let origin = origin?;
+            let host: Option<Retained<objc2_foundation::NSString>> = msg_send![&*origin, host];
+            let port: isize = msg_send![&*origin, port];
+            let host = host?.to_string();
+            Some(if port > 0 { format!("{host}:{port}") } else { host })
+        }
+    })();
+    match origin.filter(|o| !o.is_empty()) {
+        Some(o) => format!("{o} says"),
+        None => "This page says".into(),
+    }
+}
+
+fn text_field(value: &str, secure: bool) -> Option<Retained<objc2_app_kit::NSTextField>> {
+    use objc2_app_kit::{NSSecureTextField, NSTextField};
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+    let mtm = objc2::MainThreadMarker::new()?;
+    let frame = NSRect::new(NSPoint::new(0., 0.), NSSize::new(260., 24.));
+    let f: Retained<NSTextField> = if secure {
+        Retained::into_super(NSSecureTextField::initWithFrame(mtm.alloc(), frame))
+    } else {
+        NSTextField::initWithFrame(mtm.alloc(), frame)
+    };
+    f.setStringValue(&NSString::from_str(value));
+    Some(f)
+}
+
+/// A page's dialog on screen, until the user or an agent
+/// (`browser.dialog`) answers it.
+struct Pending {
+    webview: usize,
+    kind: &'static str,
+    text: String,
+    alert: Retained<objc2_app_kit::NSAlert>,
+    fields: Vec<Retained<objc2_app_kit::NSTextField>>,
+}
+
+thread_local! {
+    static DIALOGS: std::cell::RefCell<Vec<Pending>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Show a page's dialog as a sheet on its window, so the rest of Deck
+/// keeps running, and hand `done` whether it was OK'd and its fields.
+fn ask(
+    webview: Obj,
+    kind: &'static str,
+    title: &str,
+    text: &str,
+    fields: Vec<Retained<objc2_app_kit::NSTextField>>,
+    done: Box<dyn Fn(bool, Vec<String>)>,
+) {
+    use objc2::msg_send;
+    use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSModalResponse, NSWindow};
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return done(false, Vec::new());
+    };
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(text));
+    alert.addButtonWithTitle(&NSString::from_str(if kind == "login" { "Log In" } else { "OK" }));
+    if kind != "alert" {
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    }
+    match fields.as_slice() {
+        [] => {}
+        [one] => alert.setAccessoryView(Some(one)),
+        many => {
+            // Stacked, the first on top.
+            let n = many.len() as f64;
+            let box_ = NSView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0., 0.), NSSize::new(260., 32. * n - 8.)));
+            for (i, f) in many.iter().enumerate() {
+                f.setFrameOrigin(NSPoint::new(0., 32. * (n - 1. - i as f64)));
+                box_.addSubview(f);
+            }
+            alert.setAccessoryView(Some(&box_));
+        }
+    }
+    if let Some(first) = fields.first() {
+        alert.window().setInitialFirstResponder(Some(first));
+    }
+    let values = |fields: &[Retained<objc2_app_kit::NSTextField>]| -> Vec<String> {
+        fields.iter().map(|f| f.stringValue().to_string()).collect()
+    };
+    // SAFETY: the WKWebView WebKit called about; `window` is a property read.
+    let window: Option<Retained<NSWindow>> = unsafe { webview.as_ref() }.and_then(|w| unsafe { msg_send![w, window] });
+    let Some(window) = window else {
+        let ok = alert.runModal() == NSAlertFirstButtonReturn;
+        return done(ok, values(&fields));
+    };
+    let key = Retained::as_ptr(&alert) as usize;
+    DIALOGS.with(|d| {
+        d.borrow_mut().push(Pending {
+            webview: webview as usize,
+            kind,
+            text: text.to_string(),
+            alert: alert.clone(),
+            fields: fields.clone(),
+        })
+    });
+    let handler = block2::RcBlock::new(move |code: NSModalResponse| {
+        DIALOGS.with(|d| d.borrow_mut().retain(|p| Retained::as_ptr(&p.alert) as usize != key));
+        done(code == NSAlertFirstButtonReturn, values(&fields));
+    });
+    alert.beginSheetModalForWindow_completionHandler(&window, Some(&handler));
+}
+
+/// The page's view in the window, a plain view of its own that the webview
+/// fills. WebKit docks Web Inspector inside the inspected view's superview,
+/// so with this between them the inspector stays inside the pane instead of
+/// spreading the page and itself over the whole window.
+struct Host(Retained<NSView>);
+
+impl Host {
+    fn new(webview: &wry::WebView) -> Option<Self> {
+        use objc2_app_kit::NSAutoresizingMaskOptions as Mask;
+        use wry::WebViewExtMacOS;
+        let wk = webview.webview();
+        let page: &NSView = &wk;
+        // SAFETY: main thread; wry has just added the webview to gpui's view.
+        let parent = unsafe { page.superview() }?;
+        let mtm = objc2::MainThreadMarker::new()?;
+        let view = NSView::initWithFrame(mtm.alloc(), page.frame());
+        // Kept to the top through a window resize until the next layout
+        // places it, as wry keeps its own child views.
+        view.setAutoresizingMask(Mask::ViewMinYMargin);
+        view.setHidden(true);
+        parent.addSubview(&view);
+        view.addSubview(page);
+        page.setFrame(view.bounds());
+        page.setAutoresizingMask(Mask::ViewWidthSizable | Mask::ViewHeightSizable);
+        page.setHidden(false);
+        Some(Self(view))
+    }
+
+    /// Put the view at `b`, in window coordinates (y down), the way wry's
+    /// `set_bounds` would have put the webview.
+    fn place(&self, b: Bounds<Pixels>) {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        // SAFETY: main thread; the parent is gpui's view, alive with the window.
+        let Some(parent) = (unsafe { self.0.superview() }) else {
+            return;
+        };
+        let (x, y) = (f32::from(b.origin.x) as f64, f32::from(b.origin.y) as f64);
+        let (w, h) = (f32::from(b.size.width) as f64, f32::from(b.size.height) as f64);
+        let y = if parent.isFlipped() {
+            y
+        } else {
+            parent.frame().size.height - y - h
+        };
+        self.0.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)));
+        // Alone, the page fills the view. With the inspector docked beside
+        // it, WebKit lays the two out itself and is not to be fought.
+        let subs = self.0.subviews();
+        if subs.count() == 1 {
+            if let Some(page) = subs.firstObject() {
+                page.setFrame(self.0.bounds());
+            }
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.0.removeFromSuperview();
+    }
+}
+
+impl Drop for BrowserPane {
+    /// An inspector in a window of its own would outlive the pane.
+    fn drop(&mut self) {
+        if self.webview.is_devtools_open() {
+            self.webview.close_devtools();
+        }
+    }
+}
+
+/// The page's view sits inside the card: round its bottom corners (the
+/// card's own clipping does not reach a native view). Its appearance comes
+/// from the app, which wears the theme's, so pages that follow
+/// `prefers-color-scheme`, their scrollbars and form controls match deck.
+fn style_native(view: &NSView, radius: f32, all_corners: bool) {
+    use objc2_quartz_core::CACornerMask;
     view.setWantsLayer(true);
     if let Some(layer) = view.layer() {
         layer.setCornerRadius(radius as f64);
-        // AppKit layers are not flipped: MinY is the bottom edge.
-        layer.setMaskedCorners(
-            CACornerMask::LayerMinXMinYCorner | CACornerMask::LayerMaxXMinYCorner,
-        );
+        // AppKit layers are not flipped: MinY is the bottom edge. The
+        // editor has no toolbar above it, so it rounds its top too.
+        let bottom = CACornerMask::LayerMinXMinYCorner | CACornerMask::LayerMaxXMinYCorner;
+        layer.setMaskedCorners(if all_corners {
+            bottom | CACornerMask::LayerMinXMaxYCorner | CACornerMask::LayerMaxXMaxYCorner
+        } else {
+            bottom
+        });
         layer.setMasksToBounds(true);
     }
 }
@@ -1578,6 +2671,11 @@ fn rect(b: Bounds<Pixels>) -> wry::Rect {
 /// wry hands back the JSON of what the page returned — here, a string that is
 /// itself JSON.
 fn decode_eval(json: &str) -> Result<Value, String> {
+    // WebKit returned nothing: the script did not parse, or the page was
+    // between documents.
+    if json.is_empty() {
+        return Err("the page did not run it (a syntax error, or it was loading)".into());
+    }
     let inner: String = serde_json::from_str(json).map_err(|e| format!("bad eval result: {e}"))?;
     let mut v: Value = serde_json::from_str(&inner).map_err(|e| format!("bad eval result: {e}"))?;
     if let Some(err) = v.get("err").and_then(Value::as_str) {
@@ -1755,6 +2853,61 @@ mod tests {
         assert!(parse_ipc("tab:javascript:alert(1)").is_none());
         assert!(parse_ipc("icon:file:///etc/passwd").is_none());
         assert!(parse_ipc("url:https://evil.example").is_none());
+    }
+
+    #[test]
+    fn log_batches_are_trimmed() {
+        let Some(Msg::Log(e)) = parse_ipc(
+            r#"{"deck":"log","entries":[{"t":"console","level":"log","text":"hi","seq":99},3,"x",{"t":"net","url":"https://a.b/","status":404,"nested":{"a":1}},{"no":"t"}]}"#,
+        ) else {
+            panic!("not a log batch");
+        };
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0], serde_json::json!({"t": "console", "level": "log", "text": "hi"}));
+        assert_eq!(e[1], serde_json::json!({"t": "net", "url": "https://a.b/", "status": 404}));
+        assert!(parse_ipc(r#"{"deck":"log","entries":[]}"#).is_none());
+        assert!(parse_ipc(r#"{"deck":"log","entries":{"t":"console"}}"#).is_none());
+        assert!(parse_ipc(r#"{"deck":"log"}"#).is_none());
+
+        let long = "é".repeat(5000);
+        let body = serde_json::json!({"deck": "log", "entries": [{"t": "console", "text": long}]});
+        let Some(Msg::Log(e)) = parse_ipc(&body.to_string()) else {
+            panic!("not a log batch");
+        };
+        assert!(e[0]["text"].as_str().unwrap().len() <= 4096 + "…".len());
+
+        let many: Vec<Value> = (0..500).map(|i| serde_json::json!({"t": "console", "text": i.to_string()})).collect();
+        let body = serde_json::json!({"deck": "log", "entries": many});
+        let Some(Msg::Log(e)) = parse_ipc(&body.to_string()) else {
+            panic!("not a log batch");
+        };
+        assert_eq!(e.len(), LOG_BATCH);
+    }
+
+    #[test]
+    fn log_queries_pick_their_kind() {
+        let q = |p: Value| LogQuery::from_params(&p).unwrap();
+        let log = serde_json::json!({"t": "console", "level": "log", "text": "Ready"});
+        let err = serde_json::json!({"t": "console", "level": "error", "text": "boom"});
+        let thrown = serde_json::json!({"t": "error", "kind": "error", "text": "TypeError: x"});
+        let ok = serde_json::json!({"t": "net", "type": "fetch", "url": "https://a.b/api", "status": 200});
+        let missing = serde_json::json!({"t": "net", "type": "img", "url": "https://a.b/x.png", "status": 404});
+        let down = serde_json::json!({"t": "net", "type": "fetch", "url": "https://c.d/", "failed": true});
+        let nav = serde_json::json!({"t": "nav", "url": "https://a.b/"});
+        let all = [&log, &err, &thrown, &ok, &missing, &down, &nav];
+        let pick = |q: &LogQuery| all.iter().filter(|e| q.wants(e)).count();
+
+        assert_eq!(pick(&q(serde_json::json!({}))), 7);
+        assert_eq!(pick(&q(serde_json::json!({"kind": "console"}))), 4);
+        assert_eq!(pick(&q(serde_json::json!({"kind": "network"}))), 3);
+        assert_eq!(pick(&q(serde_json::json!({"kind": "errors"}))), 4);
+        assert_eq!(pick(&q(serde_json::json!({"kind": "network", "failed": true}))), 2);
+        assert_eq!(pick(&q(serde_json::json!({"filter": "A.B/API"}))), 1);
+        assert_eq!(pick(&q(serde_json::json!({"kind": "console", "filter": "ready"}))), 1);
+        assert!(LogQuery::from_params(&serde_json::json!({"kind": "dom"})).is_err());
+
+        let p = q(serde_json::json!({"since": "12", "limit": 5000, "clear": "true"}));
+        assert_eq!((p.since, p.limit, p.clear), (12, 1000, true));
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct Session {
     pub active: usize,
     pub sidebar: bool,
     pub inspector: bool,
+    /// The side panels' widths, as last dragged.
+    pub sidebar_width: f32,
+    pub inspector_width: f32,
 }
 
 impl Default for Session {
@@ -29,6 +32,8 @@ impl Default for Session {
             active: 0,
             sidebar: true,
             inspector: false,
+            sidebar_width: crate::theme::SIDEBAR_PX,
+            inspector_width: crate::theme::INSPECTOR_PX,
         }
     }
 }
@@ -64,6 +69,10 @@ pub enum PaneState {
         cwd: Option<PathBuf>,
         #[serde(default)]
         agent: Option<AgentRun>,
+        /// The key its scrollback is kept under at quit, to show again under
+        /// the new shell (see `scrollback_file`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scrollback: Option<String>,
     },
     Browser {
         url: String,
@@ -93,6 +102,12 @@ pub struct AgentRun {
 
 pub fn path() -> PathBuf {
     crate::control::socket_dir().join("session.json")
+}
+
+/// Where a terminal's scrollback waits between a quit and the next launch.
+pub fn scrollback_file(key: &str) -> PathBuf {
+    let key: String = key.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    crate::control::socket_dir().join("scrollback").join(format!("{key}.ansi"))
 }
 
 pub fn load() -> Option<Session> {
@@ -252,7 +267,7 @@ fn quote(word: &str) -> String {
 
 /// Where Claude Code keeps the conversations started in `cwd`: the path
 /// with every character that is not a letter or digit turned into `-`.
-fn claude_dir(cwd: &Path) -> PathBuf {
+pub(crate) fn claude_dir(cwd: &Path) -> PathBuf {
     let slug: String = cwd
         .to_string_lossy()
         .chars()
@@ -286,12 +301,129 @@ pub fn claude_sessions(cwd: &Path) -> Vec<String> {
     found.into_iter().map(|(_, id)| id).collect()
 }
 
+/// The conversation an agent's command line picks: `--resume ID`,
+/// `-r ID` or `--session-id ID`.
+pub fn session_arg(argv: &[String]) -> Option<String> {
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--resume=").or_else(|| a.strip_prefix("--session-id=")) {
+            return Some(v.to_string());
+        }
+        if matches!(a.as_str(), "--resume" | "-r" | "--session-id") {
+            return it.next().filter(|v| !v.starts_with('-')).cloned();
+        }
+    }
+    None
+}
+
+/// What a Claude Code conversation has been called: the titles Claude Code
+/// gave it, oldest first, and the first real thing you asked in it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConvTitles {
+    pub titles: Vec<String>,
+    pub ask: Option<String>,
+}
+
+impl ConvTitles {
+    /// Its newest title other than `not` (one Claude Code gave every open
+    /// session alike), else the first ask.
+    pub fn pick(&self, not: &str) -> Option<String> {
+        self.titles.iter().rev().find(|t| t.as_str() != not).cloned().or_else(|| self.ask.clone())
+    }
+}
+
+pub fn claude_titles(cwd: &Path, id: &str) -> ConvTitles {
+    titles_in(&claude_dir(cwd).join(format!("{id}.jsonl")))
+}
+
+fn titles_in(path: &Path) -> ConvTitles {
+    use std::io::BufRead;
+    let mut out = ConvTitles::default();
+    let Ok(file) = std::fs::File::open(path) else { return out };
+    let mut first_ask: Option<String> = None;
+    for (n, line) in std::io::BufReader::new(file).lines().map_while(Result::ok).enumerate() {
+        if line.contains("\"ai-title\"") || line.contains("\"custom-title\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                let t = v.get("customTitle").or_else(|| v.get("aiTitle")).and_then(|t| t.as_str());
+                if let Some(t) = t.map(str::trim).filter(|t| !t.is_empty()) {
+                    if out.titles.last().map(String::as_str) != Some(t) {
+                        out.titles.push(t.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        if out.ask.is_none() && n < 400 && line.contains("\"user\"") {
+            if let Some(ask) = ask_of(&line) {
+                first_ask.get_or_insert_with(|| ask.clone());
+                // "hi" says nothing; the first ask of a few words does.
+                if ask.split_whitespace().count() >= 3 {
+                    out.ask = Some(ask);
+                }
+            }
+        }
+    }
+    out.ask = out.ask.or(first_ask);
+    out
+}
+
+/// A user message's first line, when it is something you asked rather
+/// than a slash command or a caveat Claude Code wrote.
+fn ask_of(line: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("user") || v.get("isMeta").is_some_and(|m| m == true) {
+        return None;
+    }
+    let text = match &v["message"]["content"] {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let first = text.lines().map(str::trim).find(|l| !l.is_empty())?.to_string();
+    if first.starts_with('<') || first.starts_with('/') || first.starts_with("Caveat:") {
+        return None;
+    }
+    let short: String = first.chars().take(60).collect();
+    Some(if first.chars().count() > 60 { format!("{short}…") } else { short })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn argv(words: &str) -> Vec<String> {
         words.split(' ').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_conversation_is_named_by_its_own_titles_or_first_ask() {
+        assert_eq!(session_arg(&argv("claude --model opus --resume ab-1 fix")).as_deref(), Some("ab-1"));
+        assert_eq!(session_arg(&argv("claude --session-id=x9")).as_deref(), Some("x9"));
+        assert_eq!(session_arg(&argv("claude --continue")), None);
+        let dir = std::env::temp_dir().join(format!("deck-first-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>x"}}"#, "\n",
+                r#"{"type":"user","message":{"content":"/clear"}}"#, "\n",
+                r#"{"type":"user","message":{"content":"hi"}}"#, "\n",
+                r#"{"type":"user","message":{"content":[{"type":"text","text":"make the app icon\nround"}]}}"#, "\n",
+                r#"{"type":"ai-title","aiTitle":"macOS app icon"}"#, "\n",
+                r#"{"type":"ai-title","aiTitle":"Modern minimal browser"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let t = titles_in(&dir.join("s1.jsonl"));
+        assert_eq!(t.ask.as_deref(), Some("make the app icon"));
+        assert_eq!(t.pick("Modern minimal browser").as_deref(), Some("macOS app icon"));
+        assert_eq!(ConvTitles { titles: vec![], ask: Some("hi".into()) }.pick("x").as_deref(), Some("hi"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -374,6 +506,7 @@ mod tests {
                                 session: Some("abc".into()),
                                 tab: true,
                             }),
+                            scrollback: None,
                         }),
                         NodeState::Pane(PaneState::Browser {
                             url: "https://example.com".into(),
@@ -384,6 +517,7 @@ mod tests {
             active: 0,
             sidebar: false,
             inspector: true,
+            ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<Session>(&json).unwrap(), s);

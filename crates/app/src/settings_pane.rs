@@ -17,6 +17,8 @@ use gpui::{
 };
 use std::time::Duration;
 
+mod models;
+
 pub enum SettingsEvent {
     Changed(Settings),
     /// Make deck the Mac's terminal (true) or hand it back to Terminal.
@@ -74,6 +76,8 @@ pub struct SettingsPane {
     recording: Option<(&'static str, Subscription)>,
     /// Why the last recorded keys were not taken.
     key_note: Option<(&'static str, SharedString)>,
+    /// The Models page: local runtimes, models and routes.
+    models: models::Models,
     _search: Subscription,
 }
 
@@ -182,6 +186,7 @@ impl SettingsPane {
             collapsed: Default::default(),
             recording: None,
             key_note: None,
+            models: models::Models::new(cx),
             _search,
         }
     }
@@ -310,6 +315,16 @@ impl SettingsPane {
                     ),
                 )
                 .about("Looks for a newer Deck once a day and shows it in the title bar."),
+                row(
+                    "Install automatically",
+                    self.toggle(
+                        "install-updates",
+                        self.settings.install_updates,
+                        |s, on| s.install_updates = on,
+                        cx,
+                    ),
+                )
+                .about("Downloads a new version in the background and puts it in place when you next quit Deck."),
             ],
             None,
         )
@@ -330,6 +345,7 @@ impl SettingsPane {
             Page::Terminal => self.page_terminal(cx),
             Page::Browser => self.page_browser(cx),
             Page::Agents => self.page_agents(cx),
+            Page::Models => self.page_models(cx),
             Page::Keyboard => self.page_keyboard(cx),
             Page::Snippets => self.page_snippets(cx),
         }
@@ -882,7 +898,7 @@ impl SettingsPane {
     }
 
     fn fonts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut wrap = div().flex().flex_wrap().gap(u(6.));
+        let mut wrap = div().w_full().flex().flex_wrap().gap(u(6.));
         for (ix, family) in self.fonts.iter().enumerate() {
             let on = family.as_ref() == self.settings.font_family;
             let name = family.clone();
@@ -900,7 +916,7 @@ impl SettingsPane {
     /// Each scheme as a card: a strip of its background with its colours on
     /// it, the name below.
     fn schemes(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut wrap = div().flex().flex_wrap().gap(u(8.));
+        let mut wrap = div().w_full().flex().flex_wrap().gap(u(8.));
         for (ix, scheme) in Scheme::ALL.iter().copied().enumerate() {
             let on = scheme == self.settings.scheme;
             let p = scheme.palette();
@@ -972,17 +988,19 @@ pub enum Page {
     Terminal,
     Browser,
     Agents,
+    Models,
     Keyboard,
     Snippets,
 }
 
 impl Page {
-    const ALL: [Page; 7] = [
+    const ALL: [Page; 8] = [
         Page::General,
         Page::Appearance,
         Page::Terminal,
         Page::Browser,
         Page::Agents,
+        Page::Models,
         Page::Keyboard,
         Page::Snippets,
     ];
@@ -994,6 +1012,7 @@ impl Page {
             Page::Terminal => "Terminal",
             Page::Browser => "Browser",
             Page::Agents => "Agents",
+            Page::Models => "Models",
             Page::Keyboard => "Keyboard",
             Page::Snippets => "Snippets",
         }
@@ -1121,7 +1140,9 @@ fn render_row(r: Row) -> Div {
             .flex_col()
             .gap(u(4.))
             .flex_1()
-            .min_w_0()
+            // Words never get squeezed under this: in a narrow pane the
+            // control wraps below them instead of the text overrunning.
+            .min_w(u(160.))
             .when(!r.label.is_empty(), |d| {
                 d.child(
                     div()
@@ -1140,6 +1161,7 @@ fn render_row(r: Row) -> Div {
     });
     if r.wide {
         div()
+            .w_full()
             .flex()
             .flex_col()
             .gap(u(12.))
@@ -1148,9 +1170,12 @@ fn render_row(r: Row) -> Div {
             .child(r.control)
     } else {
         div()
+            .w_full()
             .flex()
+            .flex_wrap()
             .items_center()
-            .gap(u(28.))
+            .gap_x(u(28.))
+            .gap_y(u(12.))
             .min_h(u(56.))
             .py(u(14.))
             .children(words)
@@ -1243,6 +1268,9 @@ fn preview(c: &theme::Colors) -> Div {
                 .p(u(6.))
                 .rounded(u(5.))
                 .bg(rgb(c.pane))
+                // The pane's own edge, which is all that shows it on black.
+                .border_1()
+                .border_color(rgba(c.hairline))
                 .child(line(38., c.text))
                 .child(line(30., c.text_2))
                 .child(line(44., c.dim))
@@ -1257,7 +1285,9 @@ impl SettingsPane {
             window.appearance(),
             gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
         );
-        let mut tiles = div().flex().flex_wrap().gap(u(14.));
+        // A definite width, so wrapping is measured against the page and
+        // the row grows with every line of tiles instead of being drawn over.
+        let mut tiles = div().w_full().flex().flex_wrap().gap(u(14.));
         for (ix, t) in theme::Theme::ALL.iter().copied().enumerate() {
             let on = t == self.settings.theme;
             let face = if t == theme::Theme::System {
@@ -1328,9 +1358,11 @@ impl SettingsPane {
             .id("settings-tree")
             .flex()
             .flex_col()
-            .flex_none()
+            .flex_shrink()
             .gap(u(2.))
+            // Gives way to the page in a narrow pane, down to its labels.
             .w(u(232.))
+            .min_w(u(150.))
             .h_full()
             .overflow_y_scroll()
             .pt(u(16.))
@@ -1636,6 +1668,15 @@ impl SettingsPane {
                 None,
             ),
             group(
+                "Layout",
+                vec![row(
+                    "Status bar",
+                    self.toggle("status-bar", s.status_bar, |s, on| s.status_bar = on, cx),
+                )
+                .about("Along the bottom: the project and branch, commands running in any tab, open pages and dev servers on this Mac. Click one to go to it.")],
+                None,
+            ),
+            group(
                 "Terminal colours",
                 vec![wide("Palette", self.schemes(cx)).about(
                     "What terminals and agent TUIs draw with. Match window uses the theme's own.",
@@ -1710,7 +1751,16 @@ impl SettingsPane {
                         cx,
                     ),
                 )
-                .about("Diffs and highlights that programs like Claude Code paint in solid colour show as a tint instead. Greys and your selection stay as they are.")],
+                .about("The red and green lines programs like Claude Code paint diffs with show as a tint instead of solid colour. Selections, other highlights and greys stay as they are.")],
+                None,
+            ),
+            group(
+                "Typing",
+                vec![row(
+                    "Completion menu as you type",
+                    self.toggle("complete", s.complete_menu, |s, on| s.complete_menu = on, cx),
+                )
+                .about("At a zsh prompt: commands, flags, files, git branches and package scripts under the cursor. ⇥ takes one, ↑↓ choose, esc closes it, ⏎ runs the line as typed.")],
                 None,
             ),
             group(
@@ -1840,25 +1890,47 @@ impl SettingsPane {
                             cx,
                         ),
                     ),
-                    row(
-                        "Model",
-                        self.segmented(
-                            "refine-model",
-                            &crate::refine::MODELS,
-                            crate::refine::MODELS
-                                .iter()
-                                .map(|(id, _)| *id)
-                                .find(|id| *id == self.settings.refine_model)
-                                .unwrap_or("haiku"),
-                            |s, m| s.refine_model = m.to_string(),
-                            cx,
-                        ),
-                    ),
+                    {
+                        let model = row(
+                            "Model",
+                            self.segmented(
+                                "refine-model",
+                                &crate::refine::MODELS,
+                                crate::refine::MODELS
+                                    .iter()
+                                    .map(|(id, _)| *id)
+                                    .find(|id| *id == self.settings.refine_model)
+                                    .unwrap_or("haiku"),
+                                // Picking Claude here takes the job back from a local model.
+                                |s, m| {
+                                    s.refine_model = m.to_string();
+                                    s.routes.remove(crate::refine::REWRITE);
+                                },
+                                cx,
+                            ),
+                        );
+                        match crate::refine::chosen(&self.settings, crate::refine::REWRITE) {
+                            r @ crate::local::Route::Local(..) => model.about(format!(
+                                "Rewrites run on {}, set in Models. This one stands in when it can't answer.",
+                                r.label()
+                            )),
+                            _ => model,
+                        }
+                    },
                 ],
                 Some(
                     "A quick Claude run turns what you typed or dictated into a clear, complete prompt, using the thread's task and the agent's last reply to work out what \"it\" and \"that\" mean. ⌃O rewrites into the box without sending, ⌃Z brings back your words. Short replies, / commands and ! commands go as typed."
                         .into(),
                 ),
+            ),
+            group(
+                "Deck for agents",
+                vec![row(
+                    "Teach coding agents to use Deck",
+                    self.toggle("agent-skill", self.settings.agent_skill, |s, on| s.agent_skill = on, cx),
+                )
+                .about("Puts Deck's skill in the skills folder of each agent you have (Claude Code, Codex, Gemini, OpenCode, Cursor, Grok and others): how to run a dev server in a pane you both watch, read its logs, and open, click through and debug pages in Deck's browser. A copy you edit is left alone. Off removes Deck's copies.")],
+                None,
             ),
             group(
                 "Recovery",
@@ -1908,7 +1980,7 @@ impl SettingsPane {
 }
 
 /// A plain push button, the kind System Settings puts at a row's end.
-fn button(id: &'static str, label: &'static str) -> Stateful<Div> {
+fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
         .id(id)
         .flex()
@@ -1924,7 +1996,7 @@ fn button(id: &'static str, label: &'static str) -> Stateful<Div> {
         .text_color(rgb(theme::text()))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(theme::surface_hover())))
-        .child(label)
+        .child(label.into())
 }
 
 impl Render for SettingsPane {
@@ -1948,7 +2020,7 @@ impl Render for SettingsPane {
 
         // Each child of the scrolled column is one item, so the sidebar can
         // bring a section to the top.
-        let item = || div().w(u(PAGE_W)).max_w(relative(1.)).px(u(32.));
+        let item = || div().w(u(PAGE_W)).max_w(relative(1.)).px(u(28.));
         let title = |t: SharedString| {
             item().pt(u(32.)).pb(u(8.)).child(
                 div()
@@ -1972,6 +2044,9 @@ impl Render for SettingsPane {
             .track_scroll(&self.scroll);
         if q.is_empty() {
             let page = self.page;
+            if page == Page::Models {
+                self.watch_models(cx);
+            }
             column = column.child(title(page.name().into()));
             for (p, secs) in outline {
                 if p == page {
@@ -2026,6 +2101,7 @@ impl Render for SettingsPane {
             .bg(rgb(theme::pane()))
             .child(sidebar)
             .child(column)
+            .children(self.models.menu.as_ref().map(crate::menu::Open::render))
     }
 }
 
@@ -2041,7 +2117,7 @@ fn avatar(a: &crate::account::Account, size: f32) -> AnyElement {
         .bg(rgb(theme::accent()))
         .text_size(u(size * 0.45))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(0xffffff))
+        .text_color(rgb(theme::on_accent()))
         .child(a.initial())
         .into_any_element()
 }

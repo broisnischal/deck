@@ -50,11 +50,24 @@ pub struct Settings {
     pub asked_default_terminal: bool,
     /// Look for a newer deck now and then.
     pub check_updates: bool,
+    /// Download a newer deck in the background and put it in place at quit.
+    pub install_updates: bool,
     /// Programs' coloured backgrounds in terminals drawn as a tint.
     pub soften_backgrounds: bool,
+    /// A menu of completions under the cursor at a zsh prompt, as you type.
+    pub complete_menu: bool,
+    /// Deck's skill in every coding agent's skills folder, so agents know
+    /// how to run commands and drive the browser where you can see them.
+    pub agent_skill: bool,
+    /// The strip along the bottom: running commands, pages and dev servers.
+    pub status_bar: bool,
     /// Your shortcuts, by `workspace::SHORTCUTS` id: a key in gpui's form
     /// ("cmd-shift-k"), or "" for none. Absent ones keep Deck's.
     pub keys: std::collections::BTreeMap<String, String>,
+    /// Where Deck's own AI jobs run, by `refine::JOBS` id: `claude:haiku`,
+    /// `ollama:qwen2.5-coder:7b`, `lmstudio:…` or `off`. A job not listed
+    /// runs on Claude with `refine_model`, as it always has.
+    pub routes: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -63,7 +76,7 @@ impl Default for Settings {
             theme: theme::Theme::default(),
             font_px: theme::FONT_PX,
             zoom: DEFAULT_ZOOM,
-            font_family: theme::MONO.into(),
+            font_family: theme::TERM_FONT.into(),
             line_height: DEFAULT_LINE_HEIGHT,
             scheme: Scheme::default(),
             cursor: Cursor::default(),
@@ -78,8 +91,13 @@ impl Default for Settings {
             auto_retry: true,
             asked_default_terminal: false,
             check_updates: true,
+            install_updates: true,
             soften_backgrounds: true,
+            complete_menu: true,
+            agent_skill: true,
+            status_bar: true,
             keys: Default::default(),
+            routes: Default::default(),
             access: Access::default(),
         }
     }
@@ -337,6 +355,7 @@ impl Settings {
             blink: self.cursor_blink,
             option_meta: self.option_as_meta,
             soften: self.soften_backgrounds,
+            complete: self.complete_menu,
         }
     }
 
@@ -410,9 +429,19 @@ struct Stored {
     #[serde(deserialize_with = "lenient")]
     check_updates: Option<bool>,
     #[serde(deserialize_with = "lenient")]
+    install_updates: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
     soften_backgrounds: Option<bool>,
     #[serde(deserialize_with = "lenient")]
+    complete_menu: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    agent_skill: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    status_bar: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
     keys: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(deserialize_with = "lenient")]
+    routes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A value that does not parse (a scheme a newer build added, a string
@@ -469,7 +498,11 @@ fn from_stored(s: Stored) -> Settings {
         auto_retry: s.auto_retry.unwrap_or(d.auto_retry),
         asked_default_terminal: s.asked_default_terminal.unwrap_or(d.asked_default_terminal),
         check_updates: s.check_updates.unwrap_or(d.check_updates),
+        install_updates: s.install_updates.unwrap_or(d.install_updates),
         soften_backgrounds: s.soften_backgrounds.unwrap_or(d.soften_backgrounds),
+        complete_menu: s.complete_menu.unwrap_or(d.complete_menu),
+        agent_skill: s.agent_skill.unwrap_or(d.agent_skill),
+        status_bar: s.status_bar.unwrap_or(d.status_bar),
         // A key that does not parse is dropped, so Deck's comes back.
         keys: s
             .keys
@@ -477,20 +510,32 @@ fn from_stored(s: Stored) -> Settings {
             .into_iter()
             .filter(|(_, k)| k.is_empty() || gpui::Keystroke::parse(k).is_ok())
             .collect(),
+        // So does a route that does not parse: the job goes back to Claude.
+        routes: s
+            .routes
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(job, r)| !job.is_empty() && crate::local::Route::parse(r).is_some())
+            .collect(),
     }
 }
 
+/// Loading or saving also hands the routes to `refine`, so Deck's AI jobs
+/// run where Settings says from launch on.
 pub fn load() -> Settings {
     let stored: Stored = std::fs::read(path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
-    from_stored(stored)
+    let s = from_stored(stored);
+    crate::refine::set_routes(&s.routes);
+    s
 }
 
 /// Written to a temp file and renamed, so a crash mid-write cannot leave a
 /// half file that resets everything on the next launch.
 pub fn save(s: &Settings) {
+    crate::refine::set_routes(&s.routes);
     let target = path();
     let tmp = target.with_extension("json.tmp");
     let write = || -> std::io::Result<()> {
@@ -535,7 +580,7 @@ mod tests {
             }
         );
         assert_eq!(s.search, Search::Google);
-        assert_eq!(s.font_family, "Menlo");
+        assert_eq!(s.font_family, crate::theme::TERM_FONT);
     }
 
     #[test]
@@ -560,8 +605,17 @@ mod tests {
             auto_retry: false,
             asked_default_terminal: true,
             check_updates: false,
+            install_updates: false,
             soften_backgrounds: false,
+            complete_menu: false,
+            agent_skill: false,
+            status_bar: false,
             keys: [("palette".to_string(), "cmd-p".to_string())].into(),
+            routes: [
+                ("rewrite".to_string(), "ollama:qwen2.5-coder:7b".to_string()),
+                ("shell".to_string(), "off".to_string()),
+            ]
+            .into(),
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(parse(&json), s);
@@ -578,8 +632,23 @@ mod tests {
         assert_eq!(s.scheme, Scheme::Deck);
         assert_eq!(s.line_height, DEFAULT_LINE_HEIGHT);
         assert_eq!(s.cursor, Cursor::Bar);
-        assert_eq!(s.font_family, "Menlo");
+        assert_eq!(s.font_family, crate::theme::TERM_FONT);
         assert_eq!(parse(r#"{"line_height": 9}"#).line_height, 2.0);
+    }
+
+    #[test]
+    fn routes_keep_only_what_parses() {
+        let s =
+            parse(r#"{"routes": {"rewrite": "ollama:llama3.2:3b", "shell": "gpt:4", "": "off"}}"#);
+        assert_eq!(
+            s.routes,
+            [("rewrite".to_string(), "ollama:llama3.2:3b".to_string())].into()
+        );
+        assert!(parse(r#"{"routes": "all local"}"#).routes.is_empty());
+        assert!(
+            Settings::default().routes.is_empty(),
+            "every job starts on Claude"
+        );
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub enum Pick {
     Snippet(String),
     /// Keep the typed text as a new snippet.
     SaveSnippet(String),
+    /// Type this command at the terminal's prompt, as it was (not run).
+    Command(String),
 }
 
 impl Clone for Pick {
@@ -43,6 +45,7 @@ impl Clone for Pick {
             Pick::Review(t) => Pick::Review(t.clone()),
             Pick::Snippet(t) => Pick::Snippet(t.clone()),
             Pick::SaveSnippet(t) => Pick::SaveSnippet(t.clone()),
+            Pick::Command(t) => Pick::Command(t.clone()),
         }
     }
 }
@@ -54,6 +57,7 @@ pub enum Kind {
     Snippet,
     File,
     Page,
+    Command,
 }
 
 impl Kind {
@@ -64,6 +68,7 @@ impl Kind {
             Kind::Snippet => "Snippets",
             Kind::File => "Files",
             Kind::Page => "Pages",
+            Kind::Command => "History",
         }
     }
 }
@@ -99,6 +104,9 @@ pub struct Palette {
     /// Opened with ⌘;: only snippets, all of them shown before anything is
     /// typed, and what you type can be kept as a new one.
     snippets_only: bool,
+    /// Opened with ⌃R in a terminal: the commands run there and in your
+    /// shell's history, newest first, all shown before anything is typed.
+    history_only: bool,
     /// (item index, matched byte positions), best first.
     shown: Vec<(Ref, Vec<usize>)>,
     selected: usize,
@@ -127,6 +135,14 @@ impl Palette {
             "Search tabs, actions, snippets, files and pages…"
         };
         Self::build(items, tasks, false, hint, cx)
+    }
+
+    /// Commands to run again (⌃R in a terminal), newest first.
+    pub fn history(items: Vec<Item>, cx: &mut Context<Self>) -> Self {
+        let mut p = Self::build(items, false, false, "Search commands you've run…", cx);
+        p.history_only = true;
+        p.refilter(cx);
+        p
     }
 
     /// The snippets alone (⌘;).
@@ -171,6 +187,7 @@ impl Palette {
             pages: Vec::new(),
             tasks,
             snippets_only,
+            history_only: false,
             shown: Vec::new(),
             selected: 0,
             child_of: Vec::new(),
@@ -216,8 +233,9 @@ impl Palette {
             // Nothing typed: the tabs, then what you can do. Files and pages
             // only once there is something to look for.
             for (i, it) in self.items.iter().enumerate() {
-                if matches!(it.kind, Kind::Tab | Kind::Action)
+                if (!self.history_only && matches!(it.kind, Kind::Tab | Kind::Action))
                     || (self.snippets_only && it.kind == Kind::Snippet)
+                    || (self.history_only && it.kind == Kind::Command)
                 {
                     hits.push((0, it.kind, Ref::Item(i), Vec::new()));
                 }
@@ -254,6 +272,7 @@ impl Palette {
                         Kind::Snippet => 3,
                         Kind::Page => 0,
                         Kind::File => -2,
+                        Kind::Command => 0,
                     };
                     hits.push((s + kind_bonus, it.kind, r, at));
                 }
@@ -406,34 +425,24 @@ impl Render for Palette {
                     .id(ElementId::NamedInteger("pal".into(), row as u64))
                     .flex()
                     .items_center()
-                    .gap(u(12.))
-                    .h(u(40.))
+                    .gap(u(10.))
+                    .h(u(34.))
                     .px(u(10.))
-                    .rounded(u(8.))
+                    // Concentric with the palette: its 14 less the list's 8.
+                    .rounded(u(6.))
                     .text_size(u(13.))
                     .cursor_pointer()
-                    // On the palette's own surface: hover a step up from it,
-                    // the selection a step more.
-                    .when(selected, |d| d.bg(rgb(theme::surface_hover())))
-                    .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::surface()))))
+                    // The sidebar's own row states, so the palette reads as
+                    // part of the window in every theme.
+                    .when(selected, |d| d.bg(rgb(theme::surface())))
+                    .when(!selected, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
                     .child(
                         div()
                             .flex_none()
-                            .size(u(26.))
+                            .w(u(18.))
                             .flex()
-                            .items_center()
                             .justify_center()
-                            .rounded(u(7.))
-                            .bg(rgba(theme::tint()))
-                            .child(icon(
-                                glyph,
-                                14.,
-                                if selected {
-                                    theme::text()
-                                } else {
-                                    theme::text_2()
-                                },
-                            )),
+                            .child(icon(glyph, 15., if selected { theme::text() } else { theme::dim() })),
                     )
                     .child(
                         div()
@@ -447,13 +456,13 @@ impl Render for Palette {
                                     .flex_shrink()
                                     .min_w_0()
                                     .truncate()
-                                    .text_color(rgb(theme::text_2()))
+                                    .text_color(rgb(if selected { theme::text() } else { theme::text_2() }))
                                     .child(title),
                             )
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
+                                    .flex_none()
+                                    .max_w(u(200.))
                                     .truncate()
                                     .text_size(u(12.))
                                     .text_color(rgb(theme::dim()))
@@ -475,14 +484,8 @@ impl Render for Palette {
                     .children(hint.map(|h| {
                         div()
                             .flex_none()
-                            .px(u(6.))
-                            .h(u(20.))
-                            .flex()
-                            .items_center()
-                            .rounded(u(5.))
-                            .bg(rgba(theme::tint()))
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::text_2()))
+                            .text_size(u(11.5))
+                            .text_color(rgb(if selected { theme::text_2() } else { theme::dim() }))
                             .child(h)
                     }))
                     .on_click(cx.listener(move |p, _, _, cx| p.run_at(row, cx))),
@@ -497,6 +500,8 @@ impl Render for Palette {
                     .text_color(rgb(theme::dim()))
                     .child(if self.snippets_only {
                         "No snippets yet. Type one and press ⏎ to keep it."
+                    } else if self.history_only {
+                        "No commands yet"
                     } else {
                         "Nothing matches"
                     }),
@@ -505,14 +510,15 @@ impl Render for Palette {
 
         div()
             .id("palette")
-            .w(u(660.))
+            .w(u(620.))
             .max_w(relative(0.9))
             .flex()
             .flex_col()
             .rounded(u(14.))
-            .bg(rgb(theme::menu()))
+            // The panes' own colour with a firmer edge, not a menu grey.
+            .bg(rgb(theme::pane()))
             .border_1()
-            .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
+            .border_color(rgba(theme::strong_edge()))
             .shadow_lg()
             .overflow_hidden()
             .child(
@@ -520,12 +526,12 @@ impl Render for Palette {
                     .flex()
                     .items_center()
                     .gap(u(10.))
-                    .h(u(56.))
+                    .h(u(50.))
                     .pl(u(18.))
                     .pr(u(14.))
                     .border_b_1()
                     .border_color(rgba(theme::hairline()))
-                    .text_size(u(15.))
+                    .text_size(u(14.5))
                     .child(icon(Icon::Search, 16., theme::dim()))
                     .child(self.field.clone())
                     .child(
@@ -547,8 +553,8 @@ impl Render for Palette {
                 div()
                     .flex()
                     .items_center()
-                    .gap(u(18.))
-                    .h(u(38.))
+                    .gap(u(16.))
+                    .h(u(34.))
                     .px(u(18.))
                     .border_t_1()
                     .border_color(rgba(theme::hairline()))

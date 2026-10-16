@@ -189,18 +189,19 @@ pub fn running_app() -> Option<PathBuf> {
 }
 
 /// Hand the swap to a script that waits for deck to quit, moves the new app
-/// into place and opens it. The caller quits right after.
-pub fn install_on_quit(new_app: &Path) -> Result<(), String> {
+/// into place and (when `reopen`) opens it. The caller quits right after.
+pub fn install_on_quit(new_app: &Path, reopen: bool) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     let app = running_app().ok_or("deck is not running from an app bundle")?;
     let pid = std::process::id();
     let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', r"'\''"));
     let script = format!(
         "while kill -0 {pid} 2>/dev/null; do sleep 0.2; done; \
-         rm -rf {old}; mv {app} {old} && mv {new} {app} && rm -rf {old}; open {app}",
+         rm -rf {old}; mv {app} {old} && mv {new} {app} && rm -rf {old}{open}",
         old = q(&app.with_extension("app.old")),
         app = q(&app),
         new = q(new_app),
+        open = if reopen { format!("; open {}", q(&app)) } else { String::new() },
     );
     let mut cmd = std::process::Command::new("/bin/sh");
     cmd.args(["-c", &script])

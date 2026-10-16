@@ -17,6 +17,8 @@ pub struct Saved {
     pub agent: String,
     pub cwd: PathBuf,
     pub full_access: bool,
+    /// The model this thread asked for; `None` is the agent's default.
+    pub model: Option<String>,
     pub title: String,
     pub transcript: Transcript,
     pub draft: String,

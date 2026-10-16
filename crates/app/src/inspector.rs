@@ -197,7 +197,7 @@ pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) 
             None => info(ws, title, cx),
         },
         Section::Files => files(ws, cx),
-        Section::Git => git(ws),
+        Section::Git => git(ws, cx),
     };
 
     div()
@@ -205,7 +205,7 @@ pub fn render(ws: &Workspace, title: SharedString, cx: &mut Context<Workspace>) 
         .flex()
         .flex_col()
         .flex_none()
-        .w(u(theme::INSPECTOR_PX))
+        .w(u(ws.inspector_width()))
         .h_full()
         .pl(u(theme::GUTTER + 4.))
         .pr(u(theme::GUTTER + 4.))
@@ -474,14 +474,27 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
                         .min_w_0()
                         .child(div().w_full().truncate().child(e.name.clone())),
                 )
-                .on_click(cx.listener(move |ws, _, _, cx| {
+                .on_click(cx.listener(move |ws, ev: &gpui::ClickEvent, window, cx| {
                     if is_dir {
                         if !ws.inspector.expanded.remove(&path) {
                             ws.inspector.expanded.insert(path.clone());
                         }
                         ws.refresh_inspector(cx);
-                    } else {
+                    } else if ev.modifiers().alt {
+                        // ⌥-click: the app macOS opens it with.
                         cx.open_with_system(&path);
+                    } else {
+                        // In Deck's editor, on its project.
+                        let root = ws.inspector.data.root.clone();
+                        let rel = root
+                            .as_ref()
+                            .and_then(|r| path.strip_prefix(r).ok())
+                            .map(|p| p.to_string_lossy().into_owned());
+                        if let (Some(root), Some(rel)) = (root, rel) {
+                            if let Err(e) = ws.open_editor("files", Some(root), Some((rel, None, false)), window, cx) {
+                                tracing::warn!("could not open the editor: {e}");
+                            }
+                        }
                     }
                 })),
         );
@@ -494,75 +507,350 @@ fn files(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     col.into_any_element()
 }
 
-fn git(ws: &Workspace) -> AnyElement {
+fn git(ws: &Workspace, cx: &mut Context<Workspace>) -> AnyElement {
     let Some(g) = &ws.inspector.data.git else {
         return empty("Not a git repository").pt(u(16.)).into_any_element();
     };
-    let mut col = div().flex().flex_col().child(
+    let Some(root) = ws.inspector.data.root.clone() else {
+        return empty("No project").pt(u(16.)).into_any_element();
+    };
+    let ansi = theme::current().ansi;
+    let mut col = div().flex().flex_col().pt(u(12.));
+
+    // The branch, where it tracks, and the way into the editor's git views.
+    let tracking: SharedString = match &g.upstream {
+        Some(up) => format!("Tracking {up}").into(),
+        None => "Not published".into(),
+    };
+    let (r1, r2) = (root.clone(), root.clone());
+    col = col.child(
         div()
             .flex()
-            .items_center()
-            .gap(u(8.))
-            .pt(u(14.))
+            .flex_col()
+            .gap(u(10.))
+            .p(u(12.))
+            .rounded(u(10.))
+            .bg(rgb(theme::raised()))
+            .border_1()
+            .border_color(rgba(theme::hairline()))
             .child(
                 div()
-                    .text_size(u(15.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(g.branch.clone()),
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .child(icon(Icon::Git, 14., theme::text_2()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(u(14.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(g.branch.clone()),
+                    )
+                    .when(g.ahead > 0, |d| d.child(count_pill(format!("↑{}", g.ahead))))
+                    .when(g.behind > 0, |d| d.child(count_pill(format!("↓{}", g.behind)))),
             )
-            .when(g.ahead > 0, |d| {
-                d.child(
-                    div()
-                        .text_color(rgb(theme::text_2()))
-                        .child(format!("↑{}", g.ahead)),
-                )
-            })
-            .when(g.behind > 0, |d| {
-                d.child(
-                    div()
-                        .text_color(rgb(theme::text_2()))
-                        .child(format!("↓{}", g.behind)),
-                )
-            }),
+            .child(
+                div()
+                    .text_size(u(11.5))
+                    .text_color(rgb(theme::dim()))
+                    .child(tracking),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(u(6.))
+                    .child(card_button("git-changes", Icon::Pencil, "Changes").on_click(cx.listener(
+                        move |ws, _, window, cx| {
+                            let _ = ws.open_editor("changes", Some(r1.clone()), None, window, cx);
+                        },
+                    )))
+                    .child(card_button("git-history", Icon::Clock, "History").on_click(cx.listener(
+                        move |ws, _, window, cx| {
+                            let _ = ws.open_editor("history", Some(r2.clone()), None, window, cx);
+                        },
+                    ))),
+            ),
     );
-    col = col.child(header("Changes", Some(g.files.len())));
+
+    // Other checkouts of this repository.
+    if g.worktrees.len() > 1 {
+        col = col.child(header("Worktrees", Some(g.worktrees.len())));
+        for (i, w) in g.worktrees.iter().enumerate() {
+            let name = w
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| w.path.display().to_string());
+            let path = w.path.clone();
+            col = col.child(
+                git_row(ElementId::NamedInteger("wt".into(), i as u64))
+                    .child(icon(Icon::Folder, 13., if w.current { theme::text() } else { theme::text_2() }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(u(6.))
+                            .child(div().flex_none().text_color(rgb(theme::text())).child(name))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(u(11.5))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(w.branch.clone().unwrap_or_else(|| "detached".into())),
+                            ),
+                    )
+                    .when(w.current, |d| d.child(count_pill("here".into())))
+                    .on_click(cx.listener(move |ws, _, window, cx| {
+                        let _ = ws.open_editor("changes", Some(path.clone()), None, window, cx);
+                    })),
+            );
+        }
+    }
+
+    // Changes, the way a commit sees them: staged, then the rest.
+    let staged: Vec<&inspect::GitFile> = g.files.iter().filter(|f| f.staged).collect();
+    let changed: Vec<&inspect::GitFile> = g.files.iter().filter(|f| f.unstaged && f.status != "??").collect();
+    let untracked: Vec<&inspect::GitFile> = g.files.iter().filter(|f| f.status == "??").collect();
     if g.files.is_empty() {
-        col = col.child(
-            div()
-                .text_size(u(13.))
-                .text_color(rgb(theme::text_2()))
-                .child("Working tree clean"),
-        );
+        col = col.child(header("Changes", None)).child(empty("Working tree clean"));
     }
-    for f in &g.files {
-        let color = match f.status.as_str() {
-            // The letter carries the meaning; weight of grey ranks it.
-            "U" | "D" => theme::text(),
-            "??" => theme::dim(),
-            _ => theme::text_2(),
-        };
-        col = col.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(u(8.))
-                .h(u(24.))
-                .text_size(u(13.))
-                .child(
-                    div()
-                        .w(u(18.))
-                        .text_size(u(11.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(color))
-                        .child(f.status.clone()),
-                )
-                .child(
-                    div()
-                        .truncate()
-                        .text_color(rgb(theme::text_2()))
-                        .child(f.path.clone()),
-                ),
-        );
+    const SHOWN: usize = 8;
+    for (title, list, key) in [("Staged", &staged, 0u64), ("Changes", &changed, 1), ("Untracked", &untracked, 2)] {
+        if list.is_empty() {
+            continue;
+        }
+        col = col.child(header(title, Some(list.len())));
+        for (i, f) in list.iter().take(SHOWN).enumerate() {
+            let (letter, color) = match f.status.as_str() {
+                "A" => ("A", ansi[2]),
+                "D" => ("D", ansi[1]),
+                "R" | "C" => (if f.status == "R" { "R" } else { "C" }, ansi[4]),
+                "U" => ("U", ansi[1]),
+                "??" => ("?", ansi[2]),
+                _ => ("M", ansi[3]),
+            };
+            let (dir, name) = match f.path.trim_end_matches('/').rfind('/') {
+                Some(cut) => (f.path[..cut].to_string(), f.path[cut + 1..].to_string()),
+                None => (String::new(), f.path.clone()),
+            };
+            let rel = f.path.clone();
+            let root = root.clone();
+            col = col.child(
+                git_row(ElementId::NamedInteger(format!("gf{key}").into(), i as u64))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(u(12.))
+                            .font_family(theme::MONO)
+                            .text_size(u(11.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(color))
+                            .child(letter),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(u(6.))
+                            .child(div().flex_none().text_color(rgb(theme::text())).child(name))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(u(11.5))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(dir),
+                            ),
+                    )
+                    .on_click(cx.listener(move |ws, _, window, cx| {
+                        let file = Some((rel.clone(), None, true));
+                        let _ = ws.open_editor("changes", Some(root.clone()), file, window, cx);
+                    })),
+            );
+        }
+        if list.len() > SHOWN {
+            let root = root.clone();
+            col = col.child(
+                git_row(ElementId::NamedInteger(format!("gm{key}").into(), 0))
+                    .child(div().w(u(12.)))
+                    .child(
+                        div()
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::dim()))
+                            .child(format!("{} more", list.len() - SHOWN)),
+                    )
+                    .on_click(cx.listener(move |ws, _, window, cx| {
+                        let _ = ws.open_editor("changes", Some(root.clone()), None, window, cx);
+                    })),
+            );
+        }
     }
-    col.into_any_element()
+
+    // The latest commits; merges drawn as an open ring.
+    if !g.commits.is_empty() {
+        col = col.child(header("History", None));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for (i, c) in g.commits.iter().enumerate() {
+            let hash = c.hash.clone();
+            let root = root.clone();
+            let refs: Vec<String> = c
+                .refs
+                .iter()
+                .map(|r| r.trim_start_matches("HEAD -> ").trim_start_matches("tag: ").to_string())
+                .filter(|r| r != "HEAD")
+                .take(2)
+                .collect();
+            let dot = div().flex_none().size(u(8.)).rounded_full().mt(u(5.));
+            let dot = if c.merge {
+                dot.border_2().border_color(rgb(theme::text_2()))
+            } else {
+                dot.bg(rgb(if i == 0 { theme::text() } else { theme::text_2() }))
+            };
+            col = col.child(
+                div()
+                    .id(ElementId::NamedInteger("commit".into(), i as u64))
+                    .flex()
+                    .items_start()
+                    .gap(u(10.))
+                    .py(u(5.))
+                    .px(u(6.))
+                    .mx(u(-6.))
+                    .rounded(u(6.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::row_hover())))
+                    .child(dot)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(u(2.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(u(8.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(u(12.5))
+                                            .text_color(rgb(theme::text()))
+                                            .child(c.subject.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(u(11.))
+                                            .text_color(rgb(theme::dim()))
+                                            .child(since(now - c.date)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(u(6.))
+                                    .text_size(u(11.))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(div().font_family(theme::MONO).child(c.short.clone()))
+                                    .child(div().min_w_0().truncate().child(c.author.clone()))
+                                    .children(refs.into_iter().map(ref_pill)),
+                            ),
+                    )
+                    .on_click(cx.listener(move |ws, _, window, cx| {
+                        let _ = ws.open_commit(root.clone(), hash.clone(), window, cx);
+                    })),
+            );
+        }
+    }
+    col.pb(u(16.)).into_any_element()
+}
+
+/// A row in the Git tab: full width, rounded, hover-tinted.
+fn git_row(id: ElementId) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(u(8.))
+        .h(u(26.))
+        .px(u(6.))
+        .mx(u(-6.))
+        .rounded(u(6.))
+        .text_size(u(12.5))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::row_hover())))
+}
+
+fn count_pill(text: String) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(u(6.))
+        .h(u(18.))
+        .flex()
+        .items_center()
+        .rounded(u(9.))
+        .bg(rgb(theme::surface()))
+        .text_size(u(11.))
+        .text_color(rgb(theme::text_2()))
+        .child(text)
+}
+
+fn ref_pill(name: String) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(u(5.))
+        .h(u(16.))
+        .flex()
+        .items_center()
+        .rounded(u(4.))
+        .border_1()
+        .border_color(rgba(theme::input_edge()))
+        .text_size(u(10.5))
+        .text_color(rgb(theme::text_2()))
+        .child(name)
+}
+
+/// A compact button inside the branch card.
+fn card_button(id: &'static str, glyph: Icon, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .gap(u(6.))
+        .h(u(28.))
+        .rounded(u(6.))
+        .bg(rgb(theme::surface()))
+        .text_size(u(12.))
+        .text_color(rgb(theme::text()))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::surface_hover())))
+        .child(icon(glyph, 12., theme::text_2()))
+        .child(label)
+}
+
+/// "now", "5m", "3h", "2d", "4w", "8mo", "2y".
+fn since(secs: i64) -> String {
+    let s = secs.max(0);
+    match s {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        86_400..=604_799 => format!("{}d", s / 86_400),
+        604_800..=2_591_999 => format!("{}w", s / 604_800),
+        2_592_000..=31_535_999 => format!("{}mo", s / 2_592_000),
+        _ => format!("{}y", s / 31_536_000),
+    }
 }

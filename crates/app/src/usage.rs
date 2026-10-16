@@ -1,0 +1,1716 @@
+//! AI usage for the usage panel and the status-bar meter: the plan limits
+//! Claude Code and Codex report, and the tokens Claude Code's transcripts
+//! record. Everything here blocks, so call it from a background thread.
+//!
+//! - `claude_limits() -> Result<Limits, String>`: Claude's plan windows
+//!   ("5-hour", "Weekly", "Weekly Opus", ...) from Anthropic's OAuth usage
+//!   endpoint, signed in as Claude Code is. Kept for 2 minutes; after a
+//!   network or server failure it waits 5 minutes before asking again.
+//! - `codex_limits() -> Option<Limits>`: Codex's windows, from the last
+//!   `token_count` event in its newest session logs. `None` when Codex has
+//!   never reported any.
+//! - `claude_session(cwd, id) -> Option<SessionUse>`: one conversation's
+//!   context fill (from the end of its transcript), and its tokens and cost
+//!   (the whole transcript plus its sub-agents' transcripts).
+//! - `claude_latest_session(cwd) -> Option<String>`: the most recently
+//!   written conversation in `cwd`.
+//! - `claude_today() -> DayUse`: tokens and cost across every project since
+//!   local midnight.
+//!
+//! Percentages run 0-100 (a window can run past 100). Costs are dollars at
+//! Anthropic's API prices: what the tokens would cost without a plan.
+//! Transcripts are scanned once and then only their new lines are read, so
+//! repeat calls stay cheap even on 200 MB files.
+
+#![allow(dead_code)]
+
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// One rate-limit window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Limit {
+    /// "5-hour", "Weekly", "Weekly Opus", "Monthly".
+    pub label: String,
+    /// Share of the window used, 0-100.
+    pub used_pct: f32,
+    pub resets_at: Option<SystemTime>,
+}
+
+/// An agent's plan and its windows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Limits {
+    /// "claude" or "codex".
+    pub agent: &'static str,
+    /// "Max 5x", "Team (Max 5x)", "Pro", "Plus", "Free".
+    pub plan: Option<String>,
+    pub limits: Vec<Limit>,
+    /// When the numbers were read: the request for Claude, the agent's own
+    /// event for Codex.
+    pub fetched: SystemTime,
+}
+
+/// One Claude Code conversation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionUse {
+    /// The model of the last reply, e.g. "claude-opus-5-5".
+    pub model: Option<String>,
+    /// What the last reply read: its input, cache reads and cache writes.
+    pub context_used: u64,
+    /// 1,000,000 or 200,000.
+    pub context_window: u64,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    /// Prompts you typed.
+    pub turns: u32,
+    /// `None` when no reply came from a model with a known price.
+    pub cost_usd: Option<f64>,
+}
+
+/// Claude Code across every project since local midnight.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DayUse {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd: Option<f64>,
+    /// Conversations with a reply today.
+    pub sessions: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Claude plan limits
+
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const EXPIRED: &str = "Claude Code's sign-in expired; open claude to refresh it";
+const SIGNED_OUT: &str = "Claude Code isn't signed in to a Claude plan; run claude and log in";
+const FRESH: Duration = Duration::from_secs(120);
+const BACKOFF: Duration = Duration::from_secs(300);
+
+/// The last answer, when it was got, and how long it stands.
+type Kept = (Instant, Result<Limits, String>, Duration);
+static CLAUDE_LIMITS: Mutex<Option<Kept>> = Mutex::new(None);
+
+enum Failure {
+    /// Sign-in trouble: checked again as often as a good answer.
+    Sign(String),
+    /// The network or the server: backed off.
+    Net(String),
+}
+
+/// Claude's plan windows, as Claude Code's `/usage` shows them.
+pub fn claude_limits() -> Result<Limits, String> {
+    // Held across the request, so callers on other threads wait for it
+    // rather than sending their own.
+    let mut slot = CLAUDE_LIMITS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, answer, keep)) = slot.as_ref() {
+        if at.elapsed() < *keep {
+            return answer.clone();
+        }
+    }
+    let (answer, keep) = match fetch_claude_limits() {
+        Ok(l) => (Ok(l), FRESH),
+        Err(Failure::Sign(e)) => (Err(e), FRESH),
+        Err(Failure::Net(e)) => (Err(e), BACKOFF),
+    };
+    *slot = Some((Instant::now(), answer.clone(), keep));
+    answer
+}
+
+fn fetch_claude_limits() -> Result<Limits, Failure> {
+    let creds = claude_creds().ok_or_else(|| Failure::Sign(SIGNED_OUT.into()))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if creds.expires_ms.is_some_and(|e| e <= now_ms) {
+        return Err(Failure::Sign(EXPIRED.into()));
+    }
+    let (status, body) = get_usage(&creds.token)?;
+    drop(creds.token);
+    match status {
+        200 => {}
+        401 => return Err(Failure::Sign(EXPIRED.into())),
+        429 => {
+            return Err(Failure::Net(
+                "Claude's usage service is busy; trying again soon".into(),
+            ))
+        }
+        s => return Err(Failure::Net(format!("Claude's usage service answered {s}"))),
+    }
+    let limits = parse_claude_usage(&body)
+        .ok_or_else(|| Failure::Net("Couldn't read Claude's usage answer".into()))?;
+    Ok(Limits {
+        agent: "claude",
+        plan: creds.plan,
+        limits,
+        fetched: SystemTime::now(),
+    })
+}
+
+/// Claude Code's OAuth sign-in. The token lives only as long as this does.
+struct Creds {
+    token: String,
+    expires_ms: Option<u64>,
+    plan: Option<String>,
+}
+
+/// Claude Code keeps its sign-in in the keychain, or in
+/// `.credentials.json` in its config folder where there is no keychain.
+fn claude_creds() -> Option<Creds> {
+    keychain_creds()
+        .and_then(|raw| parse_creds(&raw))
+        .or_else(|| {
+            let raw = std::fs::read(claude_home().join(".credentials.json")).ok()?;
+            parse_creds(&raw)
+        })
+}
+
+/// Read with `security`, as Claude Code does, so no keychain prompt shows.
+fn keychain_creds() -> Option<Vec<u8>> {
+    let out = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", &keychain_service(), "-w"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// "Claude Code-credentials", with "-" and the first 8 hex digits of the
+/// SHA-256 of the config folder after it when `CLAUDE_CONFIG_DIR` (or
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`) moves it, as Claude Code names it.
+fn keychain_service() -> String {
+    let dir = match std::env::var("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+        Ok(d) => Some(d).filter(|d| !d.is_empty()),
+        Err(_) => std::env::var("CLAUDE_CONFIG_DIR")
+            .ok()
+            .filter(|d| !d.is_empty()),
+    };
+    match dir {
+        Some(d) => format!("Claude Code-credentials-{}", sha256_hex8(&d)),
+        None => "Claude Code-credentials".into(),
+    }
+}
+
+/// The first 4 bytes of a SHA-256, in hex, through CommonCrypto.
+fn sha256_hex8(s: &str) -> String {
+    extern "C" {
+        fn CC_SHA256(data: *const std::ffi::c_void, len: u32, md: *mut u8) -> *mut u8;
+    }
+    let mut md = [0u8; 32];
+    // SAFETY: CC_SHA256 reads `len` bytes and writes 32 into `md`.
+    unsafe { CC_SHA256(s.as_ptr().cast(), s.len() as u32, md.as_mut_ptr()) };
+    md[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_creds(raw: &[u8]) -> Option<Creds> {
+    let v: Value = serde_json::from_slice(raw).ok()?;
+    let o = v.get("claudeAiOauth")?;
+    let token = o
+        .get("accessToken")?
+        .as_str()
+        .filter(|t| !t.is_empty())?
+        .to_string();
+    Some(Creds {
+        token,
+        expires_ms: o.get("expiresAt").and_then(Value::as_u64),
+        plan: claude_plan(
+            o.get("subscriptionType").and_then(Value::as_str),
+            o.get("rateLimitTier").and_then(Value::as_str),
+        ),
+    })
+}
+
+/// "max" with tier "default_claude_max_20x" is "Max 20x"; "team" with a
+/// Max tier is "Team (Max 5x)".
+fn claude_plan(sub: Option<&str>, tier: Option<&str>) -> Option<String> {
+    let sub = sub.filter(|s| !s.is_empty())?;
+    let name = capitalize(sub);
+    let tier = tier.unwrap_or("");
+    let mult = tier.split('_').find(|w| {
+        w.len() > 1 && w.ends_with('x') && w[..w.len() - 1].bytes().all(|b| b.is_ascii_digit())
+    });
+    Some(match mult {
+        Some(m) if sub == "max" => format!("Max {m}"),
+        Some(m) if tier.contains("max") => format!("{name} (Max {m})"),
+        _ => name,
+    })
+}
+
+/// One GET through `/usr/bin/curl`, the token handed over on its stdin as
+/// a config file so it never shows on a command line, nor lands in a URL
+/// cache on disk. The status, and the body.
+fn get_usage(token: &str) -> Result<(u16, Vec<u8>), Failure> {
+    use std::process::{Command, Stdio};
+    if token
+        .bytes()
+        .any(|b| !b.is_ascii_graphic() || b == b'"' || b == b'\\')
+    {
+        return Err(Failure::Sign(EXPIRED.into()));
+    }
+    let unreachable = || Failure::Net("Couldn't reach Claude's usage service".into());
+    let mut child = Command::new("/usr/bin/curl")
+        .args([
+            "--silent",
+            "--max-time",
+            "15",
+            "--proto",
+            "=https",
+            "--config",
+            "-",
+            "--write-out",
+            "\n%{http_code}",
+            USAGE_URL,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| unreachable())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let config = format!(
+            "header = \"Authorization: Bearer {token}\"\n\
+             header = \"anthropic-beta: oauth-2025-04-20\"\n\
+             header = \"Accept: application/json\"\n\
+             user-agent = \"Deck\"\n"
+        );
+        let _ = stdin.write_all(config.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|_| unreachable())?;
+    let text = out.stdout;
+    let cut = text
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .ok_or_else(unreachable)?;
+    let status: u16 = std::str::from_utf8(&text[cut + 1..])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(unreachable)?;
+    if status == 0 {
+        return Err(unreachable());
+    }
+    Ok((status, text[..cut].to_vec()))
+}
+
+/// The usage answer's windows. Its `limits` rows are what `/usage` draws
+/// (`kind` "session", "weekly_all", "weekly_scoped" with a model); older
+/// answers only have `five_hour`, `seven_day`, `seven_day_opus` and
+/// `seven_day_sonnet`, each `{utilization, resets_at}`.
+fn parse_claude_usage(body: &[u8]) -> Option<Vec<Limit>> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+    if let Some(rows) = v.get("limits").and_then(Value::as_array) {
+        let out: Vec<Limit> = rows.iter().filter_map(limit_row).collect();
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    let named = [
+        ("five_hour", "5-hour"),
+        ("seven_day", "Weekly"),
+        ("seven_day_opus", "Weekly Opus"),
+        ("seven_day_sonnet", "Weekly Sonnet"),
+    ];
+    Some(
+        named
+            .iter()
+            .filter_map(|(key, label)| {
+                let w = v.get(key)?;
+                Some(Limit {
+                    label: label.to_string(),
+                    used_pct: w.get("utilization")?.as_f64()? as f32,
+                    resets_at: w
+                        .get("resets_at")
+                        .and_then(Value::as_str)
+                        .and_then(parse_iso),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn limit_row(row: &Value) -> Option<Limit> {
+    let kind = row.get("kind")?.as_str()?;
+    let scoped = ["model", "surface"].iter().find_map(|k| {
+        row.get("scope")?
+            .get(k)?
+            .get("display_name")?
+            .as_str()
+            .filter(|n| !n.is_empty())
+    });
+    let label = match (kind, scoped) {
+        ("session", _) => "5-hour".to_string(),
+        ("weekly_all", _) => "Weekly".to_string(),
+        (k, Some(name)) if k.starts_with("weekly") => format!("Weekly {name}"),
+        (k, Some(name)) => format!("{} {name}", kind_label(k)),
+        (k, None) => kind_label(k),
+    };
+    Some(Limit {
+        label,
+        used_pct: row.get("percent")?.as_f64()? as f32,
+        resets_at: row
+            .get("resets_at")
+            .and_then(Value::as_str)
+            .and_then(parse_iso),
+    })
+}
+
+/// "monthly_all" reads "Monthly".
+fn kind_label(kind: &str) -> String {
+    let words: Vec<&str> = kind
+        .split('_')
+        .filter(|w| !w.is_empty() && *w != "all" && *w != "scoped")
+        .collect();
+    capitalize(&words.join(" "))
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Codex limits
+
+/// Codex's windows from the newest session log that has them.
+pub fn codex_limits() -> Option<Limits> {
+    let root = codex_home()?.join("sessions");
+    newest_logs(&root, 12)
+        .iter()
+        .find_map(|f| last_codex_limits(f, SystemTime::now()))
+}
+
+fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home().map(|h| h.join(".codex")))
+}
+
+/// Up to `n` of `sessions/YYYY/MM/DD/*.jsonl`, the most recently written
+/// first, walking back from the newest day.
+fn newest_logs(root: &Path, n: usize) -> Vec<PathBuf> {
+    fn dirs_desc(p: &Path) -> Vec<PathBuf> {
+        let mut d: Vec<PathBuf> = std::fs::read_dir(p)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        d.sort();
+        d.reverse();
+        d
+    }
+    let mut out = Vec::new();
+    for year in dirs_desc(root) {
+        for month in dirs_desc(&year) {
+            for day in dirs_desc(&month) {
+                let mut files = jsonl_in(&day);
+                files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
+                out.extend(files.into_iter().map(|(p, _)| p));
+                if out.len() >= n {
+                    out.truncate(n);
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The last `token_count` event with rate limits in a Codex log: its tail
+/// first, the whole log when the tail has none.
+fn last_codex_limits(path: &Path, now: SystemTime) -> Option<Limits> {
+    let len = std::fs::metadata(path).ok()?.len();
+    for size in [1u64 << 20, 64 << 20] {
+        let (text, cut) = read_tail(path, size)?;
+        let lines: Vec<&str> = text.lines().skip(cut as usize).collect();
+        let found = lines
+            .iter()
+            .rev()
+            .filter(|l| l.contains("\"token_count\"") && l.contains("\"rate_limits\""))
+            .find_map(|l| parse_codex_event(l, now));
+        if found.is_some() || size >= len {
+            return found;
+        }
+    }
+    None
+}
+
+/// `{"timestamp", "payload": {"type": "token_count", "rate_limits":
+/// {"primary"|"secondary": {used_percent, window_minutes, resets_at |
+/// resets_in_seconds}, "plan_type"}}}`. A window whose reset has passed
+/// reads 0%, since nothing has been used in the new one.
+fn parse_codex_event(line: &str, now: SystemTime) -> Option<Limits> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    let p = v.get("payload")?;
+    if p.get("type")?.as_str()? != "token_count" {
+        return None;
+    }
+    let rl = p.get("rate_limits")?.as_object()?;
+    let at = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(parse_iso);
+    let limits: Vec<Limit> = ["primary", "secondary"]
+        .iter()
+        .filter_map(|key| {
+            let w = rl.get(*key)?.as_object()?;
+            let pct = w.get("used_percent")?.as_f64()?;
+            let resets = w
+                .get("resets_at")
+                .and_then(Value::as_f64)
+                .map(|s| UNIX_EPOCH + Duration::from_secs_f64(s.max(0.)))
+                .or_else(|| {
+                    let s = w.get("resets_in_seconds")?.as_f64()?;
+                    Some(at? + Duration::from_secs_f64(s.max(0.)))
+                });
+            let label = match w.get("window_minutes").and_then(Value::as_u64) {
+                Some(m) => window_label(m),
+                None if *key == "primary" => "5-hour".into(),
+                None => "Weekly".into(),
+            };
+            let (pct, resets) = match resets {
+                Some(r) if r <= now => (0., None),
+                r => (pct, r),
+            };
+            Some(Limit {
+                label,
+                used_pct: pct as f32,
+                resets_at: resets,
+            })
+        })
+        .collect();
+    if limits.is_empty() {
+        return None;
+    }
+    Some(Limits {
+        agent: "codex",
+        plan: rl
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(capitalize),
+        limits,
+        fetched: at.unwrap_or(now),
+    })
+}
+
+/// 300 minutes reads "5-hour", a week "Weekly", 30 days "Monthly".
+fn window_label(minutes: u64) -> String {
+    match minutes {
+        300 => "5-hour".into(),
+        1440 => "Daily".into(),
+        10080 => "Weekly".into(),
+        40320..=44640 => "Monthly".into(),
+        m if m % 1440 == 0 => format!("{}-day", m / 1440),
+        m if m % 60 == 0 => format!("{}-hour", m / 60),
+        m => format!("{m}-minute"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Claude Code transcripts
+
+/// The newest conversation in `cwd`'s project folder.
+pub fn claude_latest_session(cwd: &Path) -> Option<String> {
+    crate::session::claude_sessions(cwd).into_iter().next()
+}
+
+/// One conversation's context fill, tokens and cost.
+pub fn claude_session(cwd: &Path, session_id: &str) -> Option<SessionUse> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let dir = crate::session::claude_dir(cwd);
+    session_use(&dir, session_id)
+}
+
+fn session_use(dir: &Path, id: &str) -> Option<SessionUse> {
+    let path = dir.join(format!("{id}.jsonl"));
+    let mut t = with_scan(&path, |s| s.totals(i64::MIN))?;
+    for (sub, _) in jsonl_in(&dir.join(id).join("subagents")) {
+        // A sub-agent's prompts came from the main agent, not from you.
+        if let Some(st) = with_scan(&sub, |s| s.totals(i64::MIN)) {
+            t.merge(&Tally { turns: 0, ..st });
+        }
+    }
+    let ctx = tail_context(&path, TAIL).or_else(|| {
+        with_scan(&path, |s| {
+            s.last_main.as_ref().map(|r| context_of(r, s.wide))
+        })
+        .flatten()
+    });
+    let (model, context_used, context_window) = match ctx {
+        Some(c) => (c.model, c.used, c.window),
+        None => (None, 0, 200_000),
+    };
+    Some(SessionUse {
+        model,
+        context_used,
+        context_window,
+        input: t.input,
+        output: t.output,
+        cache_read: t.cache_read,
+        cache_write: t.cache_write,
+        turns: t.turns,
+        cost_usd: t.cost_usd(),
+    })
+}
+
+static TODAY: Mutex<Option<(Instant, i64, DayUse)>> = Mutex::new(None);
+
+/// Claude Code's use across every project since local midnight. Kept for
+/// 20 seconds.
+pub fn claude_today() -> DayUse {
+    let midnight = local_midnight();
+    let mut slot = TODAY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, m, day)) = slot.as_ref() {
+        if *m == midnight && at.elapsed() < Duration::from_secs(20) {
+            return day.clone();
+        }
+    }
+    let day = day_use(&claude_home().join("projects"), midnight);
+    *slot = Some((Instant::now(), midnight, day.clone()));
+    day
+}
+
+/// Seconds since the epoch at the start of the local day.
+fn local_midnight() -> i64 {
+    let (epoch, (h, m, s)) = crate::retry::now();
+    epoch as i64 - (h * 3600 + m * 60 + s) as i64
+}
+
+/// Every transcript under `projects` written since `midnight`, counting the
+/// replies stamped since then. Sub-agents count toward their conversation.
+fn day_use(projects: &Path, midnight: i64) -> DayUse {
+    let since = UNIX_EPOCH + Duration::from_secs(midnight.max(0) as u64);
+    let from = midnight.div_euclid(BUCKET);
+    let mut total = Tally::default();
+    let mut sessions: HashSet<String> = HashSet::new();
+    let mut count = |path: &Path, key: &str| {
+        if let Some(t) = with_scan(path, |s| s.totals(from)) {
+            if t.messages > 0 {
+                sessions.insert(key.to_string());
+            }
+            total.merge(&t);
+        }
+    };
+    for project in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+        for entry in std::fs::read_dir(project.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if meta.is_file() {
+                let Some(stem) = name.strip_suffix(".jsonl") else {
+                    continue;
+                };
+                if meta.modified().is_ok_and(|m| m >= since) {
+                    count(&path, stem);
+                }
+            } else if meta.is_dir() {
+                for (sub, modified) in jsonl_in(&path.join("subagents")) {
+                    if modified >= since {
+                        count(&sub, &name);
+                    }
+                }
+            }
+        }
+    }
+    DayUse {
+        input: total.input,
+        output: total.output,
+        cache_read: total.cache_read,
+        cache_write: total.cache_write,
+        cost_usd: total.cost_usd(),
+        sessions: sessions.len() as u32,
+    }
+}
+
+/// Claude Code's config folder: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
+fn claude_home() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().unwrap_or_default().join(".claude"))
+}
+
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The `*.jsonl` files in `dir` and when each was last written.
+fn jsonl_in(dir: &Path) -> Vec<(PathBuf, SystemTime)> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension()? != "jsonl" {
+                return None;
+            }
+            let meta = e.metadata().ok()?;
+            meta.is_file().then_some((p, meta.modified().ok()?))
+        })
+        .collect()
+}
+
+/// Tokens of one reply. Cache writes are split by how long they last,
+/// since the hour-long cache costs more to write.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Tokens {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_5m: u64,
+    cache_1h: u64,
+    fast: bool,
+}
+
+impl Tokens {
+    fn cache_write(&self) -> u64 {
+        self.cache_5m + self.cache_1h
+    }
+
+    /// What the reply read: the context it had.
+    fn context(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write()
+    }
+}
+
+/// Sums over replies.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Tally {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: f64,
+    priced: u32,
+    unpriced: u32,
+    messages: u32,
+    turns: u32,
+}
+
+impl Tally {
+    fn add(&mut self, model: Option<&str>, t: &Tokens) {
+        self.input += t.input;
+        self.output += t.output;
+        self.cache_read += t.cache_read;
+        self.cache_write += t.cache_write();
+        self.messages += 1;
+        match model.and_then(|m| cost(m, t)) {
+            Some(c) => {
+                self.cost += c;
+                self.priced += 1;
+            }
+            None => self.unpriced += 1,
+        }
+    }
+
+    fn merge(&mut self, o: &Tally) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.cost += o.cost;
+        self.priced += o.priced;
+        self.unpriced += o.unpriced;
+        self.messages += o.messages;
+        self.turns += o.turns;
+    }
+
+    /// The cost of the replies with a known price; `None` when there were
+    /// replies and none had one.
+    fn cost_usd(&self) -> Option<f64> {
+        (self.priced > 0 || self.unpriced == 0).then_some(self.cost)
+    }
+}
+
+/// One assistant reply in a transcript.
+#[derive(Clone, Debug, PartialEq)]
+struct Reply {
+    /// Its quarter hour since the epoch, for counting by local day.
+    bucket: i64,
+    model: Option<String>,
+    tokens: Tokens,
+    /// In the conversation itself, not a sub-agent's side thread.
+    main: bool,
+}
+
+/// Seconds in a bucket: a quarter hour, so every time zone's midnight
+/// falls on a bucket's edge.
+const BUCKET: i64 = 900;
+/// Replies kept apart until no later line can repeat them.
+const RECENT: usize = 64;
+/// How much of a transcript's end to read for its context.
+const TAIL: u64 = 2 << 20;
+
+/// What is known of a transcript after reading it up to `offset`.
+#[derive(Default)]
+struct Scan {
+    len: u64,
+    modified: Option<SystemTime>,
+    /// Just past the last whole line read.
+    offset: u64,
+    buckets: BTreeMap<i64, Tally>,
+    /// The latest replies by message id. Claude Code writes one line per
+    /// content block, each with the reply's usage so far, so a reply counts
+    /// once, as its last line has it.
+    recent: VecDeque<(String, Reply)>,
+    last_main: Option<Reply>,
+    /// A model id with `[1m]` in it.
+    wide: bool,
+}
+
+impl Scan {
+    /// Sums over the replies from `from_bucket` on.
+    fn totals(&self, from_bucket: i64) -> Tally {
+        let mut t = Tally::default();
+        for (_, b) in self.buckets.range(from_bucket..) {
+            t.merge(b);
+        }
+        for (_, r) in &self.recent {
+            if r.bucket >= from_bucket {
+                t.add(r.model.as_deref(), &r.tokens);
+            }
+        }
+        t
+    }
+
+    fn reply(&mut self, id: Option<String>, reply: Reply) {
+        if reply.main {
+            self.last_main = Some(reply.clone());
+        }
+        let Some(id) = id else {
+            self.settle(reply);
+            return;
+        };
+        if let Some(slot) = self.recent.iter_mut().find(|(k, _)| *k == id) {
+            slot.1 = reply;
+            return;
+        }
+        self.recent.push_back((id, reply));
+        if self.recent.len() > RECENT {
+            if let Some((_, old)) = self.recent.pop_front() {
+                self.settle(old);
+            }
+        }
+    }
+
+    fn settle(&mut self, r: Reply) {
+        self.buckets
+            .entry(r.bucket)
+            .or_default()
+            .add(r.model.as_deref(), &r.tokens);
+    }
+
+    fn line(&mut self, line: &str) {
+        if line.contains("\"usage\"") && line.contains("\"assistant\"") {
+            if let Some(p) = parse_reply(line) {
+                self.wide |= p.wide;
+                self.reply(p.id, p.reply);
+                return;
+            }
+        }
+        if line.contains("\"type\":\"user\"") && !line.contains("\"tool_result\"") {
+            if let Some(bucket) = prompt_bucket(line) {
+                self.buckets.entry(bucket).or_default().turns += 1;
+            }
+        }
+    }
+
+    /// Reads the lines written since the last call. A line still being
+    /// written is left for next time.
+    fn extend(&mut self, path: &Path) -> std::io::Result<()> {
+        let mut f = std::fs::File::open(path)?;
+        f.seek(SeekFrom::Start(self.offset))?;
+        let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let n = r.read_until(b'\n', &mut buf)?;
+            if n == 0 || buf.last() != Some(&b'\n') {
+                return Ok(());
+            }
+            self.offset += n as u64;
+            if let Ok(line) = std::str::from_utf8(&buf) {
+                self.line(line);
+            }
+        }
+    }
+}
+
+static SCANS: LazyLock<Mutex<HashMap<PathBuf, Scan>>> = LazyLock::new(Default::default);
+
+/// `f` over the transcript at `path`, read up to its end. The scan is kept
+/// between calls, so only new lines are read again.
+fn with_scan<R>(path: &Path, f: impl FnOnce(&Scan) -> R) -> Option<R> {
+    let meta = std::fs::metadata(path).ok()?;
+    let (len, modified) = (meta.len(), meta.modified().ok());
+    let lock = || SCANS.lock().unwrap_or_else(|e| e.into_inner());
+    // Taken out while it reads, so other files aren't held up.
+    let mut scan = lock().remove(path).unwrap_or_default();
+    if scan.len != len || scan.modified != modified {
+        if len < scan.offset {
+            scan = Scan::default();
+        }
+        if scan.extend(path).is_err() {
+            scan = Scan::default();
+            scan.extend(path).ok()?;
+        }
+        scan.len = len;
+        scan.modified = modified;
+    }
+    let out = f(&scan);
+    let mut scans = lock();
+    if scans.len() > 2048 {
+        scans.clear();
+    }
+    scans.insert(path.to_path_buf(), scan);
+    Some(out)
+}
+
+#[derive(Deserialize)]
+struct Line {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(rename = "isSidechain")]
+    sidechain: Option<bool>,
+    #[serde(rename = "isMeta")]
+    meta: Option<bool>,
+    #[serde(rename = "isCompactSummary")]
+    summary: Option<bool>,
+    timestamp: Option<String>,
+    #[serde(rename = "requestedModel")]
+    requested: Option<String>,
+    origin: Option<Origin>,
+    message: Option<Message>,
+}
+
+#[derive(Deserialize)]
+struct Origin {
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Message {
+    id: Option<String>,
+    model: Option<String>,
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_creation: Option<CacheSplit>,
+    speed: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CacheSplit {
+    ephemeral_1h_input_tokens: Option<u64>,
+}
+
+struct Parsed {
+    id: Option<String>,
+    reply: Reply,
+    wide: bool,
+}
+
+/// An assistant line with usage. Claude Code's own placeholder replies
+/// (model `<synthetic>`) made no request, so they are skipped.
+fn parse_reply(line: &str) -> Option<Parsed> {
+    let l: Line = serde_json::from_str(line).ok()?;
+    if l.kind.as_deref() != Some("assistant") {
+        return None;
+    }
+    let m = l.message?;
+    let u = m.usage?;
+    if m.model.as_deref() == Some("<synthetic>") {
+        return None;
+    }
+    let write = u.cache_creation_input_tokens.unwrap_or(0);
+    let hour = u
+        .cache_creation
+        .and_then(|c| c.ephemeral_1h_input_tokens)
+        .unwrap_or(0)
+        .min(write);
+    let wide = [&m.model, &l.requested]
+        .iter()
+        .any(|s| s.as_deref().is_some_and(|s| s.contains("[1m]")));
+    Some(Parsed {
+        id: m.id,
+        wide,
+        reply: Reply {
+            bucket: l
+                .timestamp
+                .as_deref()
+                .and_then(iso_secs)
+                .map_or(i64::MIN, |s| s.div_euclid(BUCKET)),
+            model: m.model.or(l.requested),
+            tokens: Tokens {
+                input: u.input_tokens.unwrap_or(0),
+                output: u.output_tokens.unwrap_or(0),
+                cache_read: u.cache_read_input_tokens.unwrap_or(0),
+                cache_5m: write - hour,
+                cache_1h: hour,
+                fast: u.speed.as_deref() == Some("fast"),
+            },
+            main: !l.sidechain.unwrap_or(false),
+        },
+    })
+}
+
+/// A prompt you typed: a user line from a person (`origin.kind` "human"),
+/// or on older Claude Codes with no origin, one whose content is plain
+/// text and not a note Claude Code added or the summary that continues a
+/// compacted conversation. The bucket it falls in.
+fn prompt_bucket(line: &str) -> Option<i64> {
+    let l: Line = serde_json::from_str(line).ok()?;
+    let aside = [l.meta, l.sidechain, l.summary].contains(&Some(true));
+    if l.kind.as_deref() != Some("user") || aside {
+        return None;
+    }
+    let typed = match &l.origin {
+        Some(o) => o.kind.as_deref() == Some("human"),
+        None => line.contains("\"role\":\"user\",\"content\":\""),
+    };
+    if !typed {
+        return None;
+    }
+    Some(
+        l.timestamp
+            .as_deref()
+            .and_then(iso_secs)
+            .map_or(i64::MIN, |s| s.div_euclid(BUCKET)),
+    )
+}
+
+struct Context {
+    model: Option<String>,
+    used: u64,
+    window: u64,
+}
+
+fn context_of(r: &Reply, wide: bool) -> Context {
+    let used = r.tokens.context();
+    Context {
+        window: window_for(r.model.as_deref(), wide, used),
+        model: r.model.clone(),
+        used,
+    }
+}
+
+/// The context of the last reply in the conversation itself, read from
+/// the last `size` bytes, or four times that while the tail holds none.
+fn tail_context(path: &Path, size: u64) -> Option<Context> {
+    let len = std::fs::metadata(path).ok()?.len();
+    let mut size = size.max(1);
+    loop {
+        let (text, cut) = read_tail(path, size)?;
+        let mut wide = false;
+        let mut last = None;
+        for line in text.lines().skip(cut as usize) {
+            if line.contains("\"usage\"") && line.contains("\"assistant\"") {
+                if let Some(p) = parse_reply(line) {
+                    wide |= p.wide;
+                    if p.reply.main {
+                        last = Some(p.reply);
+                    }
+                }
+            }
+        }
+        if let Some(r) = last {
+            return Some(context_of(&r, wide));
+        }
+        if size >= len || size >= 64 << 20 {
+            return None;
+        }
+        size *= 4;
+    }
+}
+
+/// The last `size` bytes of a file as text, and how many lines to skip
+/// at its start (1 when it starts mid-line).
+fn read_tail(path: &Path, size: u64) -> Option<(String, u64)> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(size);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.take(size).read_to_end(&mut buf).ok()?;
+    Some((
+        String::from_utf8_lossy(&buf).into_owned(),
+        (start > 0) as u64,
+    ))
+}
+
+/// 1,000,000 for a `[1m]` model, a model whose window is a million, or a
+/// reply that read more than 200,000; else 200,000.
+fn window_for(model: Option<&str>, wide: bool, used: u64) -> u64 {
+    // Claude's models with a 1M window by default, per Anthropic's model
+    // table of 2026-10-06.
+    const MILLION: &[&str] = &[
+        "fable",
+        "mythos",
+        "opus-5",
+        "sonnet-5",
+        "haiku-5",
+        "opus-4-8",
+        "opus-4-7",
+        "opus-4-6",
+        "sonnet-4-6",
+    ];
+    let native = model.is_some_and(|m| MILLION.iter().any(|k| m.contains(k)));
+    if wide || native || used > 200_000 {
+        1_000_000
+    } else {
+        200_000
+    }
+}
+
+/// Dollars per million tokens: input, output, cache read, matched as a
+/// part of the model id, the more specific first. Writing to the cache
+/// costs 1.25x input for five minutes and 2x for an hour.
+///
+/// Anthropic's API prices as of 2026-10-06, from the model and pricing
+/// tables of the claude-api skill bundled with Claude Code 2.1.301, which
+/// mirror platform.claude.com/docs/en/about-claude/pricing. Haiku 5.5's
+/// cache read is assumed at the usual 0.1x of input.
+const PRICES: &[(&str, [f64; 3])] = &[
+    ("fable-5-1", [10., 50., 0.25]),
+    ("mythos-5-1", [10., 50., 0.25]),
+    ("fable-5", [10., 50., 1.]),
+    ("mythos-5", [10., 50., 1.]),
+    ("opus-5-5", [4., 20., 0.2]),
+    ("opus-5", [5., 25., 0.5]),
+    ("opus-4-8", [5., 25., 0.5]),
+    ("opus-4-7", [5., 25., 0.5]),
+    ("opus-4-6", [5., 25., 0.5]),
+    ("opus-4-5", [5., 25., 0.5]),
+    ("opus-4", [15., 75., 1.5]),
+    ("3-opus", [15., 75., 1.5]),
+    ("sonnet-5", [2., 10., 0.2]),
+    ("sonnet-4", [3., 15., 0.3]),
+    ("3-7-sonnet", [3., 15., 0.3]),
+    ("3-5-sonnet", [3., 15., 0.3]),
+    ("haiku-5-5", [0.1, 0.5, 0.01]),
+    ("haiku-4-5", [1., 5., 0.1]),
+    ("3-5-haiku", [0.8, 4., 0.08]),
+    ("3-haiku", [0.25, 1.25, 0.03]),
+];
+
+/// One reply's cost in dollars, or `None` for a model with no price.
+/// Fast mode costs twice as much, and Haiku 5.5 five times as much once a
+/// prompt passes 100,000 tokens.
+fn cost(model: &str, t: &Tokens) -> Option<f64> {
+    let [input, output, read] = PRICES.iter().find(|(k, _)| model.contains(k))?.1;
+    let mut scale = if t.fast { 2. } else { 1. };
+    if model.contains("haiku-5-5") && t.context() > 100_000 {
+        scale *= 5.;
+    }
+    let dollars = t.input as f64 * input
+        + t.output as f64 * output
+        + t.cache_read as f64 * read
+        + t.cache_5m as f64 * input * 1.25
+        + t.cache_1h as f64 * input * 2.;
+    Some(scale * dollars / 1e6)
+}
+
+// ---------------------------------------------------------------------------
+// Time
+
+/// An ISO 8601 time such as "2026-10-16T12:30:00.348202+00:00".
+fn parse_iso(s: &str) -> Option<SystemTime> {
+    let (secs, nanos) = iso_parts(s)?;
+    let secs = u64::try_from(secs).ok()?;
+    Some(UNIX_EPOCH + Duration::new(secs, nanos))
+}
+
+/// Whole seconds since the epoch.
+fn iso_secs(s: &str) -> Option<i64> {
+    iso_parts(s).map(|p| p.0)
+}
+
+fn iso_parts(s: &str) -> Option<(i64, u32)> {
+    let b = s.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = s.get(r)?;
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut rest = &s[19..];
+    let mut nanos = 0u32;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        let mut n = 0u64;
+        for (i, c) in frac[..digits].bytes().enumerate().take(9) {
+            n += (c - b'0') as u64 * 10u64.pow(8 - i as u32);
+        }
+        nanos = n as u32;
+        rest = &frac[digits..];
+    }
+    let offset = match rest.as_bytes().first() {
+        None | Some(b'Z') | Some(b'z') => 0,
+        Some(&sign @ (b'+' | b'-')) => {
+            let z: String = rest[1..].chars().filter(|c| *c != ':').collect();
+            if z.len() != 4 || !z.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let mins = z[..2].parse::<i64>().ok()? * 60 + z[2..].parse::<i64>().ok()?;
+            if sign == b'+' {
+                mins * 60
+            } else {
+                -mins * 60
+            }
+        }
+        _ => return None,
+    };
+    let days = days_from_civil(y, mo, d);
+    Some((days * 86_400 + h * 3600 + mi * 60 + sec - offset, nanos))
+}
+
+/// Days since 1970-01-01 of a Gregorian date.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("deck-usage-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn assistant(
+        id: &str,
+        ts: &str,
+        model: &str,
+        inp: u64,
+        out: u64,
+        read: u64,
+        write: u64,
+    ) -> String {
+        format!(
+            r#"{{"parentUuid":"p","isSidechain":false,"message":{{"id":"{id}","model":"{model}","role":"assistant","content":[{{"type":"text","text":"hi"}}],"usage":{{"input_tokens":{inp},"cache_creation_input_tokens":{write},"cache_read_input_tokens":{read},"output_tokens":{out},"service_tier":"standard","cache_creation":{{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":{write}}}}}}},"requestedModel":"{model}","type":"assistant","uuid":"u","timestamp":"{ts}"}}"#
+        )
+    }
+
+    fn prompt(ts: &str, text: &str) -> String {
+        format!(
+            r#"{{"parentUuid":null,"isSidechain":false,"promptId":"x","type":"user","message":{{"role":"user","content":"{text}"}},"uuid":"u","timestamp":"{ts}","origin":{{"kind":"human"}}}}"#
+        )
+    }
+
+    const TOOL_RESULT: &str = r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"usage assistant"}]},"timestamp":"2026-10-16T08:00:05.000Z"}"#;
+
+    #[test]
+    fn iso_times_parse() {
+        assert_eq!(iso_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_secs("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(
+            iso_secs("2026-10-16T12:30:00.348202+00:00"),
+            Some(1_792_153_800)
+        );
+        assert_eq!(iso_secs("2026-10-21T14:00:00+05:45"), Some(1_792_570_500));
+        assert_eq!(iso_parts("2026-10-16T08:14:30.069Z").unwrap().1, 69_000_000);
+        assert_eq!(iso_secs("yesterday"), None);
+        assert_eq!(iso_secs("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn duplicate_message_ids_count_once_as_their_last_line() {
+        let dir = temp("dupes");
+        let path = dir.join("s.jsonl");
+        let lines = [
+            prompt("2026-10-16T08:00:00.000Z", "fix it"),
+            // One reply split over three lines, its output growing.
+            assistant(
+                "msg_a",
+                "2026-10-16T08:00:01.000Z",
+                "claude-opus-5-5",
+                10,
+                1,
+                1000,
+                50,
+            ),
+            assistant(
+                "msg_a",
+                "2026-10-16T08:00:02.000Z",
+                "claude-opus-5-5",
+                10,
+                5,
+                1000,
+                50,
+            ),
+            TOOL_RESULT.to_string(),
+            assistant(
+                "msg_a",
+                "2026-10-16T08:00:03.000Z",
+                "claude-opus-5-5",
+                10,
+                9,
+                1000,
+                50,
+            ),
+            assistant(
+                "msg_b",
+                "2026-10-16T08:00:04.000Z",
+                "claude-opus-5-5",
+                2,
+                3,
+                1060,
+                7,
+            ),
+        ];
+        let summary = prompt(
+            "2026-10-16T08:00:00.500Z",
+            "This session is being continued",
+        )
+        .replace(
+            r#","origin":{"kind":"human"}"#,
+            r#","isCompactSummary":true"#,
+        );
+        std::fs::write(&path, lines.join("\n") + "\n" + &summary + "\n").unwrap();
+        let s = session_use(&dir, "s").unwrap();
+        assert_eq!(
+            (s.input, s.output, s.cache_read, s.cache_write),
+            (12, 12, 2060, 57)
+        );
+        assert_eq!(s.turns, 1);
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(s.context_used, 2 + 1060 + 7);
+        assert_eq!(s.context_window, 1_000_000);
+
+        // Appended lines are read on their own, and a reply that goes on
+        // across the old end still counts once.
+        let more = [
+            assistant(
+                "msg_b",
+                "2026-10-16T08:00:05.000Z",
+                "claude-opus-5-5",
+                2,
+                30,
+                1060,
+                7,
+            ),
+            prompt("2026-10-16T08:01:00.000Z", "again"),
+        ];
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{}", more.join("\n")).unwrap();
+        // A half-written line waits.
+        write!(
+            f,
+            "{}",
+            &assistant(
+                "msg_c",
+                "2026-10-16T08:01:01.000Z",
+                "claude-opus-5-5",
+                1,
+                1,
+                1,
+                1
+            )[..40]
+        )
+        .unwrap();
+        drop(f);
+        let s = session_use(&dir, "s").unwrap();
+        assert_eq!(
+            (s.input, s.output, s.cache_read, s.cache_write),
+            (12, 39, 2060, 57)
+        );
+        assert_eq!(s.turns, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sub_agents_count_toward_their_session_but_not_its_context() {
+        let dir = temp("subs");
+        std::fs::write(
+            dir.join("s.jsonl"),
+            assistant(
+                "m1",
+                "2026-10-16T08:00:00Z",
+                "claude-sonnet-4-5",
+                100,
+                10,
+                0,
+                0,
+            ) + "\n",
+        )
+        .unwrap();
+        let subs = dir.join("s").join("subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let side = assistant(
+            "m2",
+            "2026-10-16T08:00:01Z",
+            "claude-haiku-4-5",
+            5000,
+            50,
+            0,
+            0,
+        )
+        .replace("\"isSidechain\":false", "\"isSidechain\":true");
+        let ask = prompt("2026-10-16T08:00:00Z", "look around")
+            .replace(r#","origin":{"kind":"human"}"#, "");
+        std::fs::write(subs.join("agent-1.jsonl"), format!("{ask}\n{side}\n")).unwrap();
+        let s = session_use(&dir, "s").unwrap();
+        assert_eq!((s.input, s.output), (5100, 60));
+        assert_eq!(s.turns, 0);
+        assert_eq!(s.context_used, 100);
+        assert_eq!(s.context_window, 200_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_comes_from_the_tail() {
+        let dir = temp("tail");
+        let path = dir.join("big.jsonl");
+        let mut body = assistant(
+            "old",
+            "2026-10-16T07:00:00Z",
+            "claude-haiku-4-5",
+            1,
+            1,
+            1,
+            1,
+        ) + "\n";
+        let filler = format!(r#"{{"type":"progress","data":"{}"}}"#, "x".repeat(10_000));
+        for _ in 0..300 {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        body.push_str(&assistant(
+            "new",
+            "2026-10-16T08:00:00Z",
+            "claude-haiku-4-5",
+            3,
+            4,
+            150_000,
+            2_000,
+        ));
+        body.push('\n');
+        // A sub-agent's reply after it is not the conversation's context.
+        body.push_str(
+            &assistant(
+                "side",
+                "2026-10-16T08:00:01Z",
+                "claude-haiku-4-5",
+                9,
+                9,
+                9,
+                9,
+            )
+            .replace("\"isSidechain\":false", "\"isSidechain\":true"),
+        );
+        body.push('\n');
+        std::fs::write(&path, &body).unwrap();
+        let c = tail_context(&path, 64 << 10).unwrap();
+        assert_eq!(c.used, 152_003);
+        assert_eq!(c.window, 200_000);
+        // A tail with no reply in it looks further back.
+        let only_old = format!(
+            "{}\n{}\n",
+            assistant("o", "2026-10-16T07:00:00Z", "claude-haiku-4-5", 7, 0, 0, 0),
+            filler
+        );
+        std::fs::write(&path, only_old).unwrap();
+        assert_eq!(tail_context(&path, 1024).unwrap().used, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn million_token_windows_are_recognised() {
+        assert_eq!(
+            window_for(Some("claude-haiku-4-5"), false, 150_000),
+            200_000
+        );
+        assert_eq!(
+            window_for(Some("claude-haiku-4-5"), false, 200_001),
+            1_000_000
+        );
+        assert_eq!(
+            window_for(Some("claude-sonnet-4-5[1m]"), true, 10),
+            1_000_000
+        );
+        assert_eq!(window_for(Some("claude-opus-5-5"), false, 10), 1_000_000);
+        assert_eq!(window_for(None, false, 10), 200_000);
+        // `[1m]` in the requested model marks the session.
+        let line = assistant("m", "2026-10-16T08:00:00Z", "claude-sonnet-4-5", 1, 1, 1, 1).replace(
+            "\"requestedModel\":\"claude-sonnet-4-5\"",
+            "\"requestedModel\":\"claude-sonnet-4-5[1m]\"",
+        );
+        assert!(parse_reply(&line).unwrap().wide);
+        let synthetic = assistant("m", "2026-10-16T08:00:00Z", "<synthetic>", 0, 0, 0, 0);
+        assert!(parse_reply(&synthetic).is_none());
+    }
+
+    #[test]
+    fn prices_add_up() {
+        let t = Tokens {
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000_000,
+            cache_5m: 1_000_000,
+            cache_1h: 1_000_000,
+            fast: false,
+        };
+        // 4 + 20 + 0.2 + 5 + 8
+        assert!((cost("claude-opus-5-5", &t).unwrap() - 37.2).abs() < 1e-9);
+        // 3 + 15 + 0.3 + 3.75 + 6
+        assert!((cost("claude-sonnet-4-5-20250929", &t).unwrap() - 28.05).abs() < 1e-9);
+        // 15 + 75 + 1.5 + 18.75 + 30
+        assert!((cost("claude-opus-4-1-20250805", &t).unwrap() - 140.25).abs() < 1e-9);
+        assert!(
+            (cost("claude-opus-5-5", &Tokens { fast: true, ..t }).unwrap() - 74.4).abs() < 1e-9
+        );
+        let small = Tokens {
+            input: 50_000,
+            output: 1_000,
+            ..Default::default()
+        };
+        assert!((cost("claude-haiku-5-5", &small).unwrap() - 0.0055).abs() < 1e-12);
+        let big = Tokens {
+            input: 200_000,
+            ..Default::default()
+        };
+        assert!((cost("claude-haiku-5-5", &big).unwrap() - 0.1).abs() < 1e-12);
+        assert_eq!(cost("gpt-5", &t), None);
+
+        let mut tally = Tally::default();
+        tally.add(Some("mystery-1"), &small);
+        assert_eq!(tally.cost_usd(), None);
+        tally.add(Some("claude-haiku-4-5"), &small);
+        assert!((tally.cost_usd().unwrap() - 0.055).abs() < 1e-12);
+        assert_eq!(Tally::default().cost_usd(), Some(0.));
+    }
+
+    #[test]
+    fn hour_long_cache_writes_cost_more() {
+        let line = r#"{"type":"assistant","timestamp":"2026-10-16T08:00:00Z","message":{"id":"m","model":"claude-opus-5-5","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":1000000,"cache_creation":{"ephemeral_5m_input_tokens":250000,"ephemeral_1h_input_tokens":750000}}}}"#;
+        let r = parse_reply(line).unwrap().reply;
+        assert_eq!((r.tokens.cache_5m, r.tokens.cache_1h), (250_000, 750_000));
+        // 0.25 * 5 + 0.75 * 8
+        assert!((cost("claude-opus-5-5", &r.tokens).unwrap() - 7.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn today_counts_only_replies_since_midnight() {
+        let root = temp("today");
+        let proj = root.join("-Users-me-app");
+        std::fs::create_dir_all(proj.join("two/subagents")).unwrap();
+        let one = [
+            assistant(
+                "y",
+                "2026-10-15T23:59:00Z",
+                "claude-opus-5-5",
+                1000,
+                1000,
+                0,
+                0,
+            ),
+            assistant("t", "2026-10-16T00:00:00Z", "claude-opus-5-5", 1, 2, 3, 4),
+        ];
+        std::fs::write(proj.join("one.jsonl"), one.join("\n") + "\n").unwrap();
+        std::fs::write(
+            proj.join("two.jsonl"),
+            prompt("2026-10-16T01:00:00Z", "hi") + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("two/subagents/agent-a.jsonl"),
+            assistant(
+                "s",
+                "2026-10-16T01:00:01Z",
+                "claude-haiku-4-5",
+                10,
+                20,
+                30,
+                40,
+            ) + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("three.jsonl"),
+            prompt("2026-10-16T02:00:00Z", "nothing yet") + "\n",
+        )
+        .unwrap();
+        let midnight = iso_secs("2026-10-16T00:00:00Z").unwrap();
+        let d = day_use(&root, midnight);
+        assert_eq!(
+            (d.input, d.output, d.cache_read, d.cache_write),
+            (11, 22, 33, 44)
+        );
+        assert_eq!(d.sessions, 2);
+        assert!(d.cost_usd.unwrap() > 0.);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_events_parse() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_792_100_000);
+        let monthly = r#"{"timestamp":"2026-10-16T05:40:55.170Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":62432},"model_context_window":258400},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":3.0,"window_minutes":43200,"resets_at":1794024686},"secondary":null,"credits":{"has_credits":false},"plan_type":"free","rate_limit_reached_type":null}}}"#;
+        let l = parse_codex_event(monthly, now).unwrap();
+        assert_eq!(l.agent, "codex");
+        assert_eq!(l.plan.as_deref(), Some("Free"));
+        assert_eq!(
+            l.limits,
+            vec![Limit {
+                label: "Monthly".into(),
+                used_pct: 3.,
+                resets_at: Some(UNIX_EPOCH + Duration::from_secs(1_794_024_686)),
+            }]
+        );
+        assert_eq!(l.fetched, parse_iso("2026-10-16T05:40:55.170Z").unwrap());
+
+        let relative = r#"{"timestamp":"2026-10-16T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"primary":{"used_percent":42.5,"window_minutes":300,"resets_in_seconds":600},"secondary":{"used_percent":12.0,"window_minutes":10080,"resets_in_seconds":86400},"plan_type":"plus"}}}"#;
+        let l = parse_codex_event(relative, now).unwrap();
+        let start = parse_iso("2026-10-16T00:00:00Z").unwrap();
+        assert_eq!(l.plan.as_deref(), Some("Plus"));
+        assert_eq!(l.limits[0].label, "5-hour");
+        assert_eq!(l.limits[0].used_pct, 42.5);
+        assert_eq!(
+            l.limits[0].resets_at,
+            Some(start + Duration::from_secs(600))
+        );
+        assert_eq!(l.limits[1].label, "Weekly");
+        // Read after the 5-hour window reset: nothing used in the new one.
+        let later = start + Duration::from_secs(3600);
+        let l = parse_codex_event(relative, later).unwrap();
+        assert_eq!((l.limits[0].used_pct, l.limits[0].resets_at), (0., None));
+        assert_eq!(l.limits[1].used_pct, 12.);
+
+        let none = r#"{"timestamp":"2026-10-16T00:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":null}}"#;
+        assert!(parse_codex_event(none, now).is_none());
+        assert_eq!(window_label(120), "2-hour");
+        assert_eq!(window_label(2880), "2-day");
+
+        // The newest log with limits wins over a newer one without.
+        let root = temp("codex");
+        let day = root.join("2026/10/16");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("rollout-a.jsonl"), format!("{monthly}\n")).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(day.join("rollout-b.jsonl"), format!("{none}\n")).unwrap();
+        let logs = newest_logs(&root, 12);
+        assert!(logs[0].ends_with("rollout-b.jsonl"), "{logs:?}");
+        let found = logs.iter().find_map(|f| last_codex_limits(f, now)).unwrap();
+        assert_eq!(found.limits[0].label, "Monthly");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real answer from the usage endpoint (2026-10-16), trimmed of the
+    /// fields that are always null.
+    const USAGE_SAMPLE: &str = r#"{
+        "five_hour": {"utilization": 14.0, "resets_at": "2026-10-16T12:30:00.348202+00:00", "limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null},
+        "seven_day": {"utilization": 58.0, "resets_at": "2026-10-21T14:00:00.348225+00:00", "limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null},
+        "seven_day_oauth_apps": null, "seven_day_opus": null, "seven_day_sonnet": null,
+        "extra_usage": {"is_enabled": false, "monthly_limit": null, "used_credits": null, "utilization": null, "currency": null},
+        "limits": [
+            {"kind": "session", "group": "session", "percent": 14, "severity": "normal", "resets_at": "2026-10-16T12:30:00.348202+00:00", "scope": null, "is_active": false},
+            {"kind": "weekly_all", "group": "weekly", "percent": 58, "severity": "normal", "resets_at": "2026-10-21T14:00:00.348225+00:00", "scope": null, "is_active": true},
+            {"kind": "weekly_scoped", "group": "weekly", "percent": 0, "severity": "normal", "resets_at": "2026-10-21T14:00:00+00:00", "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": false}
+        ],
+        "member_dashboard_available": false
+    }"#;
+
+    #[test]
+    fn usage_answers_parse() {
+        let l = parse_claude_usage(USAGE_SAMPLE.as_bytes()).unwrap();
+        let labels: Vec<_> = l.iter().map(|l| (l.label.as_str(), l.used_pct)).collect();
+        assert_eq!(
+            labels,
+            vec![("5-hour", 14.), ("Weekly", 58.), ("Weekly Fable", 0.)]
+        );
+        assert_eq!(
+            l[0].resets_at
+                .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs()),
+            Some(1_792_153_800)
+        );
+
+        // Older answers without `limits`.
+        let old = r#"{"five_hour":{"utilization":3.5,"resets_at":"2026-10-16T12:30:00Z"},"seven_day":{"utilization":40,"resets_at":null},"seven_day_opus":{"utilization":7,"resets_at":"2026-10-21T14:00:00Z"},"seven_day_sonnet":null}"#;
+        let l = parse_claude_usage(old.as_bytes()).unwrap();
+        let labels: Vec<_> = l
+            .iter()
+            .map(|l| (l.label.as_str(), l.used_pct, l.resets_at.is_some()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("5-hour", 3.5, true),
+                ("Weekly", 40., false),
+                ("Weekly Opus", 7., true)
+            ]
+        );
+        assert!(parse_claude_usage(b"<html>").is_none());
+        assert_eq!(kind_label("monthly_all"), "Monthly");
+    }
+
+    #[test]
+    fn credentials_and_plans_read() {
+        let raw = br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-REDACTED","refreshToken":"x","expiresAt":1792146830662,"scopes":["user:inference"],"subscriptionType":"team","rateLimitTier":"default_claude_max_5x"},"mcpOAuth":{}}"#;
+        let c = parse_creds(raw).unwrap();
+        assert_eq!(c.expires_ms, Some(1_792_146_830_662));
+        assert_eq!(c.plan.as_deref(), Some("Team (Max 5x)"));
+        assert_eq!(
+            claude_plan(Some("max"), Some("default_claude_max_20x")).as_deref(),
+            Some("Max 20x")
+        );
+        assert_eq!(claude_plan(Some("pro"), None).as_deref(), Some("Pro"));
+        assert!(parse_creds(br#"{"claudeAiOauth":{"accessToken":""}}"#).is_none());
+        assert_eq!(sha256_hex8("abc"), "ba7816bf");
+    }
+}

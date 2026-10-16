@@ -4,3 +4,6 @@
 # Local Claude Code / plugin state
 .claude/
 /dist
+
+# The editor bundle is built into editor/dist, which is committed.
+crates/app/editor/node_modules/

@@ -30,6 +30,11 @@
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!-- Pages in Deck's browser that ask for them, and programs in its terminals. -->
+	<key>NSCameraUsageDescription</key>
+	<string>A page or a program in Deck wants to use the camera.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>A page or a program in Deck wants to use the microphone.</string>
 	<!-- What a terminal opens, so deck can be the default one. -->
 	<key>CFBundleDocumentTypes</key>
 	<array>

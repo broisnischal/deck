@@ -22,7 +22,7 @@ use crate::workspace::{
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
-    div, fill, font, outline, point, px, relative, rgb, rgba, size, App, BorderStyle, Bounds,
+    div, fill, outline, point, px, relative, rgb, rgba, size, AnyElement, App, BorderStyle, Bounds,
     ClipboardItem, Context, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     EventEmitter, ExternalPaths, FocusHandle, FontStyle, FontWeight, GlobalElementId,
     InspectorElementId, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent,
@@ -31,7 +31,7 @@ use gpui::{
 };
 use std::collections::HashMap;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub enum TerminalEvent {
@@ -44,6 +44,19 @@ pub enum TerminalEvent {
     Exited,
     /// ⌘-click on a URL in the output.
     OpenUrl(String),
+    /// A command at the shell finished: what ran, its exit status, and how
+    /// long it took.
+    CommandDone {
+        command: Option<String>,
+        exit: Option<i32>,
+        took: std::time::Duration,
+    },
+    /// ⌃R at the shell's prompt: search the commands run before.
+    History,
+    /// "# …" at the prompt: write a command for this, in this folder.
+    Ask { request: String, cwd: Option<PathBuf> },
+    /// "Fix with agent" on a block: a message for a chat in this folder.
+    AskAgent { prompt: String, cwd: Option<PathBuf> },
 }
 
 pub struct TerminalPane {
@@ -60,6 +73,8 @@ pub struct TerminalPane {
     /// OSC 9;4 progress, once the program has reported any: `Some` while it
     /// works.
     progress: Option<Option<u8>>,
+    /// Its percentage, when it gives one.
+    progress_pct: Option<u8>,
     exited: bool,
     look: Look,
     cell_w: f32,
@@ -87,6 +102,18 @@ pub struct TerminalPane {
     blink_on: bool,
     /// When the user last typed: the cursor stays solid while they do.
     typed: Instant,
+    /// The command block under the mouse, for its actions.
+    hover_block: Option<u64>,
+    /// The line at the prompt as the shell last reported it: cursor (in
+    /// characters) and text. `None` while a command runs.
+    line: Option<(usize, String)>,
+    /// What the word at the cursor could become, for the line it was worked
+    /// out for.
+    suggest: Option<Suggest>,
+    /// Esc closed the menu: the line before the word it was closed on, so it
+    /// stays shut while that word is typed.
+    hushed: Option<String>,
+    _complete: Option<Task<()>>,
     _blink: Option<Task<()>>,
     _wake: Task<()>,
 }
@@ -108,7 +135,19 @@ pub struct Look {
     pub option_meta: bool,
     /// Programs' coloured backgrounds (diffs, highlights) drawn as a tint.
     pub soften: bool,
+    /// The completion menu at a zsh prompt, as you type.
+    pub complete: bool,
 }
+
+struct Suggest {
+    line: String,
+    cursor: usize,
+    found: crate::complete::Found,
+    sel: usize,
+}
+
+/// Rows the completion menu shows at once; the rest scroll into view.
+const MENU_ROWS: usize = 8;
 
 /// Half a blink cycle, as macOS text fields use.
 const BLINK: std::time::Duration = std::time::Duration::from_millis(530);
@@ -182,13 +221,30 @@ impl TerminalPane {
                                 cx.emit(TerminalEvent::Alert(Some(said)));
                                 cx.emit(TerminalEvent::Retitled);
                             }
-                            term::TermEvent::Progress(state) if p.progress != Some(state) => {
-                                p.progress = Some(state);
-                                cx.emit(TerminalEvent::Retitled);
+                            term::TermEvent::Progress(state, pct) => {
+                                p.progress_pct = pct;
+                                if p.progress != Some(state) {
+                                    p.progress = Some(state);
+                                    cx.emit(TerminalEvent::Retitled);
+                                }
                             }
                             term::TermEvent::Exited(_) => {
                                 p.exited = true;
                                 cx.emit(TerminalEvent::Exited);
+                            }
+                            term::TermEvent::Ask(request) => {
+                                let cwd = p.term.shell_cwd().map(PathBuf::from);
+                                cx.emit(TerminalEvent::Ask { request, cwd });
+                            }
+                            term::TermEvent::Line(line) => {
+                                if line.is_none() {
+                                    p.hushed = None;
+                                }
+                                p.line = line;
+                                p.refresh_completions(cx);
+                            }
+                            term::TermEvent::CommandDone { command, exit, took, .. } => {
+                                cx.emit(TerminalEvent::CommandDone { command, exit, took });
                             }
                             _ => {}
                         }
@@ -211,6 +267,7 @@ impl TerminalPane {
             bell: false,
             alert: None,
             progress: None,
+            progress_pct: None,
             exited: false,
             cell_w: cell_width(window, &look.family, look.font_px),
             look,
@@ -226,6 +283,11 @@ impl TerminalPane {
             restyle: false,
             blink_on: true,
             typed: Instant::now(),
+            hover_block: None,
+            line: None,
+            suggest: None,
+            hushed: None,
+            _complete: None,
             _blink: None,
             _wake: wake,
         }
@@ -442,6 +504,64 @@ impl TerminalPane {
         if self.marked.is_some() || !self.focus.is_focused(window) {
             return;
         }
+        // ⌘↑ / ⌘↓: from prompt to prompt, as Terminal does with its marks.
+        let k = &ev.keystroke;
+        // The completion menu, while open, has ↑↓, ⇥ and Esc; ⏎ still runs
+        // the line as typed.
+        let plain = !k.modifiers.control && !k.modifiers.platform && !k.modifiers.alt && !k.modifiers.shift;
+        if let Some(n) = self.shown_suggest(true).map(|s| s.found.items.len()) {
+            let handled = match k.key.as_str() {
+                "up" | "down" if plain => {
+                    if let Some(s) = self.suggest.as_mut() {
+                        s.sel = if k.key == "up" { (s.sel + n - 1) % n } else { (s.sel + 1) % n };
+                    }
+                    true
+                }
+                "tab" if plain => {
+                    let sel = self.suggest.as_ref().map_or(0, |s| s.sel);
+                    self.accept_completion(sel);
+                    true
+                }
+                "escape" if plain => {
+                    self.hushed = self.suggest.as_ref().map(word_lead);
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                self.typed = Instant::now();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+        // ⌃R at a prompt (zsh, nothing running, no full-screen program):
+        // Deck's history search. Anywhere else ⌃R is the program's.
+        if k.modifiers.control
+            && !k.modifiers.platform
+            && !k.modifiers.alt
+            && !k.modifiers.shift
+            && k.key == "r"
+            && !self.term.last().alt_screen
+            && self.term.last_block().is_some_and(|(_, b)| !b.running())
+        {
+            cx.emit(TerminalEvent::History);
+            cx.stop_propagation();
+            return;
+        }
+        if k.modifiers.platform
+            && !k.modifiers.shift
+            && !k.modifiers.alt
+            && !k.modifiers.control
+            && matches!(k.key.as_str(), "up" | "down")
+            && self.term.has_blocks()
+        {
+            if self.term.jump_block(k.key == "up") {
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
         self.typed = Instant::now();
         self.blink_on = true;
         let bytes = key_bytes(&ev.keystroke, self.term.app_cursor()).or_else(|| {
@@ -456,6 +576,243 @@ impl TerminalPane {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+
+    /// Work out the completions for the line the shell just reported, off
+    /// the main thread; a newer line cancels the last one's.
+    fn refresh_completions(&mut self, cx: &mut Context<Self>) {
+        let Some((cursor, text)) = self.line.clone().filter(|_| self.look.complete) else {
+            self.suggest = None;
+            self._complete = None;
+            return;
+        };
+        let cwd = self
+            .term
+            .shell_cwd()
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_default();
+        self._complete = Some(cx.spawn(async move |this, cx| {
+            let (line, at) = (text.clone(), cursor);
+            let found = cx
+                .background_executor()
+                .spawn(async move { crate::complete::complete(&line, at, &cwd) })
+                .await;
+            let _ = this.update(cx, |p, cx| {
+                // Keep the choice when the list starts the same way.
+                let sel = match (&p.suggest, &found) {
+                    (Some(old), Some(new)) => old
+                        .found
+                        .items
+                        .get(old.sel)
+                        .and_then(|it| new.items.iter().position(|n| n.insert == it.insert))
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                p.suggest = found.map(|found| Suggest { line: text, cursor, found, sel });
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The menu, when there is one to show: for the line as it is now, at a
+    /// prompt, with the cursor at the end of a word.
+    fn shown_suggest(&self, focused: bool) -> Option<&Suggest> {
+        let s = self.suggest.as_ref()?;
+        let (cursor, line) = self.line.as_ref()?;
+        let snap = self.term.last();
+        let at_prompt = !snap.alt_screen
+            && snap.scrolled_back == 0
+            && snap.cursor.is_some()
+            && self.term.last_block().is_some_and(|(_, b)| !b.running());
+        let word_end = line.chars().nth(*cursor).is_none_or(char::is_whitespace);
+        (focused
+            && at_prompt
+            && word_end
+            && s.cursor == *cursor
+            && s.line == *line
+            && (s.found.eager || !s.found.word.is_empty())
+            && self.hushed.as_deref() != Some(word_lead(s).as_str())
+            && self.menu.is_none()
+            && self.find.is_none())
+        .then_some(s)
+    }
+
+    /// Type what turns the word into item `ix`: the rest of it when it
+    /// carries on from what was typed, else the word rubbed out and the item.
+    fn accept_completion(&mut self, ix: usize) {
+        let Some(s) = self.suggest.take() else { return };
+        let Some(item) = s.found.items.get(ix) else { return };
+        let word = s.found.word.as_str();
+        let mut keys = match item.insert.strip_prefix(word) {
+            Some(rest) => rest.to_string(),
+            None => "\x7f".repeat(word.chars().count()) + &item.insert,
+        };
+        if item.space {
+            keys.push(' ');
+        }
+        if !keys.is_empty() {
+            self.term.write(keys.into_bytes());
+        }
+    }
+
+    fn render_suggest(&self, focused: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::complete::Kind;
+        let s = self.shown_suggest(focused)?;
+        let (row, col) = self.term.last().cursor?;
+        let lh = self.line_px();
+        let fs = self.look.font_px;
+        let small = (fs * 0.78).max(10.);
+        let label_px = (fs * 0.92).round();
+        let item_h = (fs * 1.55).round();
+        let n = s.found.items.len();
+        let shown = n.min(MENU_ROWS);
+        let first = s.sel.saturating_sub(shown - 1).min(n - shown);
+        let longest = s.found.items.iter().map(|i| i.label.chars().count()).max().unwrap_or(8);
+        let has_detail = s.found.items.iter().any(|i| i.detail.as_deref().is_some_and(|d| !d.is_empty()));
+        let grid_w = self.term.columns() as f32 * self.cell_w;
+        // Icons only tell kinds apart, so a list of one kind goes without.
+        let mixed = s.found.items.iter().any(|i| i.kind != s.found.items[0].kind);
+        let width = (longest as f32 * self.cell_w * 0.92 + 32. + if mixed { 22. } else { 0. } + if has_detail { 120. } else { 0. })
+            .clamp(180., 440.)
+            .min(grid_w.max(180.));
+        let height = shown as f32 * item_h + 8. + (small + 10.);
+        let word_cols = s.found.word.chars().count();
+        let left = ((col.saturating_sub(word_cols)) as f32 * self.cell_w - 10.)
+            .min(grid_w - width)
+            .max(0.);
+        let rows = self.term.rows() as f32;
+        let below = (rows - row as f32 - 1.) * lh;
+        let top = if below < height + 4. && row as f32 * lh > below {
+            row as f32 * lh - height - 4.
+        } else {
+            (row as f32 + 1.) * lh + 4.
+        };
+        let pal = &self.look.palette;
+        let tint = |k: Kind| match k {
+            Kind::Command => pal.ansi[2],
+            Kind::Sub | Kind::Dir => pal.ansi[4],
+            Kind::Flag | Kind::Script => pal.ansi[3],
+            Kind::Branch => pal.ansi[5],
+            Kind::File => theme::text_2(),
+        };
+        let glyph = |k: Kind| match k {
+            Kind::Command => Icon::Terminal,
+            Kind::Sub => Icon::ChevronRight,
+            Kind::Flag => Icon::Settings,
+            Kind::Dir => Icon::Folder,
+            Kind::File => Icon::File,
+            Kind::Branch => Icon::Git,
+            Kind::Script => Icon::Bolt,
+        };
+        let mut list = div().flex().flex_col().p(px(4.));
+        for (i, it) in s.found.items.iter().enumerate().skip(first).take(shown) {
+            let on = i == s.sel;
+            let lights: Vec<_> = it
+                .label
+                .char_indices()
+                .enumerate()
+                .filter(|(ci, _)| it.matched.contains(ci))
+                .map(|(_, (b, ch))| {
+                    (
+                        b..b + ch.len_utf8(),
+                        gpui::HighlightStyle {
+                            color: Some(rgb(theme::text()).into()),
+                            font_weight: Some(gpui::FontWeight::BOLD),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            list = list.child(
+                div()
+                    .id(("suggest", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(item_h))
+                    .px(px(8.))
+                    .rounded(px(6.))
+                    .when(on, |d| d.bg(rgb(theme::surface())))
+                    .when(!on, |d| d.hover(|h| h.bg(rgb(theme::row_hover()))))
+                    .cursor_pointer()
+                    .when(mixed, |d| {
+                        d.child(
+                            gpui::svg()
+                                .path(glyph(it.kind).path())
+                                .size(px((fs * 0.8).round()))
+                                .flex_none()
+                                .text_color(rgb(if on { tint(it.kind) } else { theme::dim() })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(self.look.family.clone())
+                            .text_size(px(label_px))
+                            .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
+                            .child(gpui::StyledText::new(it.label.clone()).with_highlights(lights)),
+                    )
+                    .children(it.detail.clone().filter(|d| !d.is_empty()).map(|d| {
+                        div()
+                            .flex_none()
+                            .max_w(px(120.))
+                            .truncate()
+                            .text_size(px(small))
+                            .text_color(rgb(theme::dim()))
+                            .child(d)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |p, _, window, cx| {
+                            cx.stop_propagation();
+                            p.accept_completion(i);
+                            window.focus(&p.focus);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        let foot = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(small + 10.))
+            .px(px(12.))
+            .border_t_1()
+            .border_color(rgba(theme::hairline()))
+            .text_size(px(small))
+            .text_color(rgb(theme::dim()))
+            .child("⇥ complete")
+            .child("↑↓ choose")
+            .child("esc close");
+        Some(
+            div()
+                .absolute()
+                .top(theme::u(theme::PANE_PAD_Y))
+                .left(theme::u(theme::PANE_PAD_X))
+                .child(
+                    div()
+                        .id("suggest-menu")
+                        .absolute()
+                        .top(px(top))
+                        .left(px(left))
+                        .w(px(width))
+                        .flex()
+                        .flex_col()
+                        .rounded(px(10.))
+                        .bg(rgb(theme::menu()))
+                        .border_1()
+                        .border_color(rgba(theme::hairline()))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .child(list)
+                        .child(foot),
+                )
+                .into_any_element(),
+        )
     }
 
     fn focus_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -473,6 +830,32 @@ impl TerminalPane {
             self.alert = None;
             cx.emit(TerminalEvent::Retitled);
         }
+    }
+
+    /// The folder the shell last said it is in (OSC 7).
+    pub fn shell_cwd(&self) -> Option<PathBuf> {
+        self.term.shell_cwd().map(PathBuf::from)
+    }
+
+    /// The shell's newest command and how it went, for the status bar.
+    pub fn job(&self) -> Option<term::Block> {
+        self.term.last_command()
+    }
+
+    /// The last `lines` lines this pane printed, scrollback included.
+    pub fn tail(&self, lines: usize) -> String {
+        self.term.tail_text(lines)
+    }
+
+    /// The command lines run here, newest first.
+    pub fn session_commands(&self) -> Vec<String> {
+        self.term.commands()
+    }
+
+    /// What this pane showed, with its colours, to show again after a
+    /// relaunch (see `Workspace::save_scrollback`).
+    pub fn history_ansi(&self) -> Option<String> {
+        self.term.history_ansi(5000)
     }
 
     /// Whether the program says it is working, when it says: OSC 9;4
@@ -675,6 +1058,11 @@ impl TerminalPane {
 
     fn on_mouse_move(&mut self, ev: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let (row, col, right) = self.cell_at(ev.position);
+        let hover = self.block_at_row(row);
+        if hover != self.hover_block {
+            self.hover_block = hover;
+            cx.notify();
+        }
         // A button let go where this pane never heard it (over the sidebar,
         // another pane, the menu bar) left a press open. The program would
         // take every later move for a drag, and Claude Code then selects as
@@ -907,6 +1295,369 @@ impl EntityInputHandler for TerminalPane {
     }
 }
 
+// -- command blocks ------------------------------------------------------------------------
+
+/// A block's mark on screen: where its prompt starts (`None` when that is
+/// above the view), how far it reaches, and what deck knows about it.
+struct Shown<'a> {
+    n: u64,
+    start: Option<usize>,
+    end: usize,
+    block: &'a term::Block,
+}
+
+impl TerminalPane {
+    /// The blocks on screen, top to bottom, from the last snapshot.
+    fn shown_blocks(&self) -> Vec<Shown<'_>> {
+        let snap = self.term.last();
+        if snap.alt_screen || snap.blocks.is_empty() {
+            return Vec::new();
+        }
+        let info = |n: u64| snap.blocks.iter().find(|(m, _)| *m == n).map(|(_, b)| b);
+        let mut starts: Vec<(usize, u64)> = Vec::new();
+        for (r, row) in snap.rows.iter().enumerate() {
+            if let Some(n) = row.block {
+                if r == 0 || snap.rows[r - 1].block != Some(n) {
+                    starts.push((r, n));
+                }
+            }
+        }
+        // The newest block reaches down to the cursor, not the bottom of
+        // an empty screen.
+        let bottom = match snap.cursor {
+            Some((row, _)) if snap.scrolled_back == 0 => row + 1,
+            _ => snap.rows.len(),
+        };
+        let mut out = Vec::new();
+        if let Some(n) = snap.above {
+            let end = starts.first().map(|s| s.0).unwrap_or(bottom);
+            if let Some(block) = info(n) {
+                out.push(Shown { n, start: None, end, block });
+            }
+        }
+        for (i, &(r, n)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map(|s| s.0).unwrap_or(bottom.max(r + 1));
+            if let Some(block) = info(n) {
+                out.push(Shown { n, start: Some(r), end, block });
+            }
+        }
+        out
+    }
+
+    /// The block a screen row belongs to.
+    fn block_at_row(&self, row: usize) -> Option<u64> {
+        self.shown_blocks()
+            .into_iter()
+            .find(|b| b.start.unwrap_or(0) <= row && row < b.end)
+            .map(|b| b.n)
+    }
+
+    fn copy_block(&mut self, n: u64, output: bool, cx: &mut Context<Self>) {
+        let text = if output {
+            self.term.block_output(n)
+        } else {
+            self.term.block(n).and_then(|b| b.command)
+        };
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Run block `n`'s command again, at the prompt.
+    fn rerun_block(&mut self, n: u64, cx: &mut Context<Self>) {
+        let at_prompt = self.term.last_block().is_some_and(|(_, b)| !b.running());
+        if let Some(cmd) = self.term.block(n).and_then(|b| b.command).filter(|_| at_prompt) {
+            self.term.select_clear();
+            self.term.write(format!("{cmd}\r").into_bytes());
+            cx.notify();
+        }
+    }
+
+    /// Hand a command and what it printed to an agent.
+    fn ask_agent(&mut self, n: u64, cx: &mut Context<Self>) {
+        let Some(block) = self.term.block(n) else {
+            return;
+        };
+        let command = block.command.clone().unwrap_or_default();
+        let output = self.term.block_output(n).unwrap_or_default();
+        // The end of a long log is where the error is.
+        let lines: Vec<&str> = output.lines().collect();
+        let tail = lines[lines.len().saturating_sub(150)..].join("\n");
+        let prompt = match block.exit {
+            Some(code) if code != 0 => format!(
+                "This command failed in my terminal (exit {code}):\n\n```\n$ {command}\n{tail}\n```\n\nFind out why and fix it."
+            ),
+            _ => format!("Here is a command I ran and its output:\n\n```\n$ {command}\n{tail}\n```\n\nExplain what happened."),
+        };
+        cx.emit(TerminalEvent::AskAgent {
+            prompt,
+            cwd: block.cwd.map(PathBuf::from),
+        });
+    }
+
+    /// Separators between commands, a bar beside a failed (or running)
+    /// one, its status on its prompt row, actions under the mouse, and the
+    /// command whose output fills the screen pinned at the top.
+    fn render_blocks(&self, pad: u32, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let shown = self.shown_blocks();
+        if shown.is_empty() {
+            return None;
+        }
+        let lh = self.line_px();
+        let fs = (self.look.font_px * 0.82).max(10.);
+        let red = self.look.palette.ansi[1];
+        let green = self.look.palette.ansi[2];
+        let rows = self.term.last().rows.len();
+        let (pad_x, pad_y) = (theme::u(theme::PANE_PAD_X), theme::u(theme::PANE_PAD_Y));
+        let mut layer = div()
+            .absolute()
+            .top(pad_y)
+            .left(pad_x)
+            .right(pad_x)
+            .h(px(rows as f32 * lh));
+
+        let chip = |b: &term::Block| -> Option<AnyElement> {
+            let took = b.took().map(human);
+            // Running: a still dot. A spinner would redraw the window for as
+            // long as a dev server runs.
+            let (mark, color, text) = if b.running() {
+                ("●", theme::accent(), None)
+            } else {
+                match b.exit {
+                    // A quick success needs no mark; a slow one says how long.
+                    Some(0) if b.took().is_none_or(|t| t.as_secs_f32() < 2.) => return None,
+                    Some(0) => ("✓", green, took),
+                    Some(code) => ("✗", red, Some(format!("{code}{}", took.map(|t| format!(" · {t}")).unwrap_or_default()))),
+                    None => return None,
+                }
+            };
+            Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(div().text_color(rgb(color)).child(mark))
+                    .children(text)
+                    .into_any_element(),
+            )
+        };
+
+        for b in &shown {
+            let top = b.start.unwrap_or(0) as f32 * lh;
+            let height = (b.end.saturating_sub(b.start.unwrap_or(0))) as f32 * lh;
+            // The edge: red for a failure, the accent while it runs.
+            let edge = if b.block.running() {
+                Some(theme::accent())
+            } else {
+                b.block.exit.filter(|c| *c != 0).map(|_| red)
+            };
+            if let Some(color) = edge {
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .left(px(-7.))
+                        .top(px(top))
+                        .w(px(2.))
+                        .h(px(height))
+                        .rounded(px(1.))
+                        .bg(rgb(color)),
+                );
+            }
+            let Some(start) = b.start else { continue };
+            if start > 0 {
+                // Between commands: a quiet rule on the text's own edges,
+                // so blocks part without boxing the screen in lines.
+                let rule = theme::hairline();
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .left(px(0.))
+                        .right(px(0.))
+                        .top(px(start as f32 * lh - 1.))
+                        .h(px(1.))
+                        .bg(rgba((rule & !0xff) | ((rule & 0xff) / 2))),
+                );
+            }
+            let hovered = self.hover_block == Some(b.n);
+            let status = if hovered {
+                Some(self.block_actions(b.n, b.block, fs, cx))
+            } else {
+                chip(b.block)
+            };
+            if let Some(status) = status {
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .right(px(0.))
+                        .top(px(start as f32 * lh))
+                        .h(px(lh))
+                        .flex()
+                        .items_center()
+                        .px(px(6.))
+                        .rounded(px(5.))
+                        .bg(rgb(pad))
+                        .text_size(px(fs))
+                        .text_color(rgb(theme::dim()))
+                        .child(status),
+                );
+            }
+        }
+
+        // Reading a command's output with its prompt scrolled away: pin it.
+        if let Some(b) = shown.first().filter(|b| b.start.is_none() && b.block.command.is_some()) {
+            let n = b.n;
+            let hovered = self.hover_block == Some(n);
+            let command = b.block.command.clone().unwrap_or_default();
+            let right = if hovered {
+                Some(self.block_actions(n, b.block, fs, cx))
+            } else {
+                chip(b.block)
+            };
+            layer = layer.child(
+                div()
+                    .id(ElementId::Name(format!("sticky-{n}").into()))
+                    .absolute()
+                    .left(px(-8.))
+                    .right(px(-8.))
+                    .top(px(-4.))
+                    .h(px(lh + 8.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .bg(rgb(pad))
+                    .border_b_1()
+                    .border_color(rgba(theme::hairline()))
+                    .shadow_sm()
+                    .cursor_pointer()
+                    .font_family(self.look.family.clone())
+                    .text_size(px(self.look.font_px))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |p, _, _, cx| {
+                        if p.term.scroll_to_block(n) {
+                            cx.notify();
+                        }
+                    }))
+                    .child(div().flex_none().text_color(rgb(theme::accent())).child("❯"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(theme::text()))
+                            .child(crate::chat::one_line_pub(&command)),
+                    )
+                    .children(right.map(|r| {
+                        div()
+                            .flex_none()
+                            .text_size(px(fs))
+                            .text_color(rgb(theme::dim()))
+                            .child(r)
+                    })),
+            );
+        }
+        Some(layer.into_any_element())
+    }
+
+    /// Copy, Output, Rerun and Fix with agent, for the block under the mouse.
+    fn block_actions(&self, n: u64, block: &term::Block, fs: f32, cx: &mut Context<Self>) -> AnyElement {
+        let failed = block.exit.is_some_and(|c| c != 0);
+        let latest = self.term.last_block().map(|(m, b)| (m, b.running()));
+        let can_rerun = block.command.is_some() && latest.is_some_and(|(_, running)| !running);
+        let button = |id: &str, label: &'static str, strong: bool| {
+            div()
+                .id(ElementId::Name(format!("blk-{id}-{n}").into()))
+                .px(px(7.))
+                .py(px(1.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(fs))
+                .text_color(rgb(if strong { theme::text() } else { theme::text_2() }))
+                .bg(rgb(theme::surface()))
+                .hover(|s| s.bg(rgb(theme::surface_hover())))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(label)
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .when(block.command.is_some(), |d| {
+                d.child(button("cmd", "Copy", false).on_click(cx.listener(move |p, _, _, cx| p.copy_block(n, false, cx))))
+            })
+            .child(button("out", "Output", false).on_click(cx.listener(move |p, _, _, cx| p.copy_block(n, true, cx))))
+            .when(can_rerun, |d| {
+                d.child(button("run", "Rerun", false).on_click(cx.listener(move |p, _, _, cx| p.rerun_block(n, cx))))
+            })
+            .when(block.finished.is_some(), |d| {
+                d.child(
+                    button("ask", if failed { "Fix with agent" } else { "Ask agent" }, failed)
+                        .on_click(cx.listener(move |p, _, _, cx| p.ask_agent(n, cx))),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+impl TerminalPane {
+    /// OSC 9;4 as a slim bar along the top: filled to the percentage, a
+    /// sliding band when the program can't say how far, red for an error,
+    /// amber when paused.
+    fn render_progress(&self) -> Option<AnyElement> {
+        let state = self.progress.flatten()?;
+        let (color, fill) = match state {
+            2 => (self.look.palette.ansi[1], Some(self.progress_pct.unwrap_or(100))),
+            4 => (self.look.palette.ansi[3], Some(self.progress_pct.unwrap_or(100))),
+            1 => (theme::accent(), self.progress_pct),
+            _ => (theme::accent(), None),
+        };
+        let track = div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .right(px(0.))
+            .h(px(2.))
+            .overflow_hidden()
+            .bg(rgba(theme::alpha(color, 0x33)));
+        let bar = match fill {
+            Some(pct) => div()
+                .h_full()
+                .w(relative(pct as f32 / 100.))
+                .bg(rgb(color)),
+            None => {
+                // On the shared animation clock, not every display frame.
+                let t = crate::icon::phase(1400);
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .h_full()
+                    .w(relative(0.3))
+                    .left(relative(t * 1.3 - 0.3))
+                    .bg(rgb(color))
+            }
+        };
+        Some(track.child(bar).into_any_element())
+    }
+}
+
+/// The line before the word a menu was made for.
+fn word_lead(s: &Suggest) -> String {
+    let n = s.cursor.saturating_sub(s.found.word.chars().count());
+    s.line.chars().take(n).collect()
+}
+
+/// "0.4s", "12s", "3m 5s".
+fn human(d: std::time::Duration) -> String {
+    let s = d.as_secs_f32();
+    if s < 10. {
+        format!("{s:.1}s")
+    } else if s < 60. {
+        format!("{}s", s as u64)
+    } else {
+        format!("{}m {}s", s as u64 / 60, s as u64 % 60)
+    }
+}
+
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let restyle = std::mem::take(&mut self.restyle);
@@ -973,6 +1724,9 @@ impl Render for TerminalPane {
                 focus: self.focus.clone(),
                 focused,
             })
+            .children(self.render_progress())
+            .children(self.render_blocks(pad, cx))
+            .children(self.render_suggest(focused, cx))
             .children(find)
             .children(self.menu.as_ref().map(menu::Open::render))
     }
@@ -1010,15 +1764,33 @@ fn on_grid(ch: char) -> bool {
     matches!(ch as u32, 0x20..=0x7e | 0xa0..=0x17f | 0x2500..=0x259f)
 }
 
-/// A program's coloured background as a tint of the pane rather than a
-/// solid block: a third of its saturation taken out, then 40% of the way to
-/// the pane's colour. Claude Code's diffs, for one, otherwise paint whole
-/// lines in deep green and red. Greys (bars, input boxes) are left as they
-/// are; they carry the layout.
+/// A program's red or green background as a tint of the pane rather than
+/// a solid block: a third of its saturation taken out, then 40% of the way
+/// to the pane's colour. Claude Code's diffs otherwise paint whole lines in
+/// deep green and red. Other hues are left alone: a blue is a selection
+/// (Claude Code's own, when you drag in it) or a highlight, and softening it
+/// made selected text look merely faded. Greys (bars, input boxes) carry the
+/// layout and stay too.
 fn soften(color: u32, pane: u32) -> u32 {
     let ch = |c: u32, shift: u32| ((c >> shift) & 0xff) as f32;
     let (r, g, b) = (ch(color, 16), ch(color, 8), ch(color, 0));
-    if r.max(g).max(b) - r.min(g).min(b) < 24. {
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    if max - min < 24. {
+        return color;
+    }
+    let hue = {
+        let d = max - min;
+        let h = if max == r {
+            ((g - b) / d).rem_euclid(6.)
+        } else if max == g {
+            (b - r) / d + 2.
+        } else {
+            (r - g) / d + 4.
+        };
+        h * 60.
+    };
+    let diff_like = !(25. ..320.).contains(&hue) || (75. ..=165.).contains(&hue);
+    if !diff_like {
         return color;
     }
     let luma = 0.299 * r + 0.587 * g + 0.114 * b;
@@ -1165,7 +1937,7 @@ impl Element for Grid {
         window: &mut Window,
         cx: &mut App,
     ) -> Prepared {
-        let regular = font(self.pane.read(cx).look.family.clone());
+        let regular = theme::term_font(self.pane.read(cx).look.family.clone());
         let ts = window.text_system().clone();
         // Rows are shaped once and reused while their content is unchanged:
         // typing or a spinner touches one or two rows a frame, not all fifty.
@@ -1358,7 +2130,7 @@ fn row_text(row: &term::Row) -> String {
 
 fn cell_width(window: &Window, family: &SharedString, font_px: f32) -> f32 {
     let ts = window.text_system();
-    let id = ts.resolve_font(&font(family.clone()));
+    let id = ts.resolve_font(&theme::term_font(family.clone()));
     ts.advance(id, px(font_px), 'm')
         .map(|s| f32::from(s.width))
         .unwrap_or(font_px * 0.6)
@@ -1497,6 +2269,12 @@ mod tests {
         assert!(red >> 16 > (red >> 8) & 0xff);
         // A grey bar is left alone.
         assert_eq!(soften(0x373737, pane), 0x373737);
+        // So is a selection: Claude Code's dark and light theme blues.
+        assert_eq!(soften(0x264f78, pane), 0x264f78);
+        assert_eq!(soften(0xb4d5ff, pane), 0xb4d5ff);
+        // Word-level diff highlights are still red and green, so they tint.
+        assert_ne!(soften(0x38a660, pane), 0x38a660);
+        assert_ne!(soften(0xb3596b, pane), 0xb3596b);
     }
 
     fn ks(key: &str, ch: Option<&str>, m: Modifiers) -> Keystroke {

@@ -46,6 +46,7 @@ icons! {
     Folder => "folder.svg",
     File => "file.svg",
     Files => "files.svg",
+    Code => "code.svg",
     Git => "git.svg",
     Info => "info.svg",
     Copy => "copy.svg",
@@ -92,6 +93,19 @@ impl Icon {
             _ => Icon::GenericAgent,
         }
     }
+
+    /// The colour an agent's mark takes while it works, so a busy row is
+    /// told apart from idle ones at a glance. Readable on dark and light.
+    pub fn brand(self) -> Option<u32> {
+        Some(match self {
+            Icon::Claude => 0xd97757,
+            Icon::Codex => 0x10a37f,
+            Icon::Gemini => 0x4f8ff7,
+            Icon::Grok => 0x9b8cf7,
+            Icon::OpenCode => 0xf0a030,
+            _ => return None,
+        })
+    }
 }
 
 pub fn icon(kind: Icon, size: f32, color: u32) -> AnyElement {
@@ -103,80 +117,89 @@ pub fn icon(kind: Icon, size: f32, color: u32) -> AnyElement {
         .into_any_element()
 }
 
+/// Animations here run on one clock at [`ANIM_FPS`] rather than at the
+/// display's refresh rate. Every frame redraws the whole window, so a spinner
+/// asking for 120 frames a second kept the main thread and the GPU busy for
+/// as long as an agent worked; at 15 it looks the same. Building one marks
+/// the frame as animated; the workspace's animation tick (see
+/// [`take_animating`]) draws the next one.
+pub const ANIM_FPS: f32 = 15.;
+
+static ANIMATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether anything animated was drawn since the last call.
+pub fn take_animating() -> bool {
+    ANIMATING.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Where in a cycle of `period_ms` the clock is, 0–1, in steps of a frame,
+/// and a note that the window must come back for the next step.
+pub fn phase(period_ms: u64) -> f32 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    ANIMATING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let frame = (START.get_or_init(Instant::now).elapsed().as_secs_f32() * ANIM_FPS).floor();
+    (frame / ANIM_FPS * 1000. / period_ms as f32).fract()
+}
+
 /// Work in progress: a comet, its head bright and its tail fading, turning
-/// a little faster than once a second. `id` keeps the motion steady across
-/// frames.
-pub fn spinner(id: impl Into<gpui::ElementId>, size: f32, color: u32) -> AnyElement {
-    use gpui::{percentage, Animation, AnimationExt, Transformation};
+/// a little faster than once a second.
+pub fn spinner(_id: impl Into<gpui::ElementId>, size: f32, color: u32) -> AnyElement {
+    use gpui::{percentage, Transformation};
     svg()
         .path(Icon::Spinner.path())
         .size(u(size))
         .flex_none()
         .text_color(rgb(color))
-        .with_animation(
-            id,
-            Animation::new(std::time::Duration::from_millis(850)).repeat(),
-            |s, t| s.with_transformation(Transformation::rotate(percentage(t))),
-        )
+        .with_transformation(Transformation::rotate(percentage(phase(850))))
         .into_any_element()
 }
 
 /// An agent at work: its own mark turns in eased quarter steps and breathes
 /// in between, the way Claude Code's glyph does in a terminal. Still marks
 /// read as idle; this one reads as thinking.
-pub fn thinking(id: impl Into<gpui::ElementId>, glyph: Icon, size: f32, color: u32) -> AnyElement {
-    use gpui::{percentage, size as sz, Animation, AnimationExt, Transformation};
+pub fn thinking(_id: impl Into<gpui::ElementId>, glyph: Icon, size: f32, color: u32) -> AnyElement {
+    use gpui::{percentage, size as sz, Transformation};
+    let t = phase(2400);
+    let (step, within) = ((t * 4.).floor(), (t * 4.).fract());
+    let turn = (step + ease_in_out(within)) / 4.;
+    // Smallest mid-turn, full size at rest.
+    let scale = 1. - 0.16 * (within * std::f32::consts::PI).sin();
     svg()
         .path(glyph.path())
         .size(u(size))
         .flex_none()
         .text_color(rgb(color))
-        .with_animation(
-            id,
-            Animation::new(std::time::Duration::from_millis(2400)).repeat(),
-            |s, t| {
-                let (step, within) = ((t * 4.).floor(), (t * 4.).fract());
-                let turn = (step + ease_in_out(within)) / 4.;
-                // Smallest mid-turn, full size at rest.
-                let scale = 1. - 0.16 * (within * std::f32::consts::PI).sin();
-                s.with_transformation(
-                    Transformation::rotate(percentage(turn)).with_scaling(sz(scale, scale)),
-                )
-            },
-        )
+        .with_transformation(Transformation::rotate(percentage(turn)).with_scaling(sz(scale, scale)))
         .into_any_element()
 }
 
 /// Text with a band of light sweeping across it: "Working…" while an agent
 /// is busy.
-pub fn shimmer(id: impl Into<gpui::ElementId>, text: SharedString) -> AnyElement {
-    use gpui::{Animation, AnimationExt, HighlightStyle, StyledText};
+pub fn shimmer(_id: impl Into<gpui::ElementId>, text: SharedString) -> AnyElement {
+    use gpui::{HighlightStyle, StyledText};
+    let t = phase(1900);
+    let n = text.chars().count() as f32;
+    let band = 5.;
+    let at = t * (n + band * 2.) - band;
+    let lights: Vec<_> = text
+        .char_indices()
+        .enumerate()
+        .map(|(i, (byte, ch))| {
+            let k = (1. - (i as f32 - at).abs() / band).max(0.);
+            (
+                byte..byte + ch.len_utf8(),
+                HighlightStyle {
+                    color: Some(rgb(mix(SHIMMER_BASE, SHIMMER_PEAK, k)).into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
     gpui::div()
         .flex_none()
-        .with_animation(
-            id,
-            Animation::new(std::time::Duration::from_millis(1900)).repeat(),
-            move |d, t| {
-                let n = text.chars().count() as f32;
-                let band = 5.;
-                let at = t * (n + band * 2.) - band;
-                let lights: Vec<_> = text
-                    .char_indices()
-                    .enumerate()
-                    .map(|(i, (byte, ch))| {
-                        let k = (1. - (i as f32 - at).abs() / band).max(0.);
-                        (
-                            byte..byte + ch.len_utf8(),
-                            HighlightStyle {
-                                color: Some(rgb(mix(SHIMMER_BASE, SHIMMER_PEAK, k)).into()),
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect();
-                d.child(StyledText::new(text.clone()).with_highlights(lights))
-            },
-        )
+        .child(StyledText::new(text.clone()).with_highlights(lights))
         .into_any_element()
 }
 

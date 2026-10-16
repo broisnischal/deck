@@ -38,14 +38,43 @@ pub struct GitFile {
     pub path: String,
     /// `M`, `A`, `D`, `R`, `C`, `U` or `??`.
     pub status: String,
+    /// Has changes in the index (staged), and in the working tree.
+    pub staged: bool,
+    pub unstaged: bool,
+}
+
+/// A checkout of the repository: the main one or one added with
+/// `git worktree add`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub current: bool,
+}
+
+/// A commit in the recent history.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Commit {
+    pub hash: String,
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    /// Unix seconds.
+    pub date: i64,
+    pub refs: Vec<String>,
+    /// More than one parent.
+    pub merge: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GitInfo {
     pub branch: String,
+    pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
     pub files: Vec<GitFile>,
+    pub worktrees: Vec<Worktree>,
+    pub commits: Vec<Commit>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -627,7 +656,78 @@ pub fn git(dir: &Path) -> Option<GitInfo> {
     if !out.status.success() {
         return None;
     }
-    Some(parse_git(&String::from_utf8_lossy(&out.stdout)))
+    let mut info = parse_git(&String::from_utf8_lossy(&out.stdout));
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    info.worktrees = parse_worktrees(&git(&["worktree", "list", "--porcelain"]), dir);
+    info.commits = parse_log(&git(&["log", "-n", "12", "--format=%H%x1f%h%x1f%P%x1f%s%x1f%an%x1f%at%x1f%D%x1e"]));
+    Some(info)
+}
+
+fn parse_worktrees(out: &str, dir: &Path) -> Vec<Worktree> {
+    let mut list: Vec<Worktree> = out
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut w = Worktree::default();
+            for line in block.lines() {
+                let (k, v) = line.split_once(' ').unwrap_or((line, ""));
+                match k {
+                    "worktree" => w.path = PathBuf::from(v),
+                    "branch" => w.branch = Some(v.strip_prefix("refs/heads/").unwrap_or(v).to_string()),
+                    _ => {}
+                }
+            }
+            (!w.path.as_os_str().is_empty()).then_some(w)
+        })
+        .collect();
+    // The current one is the deepest worktree this folder is inside (one
+    // worktree can sit inside another's folder).
+    let here = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let current = list
+        .iter()
+        .enumerate()
+        .filter_map(|(i, w)| {
+            let p = std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone());
+            here.starts_with(&p).then_some((i, p.components().count()))
+        })
+        .max_by_key(|&(_, depth)| depth)
+        .map(|(i, _)| i);
+    if let Some(i) = current {
+        list[i].current = true;
+    }
+    list
+}
+
+fn parse_log(out: &str) -> Vec<Commit> {
+    out.split('\x1e')
+        .map(|r| r.trim_start_matches('\n'))
+        .filter(|r| !r.is_empty())
+        .filter_map(|r| {
+            let f: Vec<&str> = r.split('\x1f').collect();
+            Some(Commit {
+                hash: f.first()?.to_string(),
+                short: f.get(1)?.to_string(),
+                merge: f.get(2)?.split_whitespace().count() > 1,
+                subject: f.get(3)?.to_string(),
+                author: f.get(4)?.to_string(),
+                date: f.get(5)?.parse().unwrap_or(0),
+                refs: f
+                    .get(6)
+                    .map(|d| d.split(", ").filter(|x| !x.is_empty()).map(str::to_string).collect())
+                    .unwrap_or_default(),
+            })
+        })
+        .collect()
 }
 
 /// Porcelain v2 with `-z`: NUL-terminated records, so paths need no
@@ -643,6 +743,7 @@ fn parse_git(out: &str) -> GitInfo {
             match key {
                 "branch.oid" => oid = value.to_string(),
                 "branch.head" => info.branch = value.to_string(),
+                "branch.upstream" => info.upstream = Some(value.to_string()),
                 "branch.ab" => {
                     for part in value.split_whitespace() {
                         if let Some(n) = part.strip_prefix('+') {
@@ -656,6 +757,12 @@ fn parse_git(out: &str) -> GitInfo {
             }
             continue;
         }
+        let xy = rec.get(2..4).unwrap_or("..");
+        let (staged, unstaged) = match rec.as_bytes().first() {
+            Some(b'1' | b'2') => (xy.as_bytes()[0] != b'.', xy.as_bytes().get(1) != Some(&b'.')),
+            Some(b'u') => (false, true),
+            _ => (false, true),
+        };
         let file = match rec.as_bytes().first() {
             Some(b'1') => rec
                 .splitn(9, ' ')
@@ -680,6 +787,8 @@ fn parse_git(out: &str) -> GitInfo {
                 info.files.push(GitFile {
                     path: path.to_string(),
                     status,
+                    staged,
+                    unstaged,
                 });
             }
         }

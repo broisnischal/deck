@@ -117,6 +117,8 @@ pub enum ChatEvent {
     Focused,
     /// A link in a reply was clicked.
     OpenUrl(String),
+    /// "Open in editor" on a changed file: its path, with its changes shown.
+    OpenFile(PathBuf),
 }
 
 /// A message on its way out: typed text plus what was attached.
@@ -241,6 +243,14 @@ pub struct ChatPane {
     /// When each tool started and, once done, how long it took.
     tool_times: HashMap<String, (Instant, Option<Duration>)>,
     switching: bool,
+    /// The model picker is open.
+    picking_model: bool,
+    /// The model asked for, an id from the agent's own list; `None` runs
+    /// the CLI's default.
+    model: Option<smol_str::SmolStr>,
+    /// The session was started early, when the composer took focus, so
+    /// the first message does not wait for the agent to boot.
+    warmed: bool,
     mode: PermissionMode,
     cwd: PathBuf,
     /// `DECK_*` credentials so the agent can drive this window.
@@ -432,6 +442,9 @@ impl ChatPane {
             collapsed: HashSet::new(),
             tool_times: HashMap::new(),
             switching: false,
+            picking_model: false,
+            model: None,
+            warmed: false,
             // Edits flow; shell commands stay gated, except `deck …`, which is
             // pre-approved so the agent can always drive this window.
             mode: PermissionMode::Edit,
@@ -509,6 +522,7 @@ impl ChatPane {
             PermissionMode::Edit
         };
         c.native_id = saved.native_id;
+        c.model = saved.model.map(Into::into);
         c.checkpoints = saved.checkpoints.into_iter().collect();
         c.attachments = saved
             .attachments
@@ -548,6 +562,7 @@ impl ChatPane {
             agent: self.agent.as_str().to_string(),
             cwd: self.cwd.clone(),
             full_access: self.mode == PermissionMode::Yolo,
+            model: self.model.as_ref().map(|m| m.to_string()),
             title: self.title.to_string(),
             transcript: self.transcript.clone(),
             draft: f.text().to_string(),
@@ -956,7 +971,7 @@ impl ChatPane {
             &self.env.backend,
             self.session_id,
             &self.cwd,
-            None,
+            self.model.clone(),
             self.mode,
             resume,
         );
@@ -1703,8 +1718,10 @@ impl ChatPane {
             return;
         }
         self.agent = to;
-        // The old agent's session id means nothing to the new one.
+        // The old agent's session id and model mean nothing to the new one.
         self.native_id = None;
+        self.model = None;
+        self.picking_model = false;
         // A fresh backend that is handed our transcript, so the new agent
         // picks up the thread; the handoff row says how faithfully.
         if !self.transcript.messages.is_empty() {
@@ -1721,6 +1738,46 @@ impl ChatPane {
     /// turn so nothing needs a restart.
     pub fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
+    }
+
+    /// The agent's own list of models, if it has one.
+    fn models(&self) -> &'static [agent_core::ModelSpec] {
+        self.env.registry.get(&self.agent).map(|e| e.adapter.models()).unwrap_or(&[])
+    }
+
+    /// Run on `model` from here on. It is a launch flag, so a running
+    /// session restarts, resuming the agent's own conversation.
+    fn choose_model(&mut self, model: Option<smol_str::SmolStr>, cx: &mut Context<Self>) {
+        self.picking_model = false;
+        if model == self.model {
+            cx.notify();
+            return;
+        }
+        self.model = model;
+        if self.conn.is_some() && !self.busy() {
+            let carry = self.transcript.clone();
+            self.start_carrying(&carry, cx);
+        } else if let Some(old) = self.conn.take().filter(|_| !self.busy()) {
+            old.shutdown();
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Start the agent before the first message: Claude Code takes seconds
+    /// to boot (its hooks, its MCP servers), which otherwise all comes out
+    /// of the wait for the first reply. Done once, when you click in.
+    fn warm(&mut self, cx: &mut Context<Self>) {
+        if self.warmed || self.conn.is_some() {
+            return;
+        }
+        self.warmed = true;
+        let ready = self.env.registry.get(&self.agent).is_some_and(|e| e.is_ready());
+        if !ready {
+            return;
+        }
+        let prior = self.transcript.clone();
+        self.start_carrying(&prior, cx);
     }
 
     fn toggle_mode(&mut self, cx: &mut Context<Self>) {
@@ -2362,13 +2419,10 @@ impl ChatPane {
                             .size(u(7.))
                             .rounded_full()
                             .bg(rgb(theme::text_2()))
-                            .with_animation(
-                                ElementId::Name(format!("caret-{ix}-{bix}").into()),
-                                Animation::new(Duration::from_millis(900))
-                                    .repeat()
-                                    .with_easing(gpui::ease_in_out),
-                                |d, t| d.opacity(0.25 + 0.75 * (1. - (t * 2. - 1.).abs())),
-                            ),
+                            .opacity({
+                                let t = gpui::ease_in_out(crate::icon::phase(900));
+                                0.25 + 0.75 * (1. - (t * 2. - 1.).abs())
+                            }),
                     )
                     .into_any_element()
             }
@@ -2686,6 +2740,7 @@ impl ChatPane {
             .items_center()
             .gap(u(8.))
             .h(u(26.))
+            .overflow_hidden()
             .px(u(4.))
             .text_size(u(12.))
             .when(has_body, |d| {
@@ -2813,8 +2868,18 @@ impl ChatPane {
             ))
         } else {
             let (b, diff) = body();
-            b.filter(|b| !b.trim().is_empty())
-                .map(|b| render_output(&b, diff, 40))
+            // A file read is coloured by the file's language.
+            let grammar = match &t.result {
+                Some(ToolOutput::FileExcerpt { path, .. }) if !diff => {
+                    let input = t.input.get("file_path").and_then(|v| v.as_str());
+                    crate::syntax::for_path(if path.is_empty() { input.unwrap_or("") } else { path })
+                }
+                _ => None,
+            };
+            b.filter(|b| !b.trim().is_empty()).map(|b| match grammar {
+                Some(grammar) => render_excerpt(&key, grammar, &b, 40),
+                None => render_output(&b, diff, 40),
+            })
         };
         div()
             .flex()
@@ -2874,6 +2939,7 @@ impl ChatPane {
                 Some(cut) => (f.path[..=cut].to_string(), f.path[cut + 1..].to_string()),
                 None => (String::new(), f.path.clone()),
             };
+            let full = self.cwd.join(&f.path);
             card = card.child(
                 div()
                     .id(ElementId::Name(key.clone().into()))
@@ -2906,6 +2972,21 @@ impl ChatPane {
                             ),
                     )
                     .child(diff_stat(f.added, f.removed))
+                    .child(
+                        div()
+                            .id(ElementId::Name(format!("{key}-edit").into()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(u(20.))
+                            .rounded(u(5.))
+                            .hover(|s| s.bg(rgb(theme::surface_hover())))
+                            .child(icon(Icon::ArrowUpRight, 11., theme::dim()))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(ChatEvent::OpenFile(full.clone()));
+                            })),
+                    )
                     .child(icon(
                         if open {
                             Icon::ChevronDown
@@ -3143,9 +3224,33 @@ impl ChatPane {
                     .child(icon(Icon::ChevronDown, 11., theme::dim()))
                     .on_click(cx.listener(|c, _, _, cx| {
                         c.switching = !c.switching;
+                        c.picking_model = false;
                         cx.notify();
                     })),
             )
+            .when(!self.models().is_empty(), |d| {
+                let label: SharedString = match &self.model {
+                    Some(id) => self
+                        .models()
+                        .iter()
+                        .find(|m| m.id == id.as_str())
+                        .map_or_else(|| id.to_string(), |m| m.label.to_string())
+                        .into(),
+                    None => "Default model".into(),
+                };
+                d.child(
+                    chip("model")
+                        .text_color(rgb(theme::text_2()))
+                        .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                        .child(label)
+                        .child(icon(Icon::ChevronDown, 11., theme::dim()))
+                        .on_click(cx.listener(|c, _, _, cx| {
+                            c.picking_model = !c.picking_model;
+                            c.switching = false;
+                            cx.notify();
+                        })),
+                )
+            })
             .child({
                 // Every mode a quiet chip with its own mark; Full access is
                 // told apart by an outline and full-strength text, not by a
@@ -3156,18 +3261,12 @@ impl ChatPane {
                     _ => ("Ask first", Icon::Shield, false),
                 };
                 chip("mode")
-                    .border_1()
-                    .border_color(rgba(if loud {
-                        theme::strong_edge()
-                    } else {
-                        0x00000000
-                    }))
                     .text_color(rgb(if loud { theme::text() } else { theme::text_2() }))
                     .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
                     .child(icon(
                         glyph,
                         13.,
-                        if loud { theme::text() } else { theme::text_2() },
+                        if loud { theme::accent() } else { theme::text_2() },
                     ))
                     .child(label)
                     .on_click(cx.listener(|c, _, _, cx| c.toggle_mode(cx)))
@@ -3241,6 +3340,9 @@ impl ChatPane {
         let mut stack = div().w_full().flex().flex_col().gap(u(8.));
         if self.switching {
             stack = stack.child(self.render_switcher(cx));
+        }
+        if self.picking_model {
+            stack = stack.child(self.render_model_picker(cx));
         }
         // Queued messages, oldest first: those already with the agent (it
         // reads them when its current step ends), then those deck holds.
@@ -3336,6 +3438,12 @@ impl ChatPane {
         }
         let focus = self.composer.read(cx).focus.clone();
         let focused = focus.contains_focused(window, cx);
+        if focused && !self.warmed && self.conn.is_none() {
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |c, cx| c.warm(cx));
+            })
+            .detach();
+        }
         let refine_mode = crate::refine::mode();
         let retry_line = self.retry.as_ref().map(|(n, at, why)| {
             let left = at.saturating_duration_since(Instant::now()).as_secs();
@@ -3352,7 +3460,7 @@ impl ChatPane {
         let hint: SharedString = if let Some(r) = retry_line {
             r.into()
         } else if self.refining.is_some() {
-            format!("Rewriting with {}…", crate::refine::model()).into()
+            format!("Rewriting with {}…", crate::refine::rewriter()).into()
         } else if let Some(note) = &self.refine_note {
             note.clone()
         } else if self.mine.is_some() {
@@ -3366,10 +3474,10 @@ impl ChatPane {
         } else if self.mention.as_ref().is_some_and(|m| !m.matches.is_empty()) {
             "↑↓ choose · ⏎ or ⇥ insert · esc close".into()
         } else if refine_mode == crate::refine::Mode::Off {
-            "⏎ send · ⇧⏎ new line · ↑ last message · @ file · ⌘V image".into()
+            "⏎ send · ⇧⏎ new line · @ file".into()
         } else {
             format!(
-                "⏎ {} · ⌃O rewrite · ⇧⏎ new line · @ file · ⌘V image",
+                "⏎ {} · ⌃O rewrite only · ⇧⏎ new line",
                 if refine_mode == crate::refine::Mode::Auto {
                     "rewrite and send"
                 } else {
@@ -3437,8 +3545,46 @@ impl ChatPane {
             .into_any_element()
     }
 
+    /// The agent's models as a row of choices, the default first.
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div().w_full().flex().flex_wrap().gap(u(6.));
+        let choices = std::iter::once((None, "Default".to_string(), "what the CLI picks"))
+            .chain(self.models().iter().map(|m| (Some(smol_str::SmolStr::new(m.id)), m.label.to_string(), m.note)));
+        for (i, (id, label, note)) in choices.enumerate() {
+            let current = id == self.model;
+            let pick = id.clone();
+            row = row.child(
+                div()
+                    .id(ElementId::NamedInteger("model-pick".into(), i as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(6.))
+                    .h(u(30.))
+                    .px(u(10.))
+                    .rounded(u(9.))
+                    .text_size(u(12.))
+                    .border_1()
+                    .cursor_pointer()
+                    .when(current, |d| {
+                        d.bg(rgb(theme::surface()))
+                            .border_color(rgba(theme::strong_edge()))
+                            .text_color(rgb(theme::text()))
+                    })
+                    .when(!current, |d| {
+                        d.border_color(rgba(theme::hairline()))
+                            .text_color(rgb(theme::text_2()))
+                            .hover(|s| s.bg(rgb(theme::surface())))
+                    })
+                    .child(label)
+                    .child(div().text_color(rgb(theme::dim())).child(note))
+                    .on_click(cx.listener(move |c, _, _, cx| c.choose_model(pick.clone(), cx))),
+            );
+        }
+        row.into_any_element()
+    }
+
     fn render_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = div().flex().flex_wrap().gap(u(6.));
+        let mut row = div().w_full().flex().flex_wrap().gap(u(6.));
         for entry in self.env.registry.all() {
             let id = entry.id();
             let ready = entry.is_ready();
@@ -3487,37 +3633,41 @@ impl ChatPane {
     /// A new thread: the composer is the centre of the screen, with a few
     /// things worth asking underneath.
     fn render_empty(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let mut starters = div().flex().flex_col().gap(u(6.));
-        for (i, (title, prompt)) in [
+        // Quiet rows, not boxes: a mark, what it does, and the ask in full
+        // as the row's second half.
+        let mut starters = div().flex().flex_col().gap(u(2.));
+        for (i, (glyph, title, prompt)) in [
             (
+                Icon::Bolt,
                 "Run it",
                 "Start the dev server in a terminal here and open it in the browser",
             ),
-            ("Explain it", "Explain how this project is put together"),
-            ("Test it", "Run the tests and fix what fails"),
+            (Icon::Info, "Explain it", "Explain how this project is put together"),
+            (Icon::Check, "Test it", "Run the tests and fix what fails"),
         ]
         .into_iter()
         .enumerate()
         {
+            let group = SharedString::from(format!("starter-{i}"));
             starters = starters.child(
                 div()
                     .id(ElementId::NamedInteger("starter".into(), i as u64))
+                    .group(group.clone())
                     .flex()
                     .items_center()
                     .gap(u(10.))
-                    .px(u(12.))
-                    .h(u(38.))
-                    .rounded(u(10.))
-                    .border_1()
-                    .border_color(rgba(theme::hairline()))
+                    .px(u(10.))
+                    .h(u(34.))
+                    .rounded(u(8.))
                     .text_size(u(13.))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(theme::raised())))
+                    .child(icon(glyph, 14., theme::dim()))
                     .child(
                         div()
-                            .w(u(72.))
                             .flex_none()
-                            .text_color(rgb(theme::text()))
+                            .text_color(rgb(theme::text_2()))
+                            .group_hover(group.clone(), |s| s.text_color(rgb(theme::text())))
                             .child(title),
                     )
                     .child(
@@ -3532,6 +3682,9 @@ impl ChatPane {
                     .on_click(cx.listener(move |c, _, _, cx| c.send(prompt.to_string(), cx))),
             );
         }
+        // Where it works, as a short path: the folder's name, its parents
+        // trimmed to fit.
+        let place = tidy_place(&self.cwd);
         div()
             .flex_1()
             .flex()
@@ -3541,28 +3694,32 @@ impl ChatPane {
                 div()
                     .flex()
                     .flex_col()
-                    .gap(u(24.))
+                    .gap(u(20.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(u(6.))
+                            .gap(u(8.))
                             .child(
                                 div()
-                                    .text_size(u(22.))
+                                    .text_size(u(20.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(theme::text()))
                                     .child("What should we work on?"),
                             )
                             .child(
                                 div()
-                                    .text_size(u(13.))
+                                    .flex()
+                                    .items_center()
+                                    .gap(u(6.))
+                                    .min_w_0()
+                                    .text_size(u(12.5))
                                     .text_color(rgb(theme::text_2()))
-                                    .child(format!(
-                                "{} works in {} and can open terminals and pages in this window.",
-                                self.agent_name(),
-                                short_path(&self.cwd)
-                            )),
+                                    .child(icon(Icon::agent(self.agent.as_str()), 13., theme::text_2()))
+                                    .child(self.agent_name())
+                                    .child(div().text_color(rgb(theme::dim())).child("in"))
+                                    .child(icon(Icon::Folder, 13., theme::dim()))
+                                    .child(div().min_w_0().truncate().child(place)),
                             ),
                     )
                     .child(self.render_composer(window, cx))
@@ -4138,7 +4295,14 @@ impl ChatPane {
                     .line_height(u(18.))
                     .text_color(rgb(theme::text()))
                     .child(div().whitespace_nowrap().child({
-                        let runs = plain_runs(code.len(), theme::MONO, theme::text());
+                        // Coloured by the fence's language, when it names one.
+                        let runs = match crate::syntax::for_lang(lang) {
+                            Some(grammar) => crate::syntax::runs(
+                                &crate::syntax::spans(id, grammar, code),
+                                theme::MONO,
+                            ),
+                            None => plain_runs(code.len(), theme::MONO, theme::text()),
+                        };
                         let (t, rec) = self.unit_text(code.to_string().into(), runs, "\n\n", "");
                         selectable(t.into_any_element(), rec)
                     })),
@@ -4454,8 +4618,29 @@ fn tool_icon(name: &str) -> Icon {
 }
 
 /// What a step did, as a verb and its object: "Ran" `cargo test`, "Edited"
-/// `src/chat.rs`. Present tense while it runs.
+/// `src/chat.rs`. Present tense while it runs. The object is one line: a
+/// script fed to a command keeps its first line and an ellipsis, since the
+/// row is one line tall.
 fn step_phrase(t: &ToolInvocation, running: bool, cwd: &std::path::Path) -> (&'static str, String) {
+    let (verb, object) = step_phrase_full(t, running, cwd);
+    (verb, one_line(&object))
+}
+
+/// The first line of `s` with anything in it, and "…" when more follows.
+pub fn one_line_pub(s: &str) -> String {
+    one_line(s)
+}
+
+fn one_line(s: &str) -> String {
+    let mut lines = s.lines().map(str::trim).filter(|l| !l.is_empty());
+    match (lines.next(), lines.next()) {
+        (Some(first), None) => first.to_string(),
+        (Some(first), Some(_)) => format!("{first} …"),
+        (None, _) => String::new(),
+    }
+}
+
+fn step_phrase_full(t: &ToolInvocation, running: bool, cwd: &std::path::Path) -> (&'static str, String) {
     let n = t.name.to_lowercase();
     let input = |k: &str| t.input.get(k).and_then(|v| v.as_str()).map(str::to_string);
     let path = || {
@@ -4799,6 +4984,19 @@ pub fn human_duration(d: Duration) -> String {
     }
 }
 
+/// A folder as a short label: `~/deck`, or for a deep one its last two
+/// parts after an ellipsis (`…/f3691f90/scratchpad`).
+fn tidy_place(p: &std::path::Path) -> String {
+    let s = short_path(p);
+    let parts: Vec<&str> = s.split('/').filter(|x| !x.is_empty()).collect();
+    if s.chars().count() <= 32 || parts.len() <= 3 {
+        return s;
+    }
+    let tail = parts[parts.len() - 2..].join("/");
+    let tail = if tail.chars().count() > 40 { parts[parts.len() - 1].to_string() } else { tail };
+    format!("…/{tail}")
+}
+
 fn short_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     match std::env::var("HOME") {
@@ -4843,6 +5041,71 @@ fn render_output(text: &str, diff: bool, keep: usize) -> AnyElement {
         });
     }
     col.overflow_x_hidden().into_any_element()
+}
+
+/// A file read: its last `keep` lines in mono, coloured by the file's
+/// language. The line numbers the Read tool puts in front stay dim and out of
+/// the parse, so the code is read as the file has it.
+fn render_excerpt(key: &str, grammar: &'static crate::syntax::Grammar, text: &str, keep: usize) -> AnyElement {
+    let lines: Vec<&str> = text.lines().collect();
+    let numbers: Vec<usize> = lines.iter().map(|l| line_number_len(l)).collect();
+    let mut code = String::with_capacity(text.len());
+    for (line, n) in lines.iter().zip(&numbers) {
+        code.push_str(&line[*n..]);
+        code.push('\n');
+    }
+    let spans = crate::syntax::spans(&format!("excerpt-{key}"), grammar, &code);
+    let by_line = crate::syntax::by_line(&code, &spans);
+    let skip = lines.len().saturating_sub(keep);
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .my(u(4.))
+        .px(u(10.))
+        .py(u(8.))
+        .rounded(u(8.))
+        .bg(rgb(theme::raised()))
+        .font_family(theme::MONO)
+        .text_size(u(11.5))
+        .line_height(u(17.));
+    if skip > 0 {
+        col = col.child(
+            div()
+                .text_color(rgb(theme::dim()))
+                .child(format!("… {skip} earlier lines")),
+        );
+    }
+    for (i, line) in lines.iter().enumerate().skip(skip) {
+        let kinds: Vec<_> = by_line
+            .get(i)
+            .into_iter()
+            .flatten()
+            .map(|(range, kind)| (range.len(), *kind))
+            .collect();
+        let mut runs = plain_runs(numbers[i], theme::MONO, theme::dim());
+        runs.extend(crate::syntax::runs(&kinds, theme::MONO));
+        col = col.child(
+            div()
+                .whitespace_nowrap()
+                .child(StyledText::new(line.to_string()).with_runs(runs)),
+        );
+    }
+    col.overflow_x_hidden().into_any_element()
+}
+
+/// Bytes of the line number the Read tool puts before a line (`   12→` or
+/// `   12` and a tab), or 0 when it has none.
+fn line_number_len(line: &str) -> usize {
+    let pad = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[pad..];
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return 0;
+    }
+    match rest[digits..].chars().next() {
+        Some(c @ ('→' | '\t')) => pad + digits + c.len_utf8(),
+        _ => 0,
+    }
 }
 
 impl Render for ChatPane {
@@ -5245,6 +5508,9 @@ mod tests {
             ("Running", "cargo test -p app".to_string())
         );
         assert_eq!(step_phrase(&bash, false, cwd).0, "Ran");
+        assert_eq!(one_line("\n  cd /w && python3 - <<'EOF'\nprint(1)\nEOF\n"), "cd /w && python3 - <<'EOF' …");
+        assert_eq!(one_line("cargo test"), "cargo test");
+        assert_eq!(one_line("  \n "), "");
         let mut edit = tool("Edit");
         edit.input =
             serde_json::json!({"file_path": "/w/p/src/a.rs", "old_string": "a", "new_string": "b"});
@@ -5310,5 +5576,16 @@ mod tests {
         assert_eq!(human_duration(Duration::from_millis(400)), "under a second");
         assert_eq!(human_duration(Duration::from_secs(14)), "14s");
         assert_eq!(human_duration(Duration::from_secs(133)), "2m 13s");
+    }
+
+    #[test]
+    fn read_line_numbers_are_measured_in_both_forms() {
+        assert_eq!(line_number_len("     1→fn main() {"), "     1→".len());
+        assert_eq!(line_number_len("    12\tlet x = 1;"), 7);
+        assert_eq!(line_number_len("1234→"), "1234→".len());
+        // Code that happens to start with digits, or no numbers at all.
+        assert_eq!(line_number_len("42 is the answer"), 0);
+        assert_eq!(line_number_len("    let x = 1;"), 0);
+        assert_eq!(line_number_len(""), 0);
     }
 }

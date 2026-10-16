@@ -36,6 +36,13 @@ actions!(
         NewTerminal,
         NewBrowser,
         NewChat,
+        QuickOpen,
+        FocusLeft,
+        FocusRight,
+        FocusUp,
+        FocusDown,
+        OpenFiles,
+        OpenChanges,
         OpenSettings,
         ToggleAgents,
         SplitRight,
@@ -134,6 +141,8 @@ pub static SHORTCUTS: &[Shortcut] = &[
         NewBrowser
     ),
     shortcut!("agents", "Agents", "Tabs", ["cmd-shift-a"], ToggleAgents),
+    shortcut!("files", "Files", "Code", ["cmd-shift-e"], OpenFiles),
+    shortcut!("changes", "Git changes", "Code", ["cmd-shift-g"], OpenChanges),
     shortcut!("close", "Close pane", "Tabs", ["cmd-w"], ClosePane),
     shortcut!(
         "next-tab",
@@ -159,6 +168,11 @@ pub static SHORTCUTS: &[Shortcut] = &[
     ),
     shortcut!("next-pane", "Next pane", "Panes", ["cmd-]"], NextPane),
     shortcut!("prev-pane", "Previous pane", "Panes", ["cmd-["], PrevPane),
+    shortcut!("quick-open", "Go to anything (in the editor: a file)", "Window", ["cmd-p"], QuickOpen),
+    shortcut!("focus-left", "Pane to the left", "Panes", ["alt-cmd-left"], FocusLeft),
+    shortcut!("focus-right", "Pane to the right", "Panes", ["alt-cmd-right"], FocusRight),
+    shortcut!("focus-up", "Pane above", "Panes", ["alt-cmd-up"], FocusUp),
+    shortcut!("focus-down", "Pane below", "Panes", ["alt-cmd-down"], FocusDown),
     shortcut!(
         "palette",
         "Command palette",
@@ -322,6 +336,9 @@ pub fn rebind(cx: &mut App, mine: &std::collections::BTreeMap<String, String>) {
                 MenuItem::action("New Chat", NewChat),
                 MenuItem::action("New Browser Tab", NewBrowser),
                 MenuItem::action("New Agent…", ToggleAgents),
+                MenuItem::separator(),
+                MenuItem::action("Files", OpenFiles),
+                MenuItem::action("Git Changes", OpenChanges),
                 MenuItem::separator(),
                 MenuItem::action("Close", ClosePane),
             ],
@@ -511,6 +528,42 @@ impl Node {
         }
     }
 
+    /// The pane beside `target` along `axis` (forward: right or down).
+    /// `None` when `target` is not in this tree, `Some(None)` when it is but
+    /// nothing lies that way: up the tree to the nearest split along the
+    /// axis where its branch has a neighbour, then that neighbour's edge
+    /// facing it.
+    fn neighbor(&self, target: PaneId, axis: Axis, forward: bool) -> Option<Option<PaneId>> {
+        match self {
+            Node::Leaf(id) => (*id == target).then_some(None),
+            Node::Split(a, children, _) => {
+                for (i, child) in children.iter().enumerate() {
+                    let Some(found) = child.neighbor(target, axis, forward) else {
+                        continue;
+                    };
+                    if found.is_some() || *a != axis {
+                        return Some(found);
+                    }
+                    let j = if forward { Some(i + 1).filter(|j| *j < children.len()) } else { i.checked_sub(1) };
+                    return Some(j.map(|j| children[j].edge(axis, !forward)));
+                }
+                None
+            }
+        }
+    }
+
+    /// The leaf at one end of this node along `axis` (`last`: the right or
+    /// bottom end); across the other axis, the first.
+    fn edge(&self, axis: Axis, last: bool) -> PaneId {
+        match self {
+            Node::Leaf(id) => *id,
+            Node::Split(a, children, _) => {
+                let child = if *a == axis && last { children.last() } else { children.first() };
+                child.expect("a split has children").edge(axis, last)
+            }
+        }
+    }
+
     /// The pane a subtree starts with; with its axis, it names a split's
     /// child for as long as the drag on its divider lasts.
     fn first(&self) -> PaneId {
@@ -629,6 +682,8 @@ pub enum Open {
     Launcher,
     /// The review of the task with this id.
     Review(String),
+    /// The code editor on a project (a browser pane showing `code.rs`'s app).
+    Editor(crate::code::Editor),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -646,6 +701,37 @@ enum Group {
     Workspace,
 }
 
+/// One project in the sidebar: its tabs, by tab index.
+/// A Claude Code conversation: its folder, and its id when known.
+type Conversation = (PathBuf, Option<String>);
+
+/// What the usage meter and panel show, gathered off the main thread.
+#[derive(Default)]
+struct UsageView {
+    claude: Option<Result<crate::usage::Limits, String>>,
+    codex: Option<crate::usage::Limits>,
+    /// The focused Claude Code conversation: its title and its numbers.
+    session: Option<(SharedString, crate::usage::SessionUse)>,
+    today: Option<crate::usage::DayUse>,
+    busy: bool,
+    at: Option<Instant>,
+}
+
+struct ProjectGroup {
+    /// Its folder's name; empty for the tabs in no project ("Web").
+    name: String,
+    root: Option<PathBuf>,
+    /// Chats and agents, with when each last did something.
+    threads: Vec<(usize, Instant)>,
+    others: Vec<usize>,
+}
+
+impl ProjectGroup {
+    fn tabs(&self) -> impl Iterator<Item = usize> + '_ {
+        self.threads.iter().map(|t| t.0).chain(self.others.iter().copied())
+    }
+}
+
 pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
@@ -653,7 +739,8 @@ pub struct Workspace {
     next_id: PaneId,
     cwd: PathBuf,
     installed: Vec<&'static Agent>,
-    picker: bool,
+    /// Project groups folded shut in the sidebar, by name.
+    folded: std::collections::HashSet<String>,
     sidebar: bool,
     pub inspector: Inspector,
     refreshing: bool,
@@ -681,6 +768,12 @@ pub struct Workspace {
     busy: std::collections::HashSet<PaneId>,
     /// A divider being dragged.
     resizing: Option<Resize>,
+    /// The side panels' widths (unzoomed px), dragged at their inner edges.
+    sidebar_px: f32,
+    inspector_px: f32,
+    /// A side panel's edge is being dragged: which one, where the drag
+    /// started and the width then.
+    side_drag: Option<(bool, f32, f32)>,
     /// Claude Code terminals deck has unstuck from an API wait: how many
     /// times in a row, and when last.
     stalls: HashMap<PaneId, (u32, Instant)>,
@@ -724,7 +817,26 @@ pub struct Workspace {
     /// Pages are hidden for the lock or sign-in screen.
     screen_cover: bool,
     _requests: Option<Task<()>>,
+    /// A `refresh_places` scan is out on a background thread.
+    placing: bool,
+    /// Each terminal's scrollback key (see `session::scrollback_file`), and
+    /// the one the next terminal made takes over (a restored pane's).
+    scroll_keys: HashMap<PaneId, String>,
+    /// Terminals `deck run --name` made, by name.
+    named: HashMap<String, PaneId>,
+    /// Dev servers under our terminals, for the status bar: (port, process).
+    bar_ports: Vec<(u16, String)>,
+    /// The focused pane's project and its git branch, for the status bar.
+    bar_git: Option<(String, Option<String>)>,
+    /// Claude Code conversations' first asks by session id, read once: a
+    /// title of their own when Claude Code titles several terminals alike.
+    conv_titles: HashMap<String, Option<crate::session::ConvTitles>>,
+    /// AI usage for the status bar's meter and the panel it opens.
+    usage: UsageView,
+    usage_open: bool,
+    pending_scroll: Option<String>,
     _tick: Task<()>,
+    _animate: Task<()>,
 }
 
 impl Workspace {
@@ -734,6 +846,33 @@ impl Workspace {
             if this
                 .update_in(cx, |ws, window, cx| ws.tick(window, cx))
                 .is_err()
+            {
+                return;
+            }
+        });
+        // At quit, each shell's scrollback is kept for the next launch.
+        cx.on_app_quit(|ws, cx| {
+            ws.save_scrollback(cx);
+            // A downloaded update goes in now, for the next launch.
+            if ws.settings.install_updates {
+                if let crate::updates::State::Ready(_, path) = crate::updates::state() {
+                    if let Err(e) = crate::updates::install_on_quit(&path, false) {
+                        tracing::warn!("could not install the update: {e}");
+                    }
+                }
+            }
+            async {}
+        })
+        .detach();
+        // Spinners and the like step on their own clock (icon::phase): after
+        // a frame that drew one, draw the next a fifteenth of a second later.
+        // Nothing animating, nothing drawn.
+        let animate = cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs_f32(1. / crate::icon::ANIM_FPS))
+                .await;
+            if crate::icon::take_animating()
+                && this.update_in(cx, |_, window, _| window.refresh()).is_err()
             {
                 return;
             }
@@ -748,7 +887,7 @@ impl Workspace {
                 .iter()
                 .filter(|a| term::which(a.cmd).is_some())
                 .collect(),
-            picker: false,
+            folded: std::collections::HashSet::new(),
             sidebar: true,
             inspector: Inspector {
                 // A narrow (tiled) window cannot afford a third column.
@@ -772,6 +911,9 @@ impl Workspace {
             places: HashMap::new(),
             busy: Default::default(),
             resizing: None,
+            sidebar_px: theme::SIDEBAR_PX,
+            inspector_px: theme::INSPECTOR_PX,
+            side_drag: None,
             working_since: HashMap::new(),
             stalls: HashMap::new(),
             cells: Default::default(),
@@ -797,7 +939,17 @@ impl Workspace {
             account_note: None,
             screen_cover: false,
             _requests: None,
+            placing: false,
+            scroll_keys: HashMap::new(),
+            named: HashMap::new(),
+            bar_ports: Vec::new(),
+            bar_git: None,
+            conv_titles: HashMap::new(),
+            usage: UsageView::default(),
+            usage_open: false,
+            pending_scroll: None,
             _tick: tick,
+            _animate: animate,
         };
         // Scripts and links macOS opened deck with, now and later.
         if let Some(mut opened) = crate::handler::receiver() {
@@ -849,6 +1001,11 @@ impl Workspace {
             if ws.settings.theme == crate::theme::Theme::System {
                 wear(ws.settings.theme, window);
                 ws.restyle(window, cx);
+                for pane in ws.panes.values() {
+                    if let PaneKind::Browser(b) = &pane.kind {
+                        b.read(cx).editor_restyle();
+                    }
+                }
             }
         })
         .detach();
@@ -896,13 +1053,27 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<PaneId> {
         let id = self.next_id;
+        // Where a terminal starts, so its row is in its project from the
+        // first frame rather than moving there after the first scan.
+        let mut seed: Option<PathBuf> = None;
         // The fallible half (PTY, webview) happens before `cx.new`, which
         // cannot return an error.
         let (kind, token, sub) = match what {
             Open::Terminal { cmd, cwd } => {
                 let token = new_token();
-                let env = self.pane_env(id, &token);
+                let mut env = self.pane_env(id, &token);
+                // zsh marks its prompts and commands, for blocks.
+                env.extend(crate::shell::env());
+                // A restored shell prints what this pane showed before the
+                // quit, then starts fresh beneath it.
+                let key = self.pending_scroll.take().unwrap_or_else(|| new_token()[..16].to_string());
+                let saved = crate::session::scrollback_file(&key);
+                if cmd.is_none() && saved.exists() && env.contains_key("ZDOTDIR") {
+                    env.insert("DECK_RESTORE".into(), saved.display().to_string());
+                }
+                self.scroll_keys.insert(id, key);
                 let cwd = cwd.unwrap_or_else(|| self.cwd.clone());
+                seed = Some(cwd.clone());
                 let pty = TerminalPane::spawn(&cwd, cmd.as_deref(), env)?;
                 let title = agent
                     .map(|a| a.name.to_string())
@@ -914,6 +1085,7 @@ impl Workspace {
                     })
                     .unwrap_or_else(|| "shell".into());
                 let look = self.settings.term_look();
+                crate::code::set_font(&look.family, self.settings.font_px);
                 let t = cx.new(|cx| TerminalPane::new(pty, title, look, window, cx));
                 let sub =
                     cx.subscribe_in(&t, window, move |ws, _, ev: &TerminalEvent, window, cx| {
@@ -930,6 +1102,18 @@ impl Workspace {
                             TerminalEvent::OpenUrl(url) => {
                                 let url = url.clone();
                                 ws.open_url_near(id, &url, window, cx);
+                            }
+                            TerminalEvent::CommandDone { command, exit, took } => {
+                                ws.command_done(id, command.clone(), *exit, *took, window, cx);
+                            }
+                            TerminalEvent::History => ws.open_history(id, window, cx),
+                            TerminalEvent::Ask { request, cwd } => {
+                                let (request, cwd) = (request.clone(), cwd.clone());
+                                ws.write_command(id, request, cwd, cx);
+                            }
+                            TerminalEvent::AskAgent { prompt, cwd } => {
+                                let (prompt, cwd) = (prompt.clone(), cwd.clone());
+                                ws.ask_agent_beside(id, prompt, cwd, window, cx);
                             }
                         }
                     });
@@ -971,13 +1155,31 @@ impl Workspace {
                                 let url = url.clone();
                                 ws.open_url_near(id, &url, window, cx);
                             }
+                            ChatEvent::OpenFile(path) => {
+                                let root = crate::inspect::project_root(
+                                    path.parent().unwrap_or(std::path::Path::new("/")),
+                                );
+                                let rel = path
+                                    .strip_prefix(&root)
+                                    .map(|p| p.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                                let file = Some((rel, None, true));
+                                if let Err(e) = ws.open_editor("changes", Some(root), file, window, cx) {
+                                    tracing::warn!("could not open the editor: {e}");
+                                }
+                            }
                         },
                     );
                 (PaneKind::Chat(c), Some(token), sub)
             }
-            Open::Browser { url } => {
-                let (webview, events, url) = BrowserPane::build(&url, window)?;
-                let b = cx.new(|cx| BrowserPane::new(webview, events, url, window, cx));
+            Open::Browser { .. } | Open::Editor(_) => {
+                let (url, editor) = match what {
+                    Open::Editor(e) => (String::new(), Some(e)),
+                    Open::Browser { url } => (url, None),
+                    _ => unreachable!(),
+                };
+                let (webview, events, url, code) = BrowserPane::build(&url, editor, window)?;
+                let b = cx.new(|cx| BrowserPane::new(webview, events, url, code, window, cx));
                 let zoom = self.settings.zoom as f64;
                 b.update(cx, |b, _| b.set_zoom(zoom));
                 let sub =
@@ -995,6 +1197,17 @@ impl Workspace {
                             }
                             BrowserEvent::Retitled => cx.notify(),
                             BrowserEvent::Close => ws.close_pane(id, window, cx),
+                            BrowserEvent::OpenFolder { path, terminal } => {
+                                let path = path.clone();
+                                let opened = if *terminal {
+                                    ws.new_tab(Open::Terminal { cmd: None, cwd: Some(path) }, None, window, cx)
+                                } else {
+                                    ws.open_editor("files", Some(path), None, window, cx)
+                                };
+                                if let Err(e) = opened {
+                                    tracing::warn!("could not open the folder: {e}");
+                                }
+                            }
                         }
                     });
                 (PaneKind::Browser(b), None, sub)
@@ -1004,6 +1217,12 @@ impl Workspace {
             Open::Review(task) => self.make_review(id, &task, window, cx)?,
         };
         self.next_id += 1;
+        if let PaneKind::Chat(c) = &kind {
+            seed = Some(c.read(cx).cwd().to_path_buf());
+        }
+        if let Some(dir) = seed {
+            self.places.entry(id).or_insert_with(|| place_of(&dir));
+        }
         self.panes.insert(
             id,
             Pane {
@@ -1156,6 +1375,8 @@ impl Workspace {
         self.tabs.extend(opened);
         self.sidebar = last.sidebar;
         self.inspector.open = last.inspector;
+        self.sidebar_px = last.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+        self.inspector_px = last.inspector_width.clamp(INSPECTOR_MIN, INSPECTOR_MAX);
         let mut rest: Vec<_> = threads.into_values().collect();
         rest.sort_by_key(|s| s.updated);
         self.open_control(rest, window, cx);
@@ -1218,7 +1439,8 @@ impl Workspace {
             }
             NodeState::Pane(p) => {
                 let (what, agent) = match p {
-                    PaneState::Terminal { cwd, agent } => {
+                    PaneState::Terminal { cwd, agent, scrollback } => {
+                        self.pending_scroll = scrollback.clone();
                         let cwd = cwd.clone().filter(|c| c.is_dir());
                         let tab = agent
                             .as_ref()
@@ -1310,16 +1532,18 @@ impl Workspace {
                     if let (true, Some(saved)) = (place.is_none() || waiting, saved) {
                         return Some(saved.clone());
                     }
+                    let agent = place
+                        .and_then(|p| p.agent.as_ref())
+                        .map(|(cmd, argv)| AgentRun {
+                            cmd: cmd.to_string(),
+                            flags: crate::session::keep_flags(cmd, argv),
+                            session: conversation.get(&id).cloned(),
+                            tab: pane.agent.is_some(),
+                        });
                     PaneState::Terminal {
                         cwd: place.map(|p| p.cwd.clone()),
-                        agent: place
-                            .and_then(|p| p.agent.as_ref())
-                            .map(|(cmd, argv)| AgentRun {
-                                cmd: cmd.to_string(),
-                                flags: crate::session::keep_flags(cmd, argv),
-                                session: conversation.get(&id).cloned(),
-                                tab: pane.agent.is_some(),
-                            }),
+                        scrollback: agent.is_none().then(|| self.scroll_keys.get(&id).cloned()).flatten(),
+                        agent,
                     }
                 }
                 PaneKind::Browser(b) => PaneState::Browser {
@@ -1387,10 +1611,40 @@ impl Workspace {
             active,
             sidebar: self.sidebar,
             inspector: self.inspector.open,
+            sidebar_width: self.sidebar_px,
+            inspector_width: self.inspector_px,
         }
     }
 
     /// Write the layout when it has changed (checked once a second).
+    /// Write every plain shell's scrollback (an agent's TUI redraws itself),
+    /// and drop files no pane will take back.
+    fn save_scrollback(&mut self, cx: &App) {
+        let dir = crate::session::scrollback_file("x").parent().map(PathBuf::from);
+        let Some(dir) = dir else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let mut keep = std::collections::HashSet::new();
+        let stamp = "\x1b[2m── restored ──\x1b[0m\r\n";
+        for (id, pane) in &self.panes {
+            let PaneKind::Terminal(t) = &pane.kind else { continue };
+            let agent = self.places.get(id).and_then(|p| p.agent.as_ref()).is_some() || pane.agent.is_some();
+            let Some(key) = self.scroll_keys.get(id).filter(|_| !agent) else { continue };
+            let Some(text) = t.read(cx).history_ansi().filter(|t| !t.trim().is_empty()) else { continue };
+            let path = crate::session::scrollback_file(key);
+            if std::fs::write(&path, format!("{text}{stamp}")).is_ok() {
+                keep.insert(path);
+            }
+        }
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if !keep.contains(&e.path()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        // The session must name these keys even if nothing else changed.
+        self.saved_session = None;
+        self.save_session(cx);
+    }
+
     fn save_session(&mut self, cx: &App) {
         if !self.restored {
             return;
@@ -1511,7 +1765,6 @@ impl Workspace {
             focused: id,
             pinned: false,
         });
-        self.picker = false;
         self.focus_pane(id, window, cx);
         Ok(id)
     }
@@ -1531,6 +1784,84 @@ impl Workspace {
         self.tabs[ix].root.split(beside, id, axis);
         self.focus_pane(id, window, cx);
         Ok(id)
+    }
+
+    /// Open the code editor on the project the focused pane is in (or
+    /// `root`), reusing one already open on it: on its file tree or its git
+    /// changes, and with `file` open when given.
+    pub fn open_editor(
+        &mut self,
+        view: &'static str,
+        root: Option<PathBuf>,
+        file: Option<(String, Option<u32>, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<PaneId> {
+        let root = root
+            .or_else(|| self.focused().and_then(|id| self.cwd_of(id, cx)))
+            .or_else(|| self.focused_cwd(cx))
+            .unwrap_or_else(|| self.cwd.clone());
+        let root = crate::inspect::project_root(&root);
+        let open = self.panes.iter().find_map(|(&id, p)| match &p.kind {
+            PaneKind::Browser(b) if b.read(cx).editor().is_some_and(|e| e.root == root) => {
+                Some((id, b.clone()))
+            }
+            _ => None,
+        });
+        if let Some((id, b)) = open {
+            self.focus_pane(id, window, cx);
+            b.update(cx, |b, _| {
+                b.editor_show(view);
+                if let Some((path, line, diff)) = &file {
+                    b.editor_open(path, *line, *diff);
+                }
+            });
+            cx.notify();
+            return Ok(id);
+        }
+        let editor = crate::code::Editor {
+            root,
+            open: file.map(|(path, _, _)| path),
+            view,
+            commit: None,
+        };
+        self.new_tab(Open::Editor(editor), None, window, cx)
+    }
+
+    /// A commit in the editor's History, on the project at `root`.
+    pub fn open_commit(
+        &mut self,
+        root: PathBuf,
+        hash: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<PaneId> {
+        let root = crate::inspect::project_root(&root);
+        let open = self.panes.iter().find_map(|(&id, p)| match &p.kind {
+            PaneKind::Browser(b) if b.read(cx).editor().is_some_and(|e| e.root == root) => {
+                Some((id, b.clone()))
+            }
+            _ => None,
+        });
+        if let Some((id, b)) = open {
+            self.focus_pane(id, window, cx);
+            b.read(cx).editor_commit(&hash);
+            cx.notify();
+            return Ok(id);
+        }
+        let editor = crate::code::Editor { root, open: None, view: "history", commit: Some(hash) };
+        self.new_tab(Open::Editor(editor), None, window, cx)
+    }
+
+    /// Move the keyboard to the pane beside the focused one (⌥⌘ arrows).
+    fn focus_toward(&mut self, axis: Axis, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if let Some(Some(next)) = tab.root.neighbor(tab.focused, axis, forward) {
+            self.focus_pane(next, window, cx);
+            cx.notify();
+        }
     }
 
     fn tab_of(&self, pane: PaneId) -> Option<usize> {
@@ -1783,7 +2114,7 @@ impl Workspace {
         // the menu over the sidebar.
         if self.browser_in_tab(self.active).is_some() {
             let zoom = self.settings.zoom;
-            let room = (theme::SIDEBAR_PX - crate::menu::MIN_W - theme::GUTTER) * zoom;
+            let room = (self.sidebar_px - crate::menu::MIN_W - theme::GUTTER) * zoom;
             at.x = at.x.min(px(room));
         }
         let restore = window.focused(cx);
@@ -2007,7 +2338,21 @@ impl Workspace {
         if window.is_window_active() && self.ticks.is_multiple_of(2) {
             self.refresh_inspector(cx);
         }
-        self.refresh_servers(cx);
+        if self.ticks.is_multiple_of(2) || !self.settings.status_bar {
+            self.refresh_servers(cx);
+        }
+        if self.settings.status_bar {
+            self.refresh_bar_git(cx);
+            // Limits move slowly and are cached a couple of minutes below;
+            // the open panel keeps the conversation's numbers fresh.
+            // The conversation's numbers are read incrementally (about a
+            // millisecond) and limits are cached below, so every few
+            // seconds keeps ctx in step with Claude Code's own line.
+            let every = if self.usage_open { 3 } else { 5 };
+            if self.ticks % every == 1 {
+                self.refresh_usage(cx);
+            }
+        }
         self.refresh_places(cx);
         self.save_session(cx);
         if self.ticks.is_multiple_of(3) {
@@ -2017,46 +2362,39 @@ impl Workspace {
     }
 
     /// The project each terminal and chat is in, and what a terminal is
-    /// running, for the tab titles. libproc only.
+    /// running, for the tab titles. libproc only, and off the main thread:
+    /// walking every terminal's processes each second showed up as a stall.
     fn refresh_places(&mut self, cx: &mut Context<Self>) {
-        let mut next = HashMap::new();
-        for (&id, pane) in &self.panes {
-            let place = match &pane.kind {
-                PaneKind::Terminal(t) => {
-                    // What is in front is the terminal's foreground process
-                    // group, not the deepest process: an agent's helpers
-                    // (MCP servers, `caffeinate`) sit below it.
-                    let shell = t.read(cx).pid();
-                    let fg = inspect::foreground(shell).unwrap_or(shell);
-                    let mut front = (fg, inspect::process_name(fg));
-                    let mut agent = agent_of(fg, &front.1);
-                    // An agent tab runs its CLI under `sh -c`, which has no job
-                    // control: the CLI shares the shell's group, so the group
-                    // leader is the shell. Look below it for the agent.
-                    if agent.is_none() && is_shell(&front.1) {
-                        if let Some((p, a)) = inspect::descendants(fg)
-                            .into_iter()
-                            .skip(1)
-                            .find_map(|p| agent_of(p.pid, &p.name).map(|a| (p, a)))
-                        {
-                            front = (p.pid, p.name);
-                            agent = Some(a);
-                        }
-                    }
-                    let cwd = inspect::cwd(front.0).or_else(|| inspect::cwd(shell));
-                    cwd.map(|cwd| Place {
-                        agent: agent.map(|(a, argv)| (a.cmd, argv)),
-                        front: Some(front.1),
-                        ..place_of(&cwd)
-                    })
-                }
-                PaneKind::Chat(c) => Some(place_of(c.read(cx).cwd())),
-                _ => None,
-            };
-            if let Some(place) = place {
-                next.insert(id, place);
-            }
+        if self.placing {
+            return;
         }
+        let jobs: Vec<(PaneId, PlaceJob)> = self
+            .panes
+            .iter()
+            .filter_map(|(&id, pane)| match &pane.kind {
+                PaneKind::Terminal(t) => {
+                    let t = t.read(cx);
+                    Some((id, PlaceJob::Shell(t.pid(), t.shell_cwd())))
+                }
+                PaneKind::Chat(c) => Some((id, PlaceJob::Dir(c.read(cx).cwd().to_path_buf()))),
+                _ => None,
+            })
+            .collect();
+        self.placing = true;
+        let scan = cx
+            .background_executor()
+            .spawn(async move { jobs.into_iter().filter_map(|(id, job)| Some((id, job.place()?))).collect() });
+        cx.spawn(async move |this, cx| {
+            let next: HashMap<PaneId, Place> = scan.await;
+            let _ = this.update(cx, |ws, cx| {
+                ws.placing = false;
+                ws.apply_places(next, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_places(&mut self, next: HashMap<PaneId, Place>, cx: &mut Context<Self>) {
         // Busy: something other than the shell is in front and printing.
         let shell = std::env::var("SHELL")
             .ok()
@@ -2088,6 +2426,69 @@ impl Workspace {
             self.busy = busy;
             cx.notify();
         }
+        self.read_conv_titles(cx);
+    }
+
+    /// First asks of the Claude Code conversations in our terminals that
+    /// are not read yet, off the main thread.
+    fn read_conv_titles(&mut self, cx: &mut Context<Self>) {
+        let wanted: Vec<(String, PathBuf)> = self
+            .places
+            .values()
+            .filter_map(|p| {
+                let (cmd, argv) = p.agent.as_ref()?;
+                (*cmd == "claude").then_some(())?;
+                let id = crate::session::session_arg(argv)?;
+                (!self.conv_titles.contains_key(&id)).then(|| (id, p.cwd.clone()))
+            })
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        for (id, _) in &wanted {
+            self.conv_titles.insert(id.clone(), None);
+        }
+        let read = cx.background_executor().spawn(async move {
+            wanted
+                .into_iter()
+                .map(|(id, cwd)| {
+                    let titles = crate::session::claude_titles(&cwd, &id);
+                    (id, titles)
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |this, cx| {
+            let found = read.await;
+            let _ = this.update(cx, |ws, cx| {
+                for (id, titles) in found {
+                    ws.conv_titles.insert(id, Some(titles));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A Claude Code terminal's title, unless Claude Code gave the same one
+    /// to other terminals too (it has retitled every open session alike):
+    /// then the conversation's own first ask.
+    fn own_agent_title(&self, id: PaneId, title: String, cx: &App) -> String {
+        // The command line it was started with is no title either.
+        let command = AGENTS.iter().any(|a| title.starts_with(&format!("{} ", a.cmd)));
+        let shared = command
+            || self.panes.iter().any(|(&other, p)| {
+                other != id
+                    && matches!(&p.kind, PaneKind::Terminal(t) if clean_title(&t.read(cx).title).as_deref() == Some(title.as_str()))
+            });
+        if !shared {
+            return title;
+        }
+        self.places
+            .get(&id)
+            .and_then(|p| p.agent.as_ref())
+            .and_then(|(_, argv)| crate::session::session_arg(argv))
+            .and_then(|sid| self.conv_titles.get(&sid)?.as_ref()?.pick(&title))
+            .unwrap_or(title)
     }
 
     /// The sidebar and inspector islands, made on first use.
@@ -2115,10 +2516,11 @@ impl Workspace {
     /// Dev servers for any blank browser tab on screen: every port a process
     /// under one of our terminals listens on. libproc only, no spawning.
     fn refresh_servers(&mut self, cx: &mut Context<Self>) {
-        let Some((_, b)) = self.browser_in_tab(self.active) else {
-            return;
-        };
-        if !b.read(cx).is_blank() {
+        let blank = self
+            .browser_in_tab(self.active)
+            .filter(|(_, b)| b.read(cx).is_blank())
+            .map(|(_, b)| b);
+        if blank.is_none() && !self.settings.status_bar {
             return;
         }
         let pids: Vec<u32> = self
@@ -2132,15 +2534,344 @@ impl Workspace {
             .collect();
         let mut servers: Vec<(u16, String)> = inspect::listening_ports(&pids)
             .into_iter()
+            .filter(|p| dev_server(p.port, &p.process))
             .map(|p| (p.port, p.process))
             .collect();
         servers.dedup_by_key(|(port, _)| *port);
-        b.update(cx, |b, cx| {
-            if b.servers != servers {
-                b.servers = servers;
-                cx.notify();
+        if self.bar_ports != servers {
+            self.bar_ports = servers.clone();
+            cx.notify();
+        }
+        if let Some(b) = blank {
+            b.update(cx, |b, cx| {
+                if b.servers != servers {
+                    b.servers = servers;
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    /// The agent in the focused pane: its command, and for Claude Code the
+    /// folder and conversation it is in.
+    fn focused_agent(&self, cx: &App) -> Option<(&'static str, Option<Conversation>)> {
+        let id = self.focused()?;
+        match &self.panes.get(&id)?.kind {
+            PaneKind::Chat(c) => {
+                let c = c.read(cx);
+                let cmd = AGENTS.iter().find(|a| a.cmd == c.agent.as_str())?.cmd;
+                let conv = (cmd == "claude").then(|| (c.cwd().to_path_buf(), c.native_id().map(str::to_string)));
+                Some((cmd, conv))
             }
+            PaneKind::Terminal(_) => {
+                let place = self.places.get(&id)?;
+                let (cmd, argv) = place.agent.as_ref()?;
+                let conv = (*cmd == "claude").then(|| (place.cwd.clone(), crate::session::session_arg(argv)));
+                Some((cmd, conv))
+            }
+            _ => None,
+        }
+    }
+
+    /// Plan limits, and the focused conversation's numbers, off the main
+    /// thread; today's totals only while the panel is open (they read every
+    /// conversation written today).
+    fn refresh_usage(&mut self, cx: &mut Context<Self>) {
+        if self.usage.busy {
+            return;
+        }
+        self.usage.busy = true;
+        let conv = self.focused_agent(cx).and_then(|(_, conv)| conv);
+        let title = self.focused().map(|id| self.pane_title(id, cx)).unwrap_or_default();
+        let today = self.usage_open;
+        let work = cx.background_executor().spawn(async move {
+            let claude = crate::usage::claude_limits();
+            let codex = crate::usage::codex_limits();
+            let session = conv.and_then(|(cwd, id)| {
+                let id = id.or_else(|| crate::usage::claude_latest_session(&cwd))?;
+                crate::usage::claude_session(&cwd, &id)
+            });
+            let today = today.then(crate::usage::claude_today);
+            (claude, codex, session, today)
         });
+        cx.spawn(async move |this, cx| {
+            let (claude, codex, session, today) = work.await;
+            let _ = this.update(cx, |ws, cx| {
+                let u = &mut ws.usage;
+                u.busy = false;
+                u.at = Some(Instant::now());
+                u.claude = Some(claude);
+                u.codex = codex;
+                u.session = session.map(|s| (title, s));
+                if today.is_some() {
+                    u.today = today;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The meter at the status bar's end: the plan limit nearest its cap
+    /// for the agent you are in (Claude unless it is Codex), and how full
+    /// the conversation's context is. A click opens the panel.
+    fn render_usage_meter(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let agent = self.focused_agent(cx).map(|(cmd, _)| cmd);
+        let limits = match agent {
+            Some("codex") => self.usage.codex.as_ref(),
+            _ => self.usage.claude.as_ref().and_then(|r| r.as_ref().ok()),
+        };
+        // The 5-hour limit first, as Claude Code's "used" shows it; a
+        // longer one joins it only when it is the one getting close.
+        let five = limits.and_then(|l| l.limits.iter().find(|x| x.label.starts_with('5')));
+        let top = five.or_else(|| limits.and_then(|l| l.limits.iter().max_by(|a, b| a.used_pct.total_cmp(&b.used_pct))));
+        let tight = limits.and_then(|l| {
+            l.limits
+                .iter()
+                .filter(|x| Some(*x) != top && x.used_pct >= 80.)
+                .max_by(|a, b| a.used_pct.total_cmp(&b.used_pct))
+        });
+        let ctx = self
+            .usage
+            .session
+            .as_ref()
+            .filter(|_| agent == Some("claude"))
+            .map(|(_, s)| s.context_used as f32 / s.context_window.max(1) as f32 * 100.);
+        if top.is_none() && ctx.is_none() {
+            return None;
+        }
+        let glyph = Icon::agent(if agent == Some("codex") { "codex" } else { "claude" });
+        let on = self.usage_open;
+        Some(
+            div()
+                .id("usage-meter")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(u(8.))
+                .h(u(20.))
+                .px(u(6.))
+                .rounded(u(5.))
+                .cursor_pointer()
+                .when(on, |d| d.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                .when(!on, |d| d.hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))))
+                .child(icon(glyph, 12., theme::dim()))
+                .children(top.map(|l| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(6.))
+                        .child(short_limit(&l.label))
+                        .child(meter_bar(l.used_pct, 28.))
+                        .child(div().text_color(rgb(level_color(l.used_pct))).child(pct_text(l.used_pct)))
+                }))
+                .children(tight.map(|l| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(4.))
+                        .child(short_limit(&l.label))
+                        .child(div().text_color(rgb(level_color(l.used_pct))).child(pct_text(l.used_pct)))
+                }))
+                .children(ctx.map(|pct| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(4.))
+                        .child(div().text_color(rgb(theme::dim())).child("ctx"))
+                        .child(div().text_color(rgb(level_color(pct))).child(pct_text(pct)))
+                }))
+                .on_click(cx.listener(|ws, _, _, cx| {
+                    ws.usage_open = !ws.usage_open;
+                    if ws.usage_open {
+                        ws.refresh_usage(cx);
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// The usage panel over the status bar's end: plan limits with when
+    /// they reset, the conversation you are in, and today.
+    fn render_usage_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let us = &self.usage;
+        let section = |title: &str| {
+            div()
+                .pt(u(12.))
+                .pb(u(6.))
+                .text_size(u(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(theme::dim()))
+                .child(title.to_string())
+        };
+        let row = |label: SharedString, pct: f32, note: Option<String>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(u(5.))
+                .py(u(5.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(div().flex_1().text_color(rgb(theme::text())).child(label))
+                        .child(div().text_color(rgb(level_color(pct))).child(pct_text(pct))),
+                )
+                .child(meter_bar(pct, 0.))
+                .children(note.map(|n| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(n)))
+        };
+        let limits_block = |l: &crate::usage::Limits, name: &str| {
+            let mut col = div().flex().flex_col().child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(u(8.))
+                    .pt(u(4.))
+                    .child(icon(Icon::agent(l.agent), 14., theme::text()))
+                    .child(div().flex_1().font_weight(FontWeight::MEDIUM).text_color(rgb(theme::text())).child(name.to_string()))
+                    .children(l.plan.clone().map(|p| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(p))),
+            );
+            for lim in &l.limits {
+                col = col.child(row(lim.label.clone().into(), lim.used_pct, lim.resets_at.map(resets_in)));
+            }
+            col
+        };
+        let mut body = div().flex().flex_col().text_size(u(12.5));
+        match &us.claude {
+            Some(Ok(l)) => body = body.child(limits_block(l, "Claude")),
+            Some(Err(e)) => {
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(8.))
+                        .pt(u(4.))
+                        .child(icon(Icon::Claude, 14., theme::text()))
+                        .child(div().flex_1().text_color(rgb(theme::text_2())).child(e.clone())),
+                )
+            }
+            None => body = body.child(div().pt(u(4.)).text_color(rgb(theme::dim())).child("Reading usage…")),
+        }
+        if let Some((title, s)) = &us.session {
+            let pct = s.context_used as f32 / s.context_window.max(1) as f32 * 100.;
+            body = body
+                .child(section("This conversation"))
+                .child(div().truncate().text_color(rgb(theme::text())).child(title.clone()))
+                .child(row(
+                    "Context".into(),
+                    pct,
+                    Some(format!("{} of {}{}", tokens(s.context_used), tokens(s.context_window), s.model.as_deref().map(|m| format!(" · {m}")).unwrap_or_default())),
+                ))
+                .child(
+                    div()
+                        .text_size(u(11.))
+                        .text_color(rgb(theme::dim()))
+                        .child(format!(
+                            "{} turns · {} in · {} out · {} cached{}",
+                            s.turns,
+                            tokens(s.input),
+                            tokens(s.output),
+                            tokens(s.cache_read),
+                            s.cost_usd.map(|c| format!(" · ${c:.2}")).unwrap_or_default()
+                        )),
+                );
+        }
+        if let Some(t) = &us.today {
+            body = body.child(section("Today, all projects")).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(2.))
+                    .child(div().text_color(rgb(theme::text_2())).child(format!(
+                        "{} conversations{}",
+                        t.sessions,
+                        t.cost_usd.map(|c| format!(" · ${c:.2} at API prices")).unwrap_or_default()
+                    )))
+                    .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(format!(
+                        "{} written · {} new in · {} read from cache",
+                        tokens(t.output),
+                        tokens(t.input + t.cache_write),
+                        tokens(t.cache_read)
+                    ))),
+            );
+        }
+        if let Some(l) = &us.codex {
+            body = body.child(div().pt(u(10.)).child(limits_block(l, "Codex")));
+        }
+        let updated = us.at.map(|t| match t.elapsed().as_secs() {
+            0..=9 => "Updated just now".to_string(),
+            s if s < 120 => format!("Updated {s}s ago"),
+            s => format!("Updated {}m ago", s / 60),
+        });
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, _, _, cx| {
+                    ws.usage_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("usage-panel")
+                    .absolute()
+                    .bottom(u(26. + 6.))
+                    .right(u(theme::GUTTER))
+                    .w(u(320.))
+                    .max_h(gpui::relative(0.8))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .p(u(14.))
+                    .rounded(u(12.))
+                    .bg(rgb(theme::menu()))
+                    .border_1()
+                    .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(body)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .mt(u(12.))
+                            .pt(u(10.))
+                            .border_t_1()
+                            .border_color(rgba(theme::hairline()))
+                            .text_size(u(11.))
+                            .text_color(rgb(theme::dim()))
+                            .child(div().flex_1().child(updated.unwrap_or_default()))
+                            .child(
+                                icon_button("usage-refresh", Icon::Refresh)
+                                    .size(u(22.))
+                                    .on_click(cx.listener(|ws, _, _, cx| ws.refresh_usage(cx))),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The focused pane's project and branch, read from `.git` itself so it
+    /// costs no process.
+    fn refresh_bar_git(&mut self, cx: &mut Context<Self>) {
+        let git = self.focused_cwd(cx).map(|cwd| {
+            let root = inspect::project_root(&cwd);
+            let name = root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.display().to_string());
+            (name, git_head(&root))
+        });
+        if git != self.bar_git {
+            self.bar_git = git;
+            cx.notify();
+        }
     }
 
     pub fn refresh_inspector(&mut self, cx: &mut Context<Self>) {
@@ -2183,8 +2914,18 @@ impl Workspace {
             .chain(tab.leaves())
             .find_map(|id| match &self.panes.get(&id)?.kind {
                 PaneKind::Terminal(t) => {
-                    let procs = inspect::descendants(t.read(cx).pid());
-                    procs.iter().rev().find_map(|p| inspect::cwd(p.pid))
+                    let t = t.read(cx);
+                    let place = self.places.get(&id);
+                    // Where an agent stands, not the scratch folder one of
+                    // its tools is running in; for a shell, where it says it
+                    // is (OSC 7), which follows `cd` at once.
+                    match place {
+                        Some(p) if p.agent.is_some() => Some(p.cwd.clone()),
+                        _ => t
+                            .shell_cwd()
+                            .or_else(|| place.map(|p| p.cwd.clone()))
+                            .or_else(|| inspect::descendants(t.pid()).iter().rev().find_map(|p| inspect::cwd(p.pid))),
+                    }
                 }
                 PaneKind::Launcher(l) => l.read(cx).cwd.clone(),
                 PaneKind::Review(r) => Some(r.read(cx).task.worktree.clone()),
@@ -2229,9 +2970,15 @@ impl Workspace {
         if themed {
             wear(next.theme, window);
         }
+        if next.agent_skill != self.settings.agent_skill {
+            let on = next.agent_skill;
+            std::thread::spawn(move || crate::shell::install_skill(on));
+        }
         self.settings = next;
         crate::settings::save(&self.settings);
         let look = self.settings.term_look();
+        // The editor page is zoomed as a whole; it takes the size before zoom.
+        crate::code::set_font(&look.family, self.settings.font_px);
         let zoom = self.settings.zoom as f64;
         for pane in self.panes.values() {
             match &pane.kind {
@@ -2239,7 +2986,10 @@ impl Workspace {
                     let look = look.clone();
                     t.update(cx, |t, cx| t.set_look(look, window, cx))
                 }
-                PaneKind::Browser(b) => b.update(cx, |b, _| b.set_zoom(zoom)),
+                PaneKind::Browser(b) => b.update(cx, |b, _| {
+                    b.set_zoom(zoom);
+                    b.editor_restyle();
+                }),
                 PaneKind::Settings(s) => {
                     let settings = self.settings.clone();
                     s.update(cx, |s, cx| s.sync(&settings, None, cx))
@@ -2260,6 +3010,8 @@ impl Workspace {
     /// terminals' palette follows, then everything redraws.
     fn restyle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let look = self.settings.term_look();
+        // The editor page is zoomed as a whole; it takes the size before zoom.
+        crate::code::set_font(&look.family, self.settings.font_px);
         for pane in self.panes.values() {
             if let PaneKind::Terminal(t) = &pane.kind {
                 let look = look.clone();
@@ -2326,6 +3078,59 @@ impl Workspace {
     /// ⌘K: open the palette over everything (pages step aside, since a
     /// native view would cover it), or close it if it is open.
     /// ⌘K, or with `snippets_only` ⌘;: the snippets alone.
+    /// ⌃R at a terminal's prompt: what was run there, then the shell's
+    /// history, newest first; the pick is typed at the prompt.
+    fn open_history(&mut self, from: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            self.close_palette(window, cx);
+            return;
+        }
+        let Some(PaneKind::Terminal(t)) = self.panes.get(&from).map(|p| &p.kind) else {
+            return;
+        };
+        let here = t.read(cx).session_commands();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut seen = std::collections::HashSet::new();
+        let mut items: Vec<Item> = Vec::new();
+        let mut push = |cmd: String, detail: String, items: &mut Vec<Item>| {
+            if seen.insert(cmd.clone()) {
+                items.push(Item {
+                    kind: Kind::Command,
+                    title: crate::chat::one_line_pub(&cmd).into(),
+                    detail: detail.into(),
+                    icon: Icon::Terminal,
+                    hint: None,
+                    pick: crate::palette::Pick::Command(cmd),
+                });
+            }
+        };
+        for cmd in here {
+            push(cmd, "this terminal".into(), &mut items);
+        }
+        for (cmd, when) in crate::shell::zsh_history(3000) {
+            let detail = when.map(|t| format!("{} ago", short_secs((now - t).max(0) as u64))).unwrap_or_default();
+            push(cmd, detail, &mut items);
+        }
+        let palette = cx.new(|cx| Palette::history(items, cx));
+        let sub = cx.subscribe_in(&palette, window, move |ws, _, ev: &PaletteEvent, window, cx| match ev {
+            PaletteEvent::Close => ws.close_palette(window, cx),
+            PaletteEvent::Run(pick) => {
+                let pick = pick.clone();
+                ws.close_palette(window, cx);
+                ws.run_pick(pick, window, cx);
+            }
+            PaletteEvent::Query(_) => {}
+        });
+        let focus = palette.read(cx).focus(cx);
+        self.palette = Some((palette, Some(from), sub));
+        window.focus(&focus);
+        crate::browser::reclaim_keyboard(window);
+        cx.notify();
+    }
+
     fn toggle_palette(&mut self, snippets_only: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.palette.is_some() {
             self.close_palette(window, cx);
@@ -2412,7 +3217,6 @@ impl Workspace {
         .detach();
         let focus = palette.read(cx).focus(cx);
         self.palette = Some((palette, from, sub));
-        self.cover_pages(true, cx);
         window.focus(&focus);
         crate::browser::reclaim_keyboard(window);
         cx.notify();
@@ -2420,7 +3224,6 @@ impl Workspace {
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((_, from, _)) = self.palette.take() {
-            self.cover_pages(false, cx);
             if let Some(id) = from.filter(|id| self.panes.contains_key(id)) {
                 self.focus_pane(id, window, cx);
             }
@@ -2445,10 +3248,21 @@ impl Workspace {
             let id = tab.focused;
             let (glyph, _) = self.tab_icon(tab.leaves()[0], cx);
             const HINTS: [&str; 9] = ["⌘1", "⌘2", "⌘3", "⌘4", "⌘5", "⌘6", "⌘7", "⌘8", "⌘9"];
+            // A task's worktree folder is its brief as a slug; the project
+            // it belongs to says more.
+            let task = self.tasks.iter().find(|t| self.task_pane(t, cx).is_some_and(|p| tab.leaves().contains(&p)));
+            let detail = match task {
+                Some(t) => format!(
+                    "{} · task",
+                    t.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                )
+                .into(),
+                None => self.pane_subtitle(id, cx).unwrap_or_default(),
+            };
             items.push(Item {
                 kind: Kind::Tab,
                 title: self.pane_title(id, cx),
-                detail: self.pane_subtitle(id, cx).unwrap_or_default(),
+                detail,
                 icon: glyph,
                 hint: HINTS.get(ix).map(|h| SharedString::from(*h)),
                 pick: P::Pane(id),
@@ -2545,6 +3359,20 @@ impl Workspace {
                 Icon::Globe,
                 key("new-browser"),
                 Box::new(NewBrowser),
+            ),
+            action(
+                "Files",
+                "Browse and edit this project's files",
+                Icon::Files,
+                key("files"),
+                Box::new(OpenFiles),
+            ),
+            action(
+                "Git Changes",
+                "Diffs, staging, commits and branches",
+                Icon::Git,
+                key("changes"),
+                Box::new(OpenChanges),
             ),
             action(
                 "Open Location",
@@ -2675,6 +3503,19 @@ impl Workspace {
             P::NewTask(brief) => self.start_task(brief, window, cx),
             P::Review(task) => self.open_review(&task, window, cx),
             P::Snippet(body) => self.insert_snippet(&body, window, cx),
+            // As typed at the prompt (a paste, so nothing runs until ⏎),
+            // with nothing expanded: a command's braces are its own.
+            P::Command(text) => match self.focused().and_then(|id| self.panes.get(&id)).map(|p| &p.kind) {
+                Some(PaneKind::Terminal(t)) => {
+                    let t = t.clone();
+                    t.update(cx, |t, _| t.paste_text(&text));
+                    window.focus(&t.read(cx).focus);
+                }
+                _ => {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    self.flash("Command copied. ⌘V to paste it.", cx);
+                }
+            },
             P::SaveSnippet(text) => {
                 let name = crate::snippets::add(&text);
                 self.flash(format!("Kept \"{name}\" as a snippet. ⌘; puts it in."), cx);
@@ -3451,13 +4292,16 @@ impl Workspace {
             .rounded(u(theme::ROW_RADIUS))
             .cursor_pointer()
             .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+            .when(!active && (working || wants), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+            .when(!active && !working && !wants, |d| {
+                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
+            })
             .child(lead(if working {
                 thinking(
                     ElementId::Name(format!("task-think-{}", task.id).into()),
                     Icon::Git,
                     15.,
-                    theme::text(),
+                    theme::accent(),
                 )
             } else {
                 icon(
@@ -3680,22 +4524,24 @@ impl Workspace {
         // In unzoomed units, so the breakpoints hold at any zoom.
         let width = f32::from(window.viewport_size().width) / self.settings.zoom;
         let fits = |sidebar: bool| {
-            width - if sidebar { theme::SIDEBAR_PX } else { 0. } - theme::INSPECTOR_PX
+            width - if sidebar { self.sidebar_px } else { 0. } - self.inspector_px
                 >= MIN_CONTENT_PX
         };
-        if self.inspector.open && fits(self.sidebar) {
-            self.inspector.open = false;
-        } else {
-            self.inspector.open = true;
-            if !fits(self.sidebar) && fits(false) {
-                self.sidebar = false;
-            }
-        }
+        // Narrow windows are handled where the window is drawn (the sidebar
+        // steps aside while the inspector is open); here it only opens and
+        // closes, so closing it brings back exactly what was there.
+        let _ = fits;
+        self.inspector.open = !self.inspector.open;
         self.refresh_inspector(cx);
         cx.notify();
     }
 
     /// Title and URL when the focused pane is a browser.
+    /// The inspector's width, as dragged.
+    pub fn inspector_width(&self) -> f32 {
+        self.inspector_px
+    }
+
     pub fn focused_browser(&self, cx: &App) -> Option<(SharedString, SharedString)> {
         let id = self.focused()?;
         let PaneKind::Browser(b) = &self.panes.get(&id)?.kind else {
@@ -3869,6 +4715,78 @@ impl Workspace {
 
     /// One notification per pane at a time: an agent that rings and posts
     /// for the same prompt shows up once.
+    /// A command at a shell finished. One that took a while, in a pane
+    /// you aren't looking at, says so (as agents do when they finish).
+    fn command_done(
+        &mut self,
+        id: PaneId,
+        command: Option<String>,
+        exit: Option<i32>,
+        took: Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let looking = window.is_window_active() && self.focused() == Some(id);
+        if looking || took < Duration::from_secs(10) || !self.settings.notify_done {
+            return;
+        }
+        let what = command
+            .map(|c| crate::chat::one_line_pub(&c))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| "The command".into());
+        let secs = took.as_secs();
+        let long = if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+        let body = match exit {
+            Some(0) | None => format!("✓ {what} finished in {long}"),
+            Some(code) => format!("✗ {what} failed (exit {code}) after {long}"),
+        };
+        self.post(id, body, cx);
+    }
+
+    /// "# …" at a terminal's prompt: a command for it, typed at the prompt
+    /// (not run) once the model has written it.
+    fn write_command(&mut self, id: PaneId, request: String, cwd: Option<PathBuf>, cx: &mut Context<Self>) {
+        let cwd = cwd.filter(|c| c.is_dir()).or_else(|| self.cwd_of(id, cx)).unwrap_or_else(|| self.cwd.clone());
+        let model = crate::refine::model();
+        cx.spawn(async move |this, cx| {
+            let got = cx
+                .background_executor()
+                .spawn(async move { crate::refine::shell_command(&request, &cwd, &model) })
+                .await;
+            let _ = this.update(cx, |ws, cx| match got {
+                Ok(cmd) => {
+                    if let Some(PaneKind::Terminal(t)) = ws.panes.get(&id).map(|p| &p.kind) {
+                        t.update(cx, |t, _| t.paste_text(&cmd));
+                    }
+                }
+                Err(e) => ws.flash(format!("Couldn't write that command: {e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// "Fix with agent" on a terminal's command: a chat beside it, in its
+    /// folder, with the command and its output.
+    fn ask_agent_beside(
+        &mut self,
+        id: PaneId,
+        prompt: String,
+        cwd: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let cwd = cwd.filter(|c| c.is_dir()).or_else(|| self.cwd_of(id, cx));
+        let open = Open::Chat { agent: None, cwd };
+        match self.split(id, open, Axis::Row, window, cx) {
+            Ok(chat) => {
+                if let Some(PaneKind::Chat(c)) = self.panes.get(&chat).map(|p| &p.kind) {
+                    c.update(cx, |c, cx| c.send(prompt, cx));
+                }
+            }
+            Err(e) => tracing::warn!("could not start a chat: {e}"),
+        }
+    }
+
     fn post(&mut self, id: PaneId, body: String, cx: &App) {
         let now = Instant::now();
         if self
@@ -3892,7 +4810,12 @@ impl Workspace {
                 kind: PaneKind::Terminal(t),
                 ..
             }) => clean_title(&t.read(cx).title)
-                .filter(|t| !t.eq_ignore_ascii_case(a.name) && !t.eq_ignore_ascii_case(a.cmd))
+                .map(|t| self.own_agent_title(id, t, cx))
+                .filter(|t| {
+                    !t.eq_ignore_ascii_case(a.name)
+                        && !t.eq_ignore_ascii_case(a.cmd)
+                        && !t.starts_with(&format!("{} ", a.cmd))
+                })
                 .unwrap_or_else(|| a.name.to_string())
                 .into(),
             Some(Pane { agent: Some(a), .. }) => a.name.into(),
@@ -3907,13 +4830,19 @@ impl Workspace {
                     c.title.clone()
                 }
             }
+            // The sidebar's name for it, so a tab is called one thing
+            // everywhere: never "login" or the command line an agent ran.
             Some(Pane {
                 kind: PaneKind::Terminal(t),
                 ..
-            }) => clean_title(&t.read(cx).title)
-                .or_else(|| self.places.get(&id).and_then(|p| p.front.clone()))
-                .unwrap_or_else(|| short_title(&t.read(cx).title))
-                .into(),
+            }) => match self.terminal_row_text(id, cx) {
+                Some((title, _)) => title,
+                None => clean_title(&t.read(cx).title)
+                    .map(|t| self.own_agent_title(id, t, cx))
+                    .or_else(|| self.places.get(&id).and_then(|p| p.front.clone()))
+                    .unwrap_or_else(|| short_title(&t.read(cx).title))
+                    .into(),
+            },
             Some(Pane {
                 kind: PaneKind::Settings(_),
                 ..
@@ -3945,6 +4874,44 @@ impl Workspace {
 
     /// The second line of a tab: where a terminal or chat is working, the
     /// site a page is on.
+    /// A sidebar row's second line, under its project's header: a page's
+    /// host, the editor, or where in the project a terminal is and what it
+    /// runs.
+    fn row_detail(&self, id: PaneId, cx: &App) -> Option<SharedString> {
+        match &self.panes.get(&id)?.kind {
+            PaneKind::Browser(b) => {
+                let b = b.read(cx);
+                if b.is_editor() {
+                    return Some("Editor".into());
+                }
+                (!b.is_blank()).then(|| crate::history::host(&b.url).to_string().into())
+            }
+            PaneKind::Terminal(_) => {
+                let place = self.places.get(&id)?;
+                let front = place.front.as_deref().map(|f| f.trim_start_matches('-')).unwrap_or("");
+                Some(match (place.sub.is_empty(), front.is_empty()) {
+                    (true, true) => "terminal".into(),
+                    (true, false) => front.to_string().into(),
+                    (false, true) => place.sub.clone().into(),
+                    (false, false) => format!("{} · {front}", place.sub).into(),
+                })
+            }
+            _ => self.pane_subtitle(id, cx),
+        }
+    }
+
+    /// What a pane is, for a row with nothing more specific to say.
+    fn kind_label(&self, id: PaneId) -> SharedString {
+        match self.panes.get(&id).map(|p| &p.kind) {
+            Some(PaneKind::Browser(_)) => "New page".into(),
+            Some(PaneKind::Chat(_)) => "Chat".into(),
+            Some(PaneKind::Settings(_)) => "Preferences".into(),
+            Some(PaneKind::Launcher(_)) => "New tab".into(),
+            Some(PaneKind::Review(_)) => "Task review".into(),
+            Some(PaneKind::Terminal(_)) | None => "terminal".into(),
+        }
+    }
+
     fn pane_subtitle(&self, id: PaneId, cx: &App) -> Option<SharedString> {
         match &self.panes.get(&id)?.kind {
             PaneKind::Browser(b) => {
@@ -4005,6 +4972,7 @@ impl Workspace {
         let r = match req.method.as_str() {
             "pane.list" => Ok(self.list(caller, cx)),
             "pane.split" => self.rpc_split(p, caller, window, cx),
+            "pane.run" => self.rpc_run(p, caller, window, cx),
             "tab.new" => self.rpc_tab(p, window, cx),
             "pane.send" => self.rpc_send(p, cx),
             "pane.read" => return self.rpc_read(p, reply, cx),
@@ -4017,7 +4985,10 @@ impl Workspace {
                 json!({ "closed": id })
             }),
             "browser.open" => self.rpc_open(p, caller, window, cx),
-            "browser.eval" => return self.rpc_eval(p, reply, cx),
+            "browser.eval" => return self.rpc_eval(p, caller, reply, cx),
+            "browser.logs" => self.rpc_logs(p, caller, cx),
+            "browser.shot" => self.rpc_browser_shot(p, caller, window, cx),
+            "browser.dialog" => self.rpc_dialog(p, caller, cx),
             "settings.open" => {
                 use crate::settings_pane::Page;
                 let page = match str_param(p, "page").unwrap_or("general") {
@@ -4026,6 +4997,7 @@ impl Workspace {
                     "terminal" => Ok(Page::Terminal),
                     "browser" => Ok(Page::Browser),
                     "agents" => Ok(Page::Agents),
+                    "models" => Ok(Page::Models),
                     "keyboard" | "shortcuts" | "keys" => Ok(Page::Keyboard),
                     "snippets" => Ok(Page::Snippets),
                     other => Err(format!("no settings page {other}")),
@@ -4156,6 +5128,15 @@ impl Workspace {
     }
 
     fn existing(&self, p: &Value) -> Result<PaneId, String> {
+        // `--name dev` finds the pane a `deck run --name dev` opened.
+        if let Some(n) = str_param(p, "name") {
+            return self
+                .named
+                .get(n)
+                .copied()
+                .filter(|id| self.panes.contains_key(id))
+                .ok_or_else(|| format!("no pane named {n:?} (start one with `deck run --name {n} CMD` or `deck open --name {n} URL`)"));
+        }
         let id = p
             .get("pane")
             .and_then(Value::as_u64)
@@ -4237,6 +5218,50 @@ impl Workspace {
         Ok(json!({ "pane": id }))
     }
 
+    /// `deck run [--name NAME] CMD`: a terminal beside the caller running
+    /// CMD, where you can watch it. With a name it is kept: running the same
+    /// name again stops what runs there (⌃C) and runs the new command in the
+    /// same pane, so a dev server restarts in place instead of piling up.
+    fn rpc_run(
+        &mut self,
+        p: &Value,
+        caller: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let cmd = str_param(p, "cmd").filter(|c| !c.trim().is_empty()).ok_or("nothing to run")?.to_string();
+        let name = str_param(p, "name").map(str::to_string);
+        if let Some(id) = name.as_ref().and_then(|n| self.named.get(n)).copied() {
+            if let Some(PaneKind::Terminal(t)) = self.panes.get(&id).map(|p| &p.kind) {
+                let t = t.clone();
+                t.update(cx, |t, cx| t.send("\u{3}", false, cx));
+                // A moment for the program to stop and the shell to return.
+                let line = cmd.clone();
+                cx.spawn(async move |_, cx| {
+                    cx.background_executor().timer(Duration::from_millis(400)).await;
+                    let _ = t.update(cx, |t, cx| t.send(&line, true, cx));
+                })
+                .detach();
+                return Ok(json!({ "pane": id, "name": name, "reused": true }));
+            }
+        }
+        let axis = match str_param(p, "dir").unwrap_or("right") {
+            "right" => Axis::Row,
+            "down" => Axis::Column,
+            d => return Err(format!("--dir is right or down, got {d:?}")),
+        };
+        let cwd = str_param(p, "cwd").map(PathBuf::from).filter(|c| c.is_dir()).or_else(|| self.cwd_of(caller, cx));
+        let id = self
+            .split(caller, Open::Terminal { cmd: Some(cmd), cwd }, axis, window, cx)
+            .map_err(|e| e.to_string())?;
+        if let Some(n) = &name {
+            self.named.insert(n.clone(), id);
+        }
+        // The caller keeps the keyboard; the new pane is there to watch.
+        self.focus_pane(caller, window, cx);
+        Ok(json!({ "pane": id, "name": name, "reused": false }))
+    }
+
     fn rpc_tab(
         &mut self,
         p: &Value,
@@ -4244,9 +5269,24 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Result<Value, String> {
         let (what, agent) = Self::open_from(p)?;
+        // `--kind browser --name app`: a page kept under that name; asking
+        // for it again goes to the same pane.
+        let name = str_param(p, "name").filter(|_| matches!(what, Open::Browser { .. }));
+        if let Some(id) = name.and_then(|n| self.named_browser(n)) {
+            let url = str_param(p, "url").filter(|u| !u.trim().is_empty() && *u != "about:blank");
+            if let (Some(url), Some(PaneKind::Browser(b))) = (url, self.panes.get(&id).map(|p| &p.kind)) {
+                b.update(cx, |b, cx| b.navigate(url, cx))
+                    .map_err(|e| e.to_string())?;
+            }
+            self.focus_pane(id, window, cx);
+            return Ok(json!({ "pane": id, "name": name, "reused": true }));
+        }
         let id = self
             .new_tab(what, agent, window, cx)
             .map_err(|e| e.to_string())?;
+        if let Some(n) = name {
+            self.named.insert(n.to_string(), id);
+        }
         Ok(json!({ "pane": id, "tab": self.active + 1 }))
     }
 
@@ -4275,7 +5315,11 @@ impl Workspace {
         };
         match &self.panes[&id].kind {
             PaneKind::Terminal(t) => {
-                let text = t.update(cx, |t, _| t.read_text());
+                // --lines N: the end of the scrollback, for logs.
+                let text = match p.get("lines").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())) {
+                    Some(n) => t.read(cx).tail(n.clamp(1, 5000) as usize),
+                    None => t.update(cx, |t, _| t.read_text()),
+                };
                 reply.send(Ok(json!({ "pane": id, "text": text })));
             }
             PaneKind::Browser(b) => b
@@ -4299,35 +5343,218 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Result<Value, String> {
         let url = str_param(p, "url").ok_or("missing URL")?;
-        if p.get("pane").is_some() {
-            let id = self.existing(p)?;
+        // `--name app` keeps the page under that name: opening it again
+        // navigates the same pane, wherever it is.
+        let name = str_param(p, "name").filter(|n| !n.trim().is_empty());
+        let reuse = if p.get("pane").is_some_and(|v| !v.is_null()) {
+            let id = p.get("pane").and_then(Value::as_u64).ok_or("--pane takes a number")?;
+            Some(self.existing(&json!({ "pane": id }))?)
+        } else {
+            name.and_then(|n| self.named_browser(n))
+        };
+        if let Some(id) = reuse {
             let PaneKind::Browser(b) = &self.panes[&id].kind else {
-                return Err(format!("pane {id} is a terminal"));
+                return Err(format!("pane {id} is not a browser"));
             };
             b.update(cx, |b, cx| b.navigate(url, cx))
                 .map_err(|e| e.to_string())?;
-            return Ok(json!({ "pane": id }));
+            if let Some(n) = name {
+                self.named.insert(n.to_string(), id);
+            }
+            return Ok(json!({ "pane": id, "name": name, "reused": true }));
         }
-        let id = self
-            .open_url_near(caller, url, window, cx)
-            .ok_or("could not open a browser pane")?;
-        Ok(json!({ "pane": id }))
+        let tab = ["tab", "new_tab"]
+            .iter()
+            .any(|k| p.get(*k).and_then(Value::as_bool) == Some(true));
+        let id = if tab {
+            self.new_tab(Open::Browser { url: url.into() }, None, window, cx)
+                .map_err(|e| e.to_string())?
+        } else if name.is_some() {
+            // A named page is its own, not whatever page the tab has.
+            self.split(caller, Open::Browser { url: url.into() }, Axis::Row, window, cx)
+                .map_err(|e| e.to_string())?
+        } else {
+            self.open_url_near(caller, url, window, cx)
+                .ok_or("could not open a browser pane")?
+        };
+        if let Some(n) = name {
+            self.named.insert(n.to_string(), id);
+        }
+        Ok(json!({ "pane": id, "name": name }))
     }
 
-    fn rpc_eval(&mut self, p: &Value, reply: Reply, cx: &mut Context<Self>) {
-        let res = self.existing(p).and_then(|id| {
+    /// The browser pane kept under `name`, while it is open.
+    fn named_browser(&self, name: &str) -> Option<PaneId> {
+        self.named
+            .get(name)
+            .copied()
+            .filter(|id| matches!(self.panes.get(id).map(|p| &p.kind), Some(PaneKind::Browser(_))))
+    }
+
+    /// The page a `browser.*` call is for: `--pane` or `--name`, else the
+    /// page in the caller's tab, else the only page open.
+    fn browser_target(&self, p: &Value, caller: PaneId, cx: &App) -> Result<PaneId, String> {
+        let given = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+        if given("pane") || given("name") {
+            let id = self.existing(p)?;
+            return match self.panes.get(&id).map(|p| &p.kind) {
+                Some(PaneKind::Browser(_)) => Ok(id),
+                _ => Err(format!("pane {id} is not a browser")),
+            };
+        }
+        let page = |id: &PaneId| {
+            matches!(self.panes.get(id).map(|p| &p.kind),
+                Some(PaneKind::Browser(b)) if !b.read(cx).is_editor())
+        };
+        if let Some(tab) = self.tab_of(caller).map(|ix| &self.tabs[ix]) {
+            if let Some(id) = std::iter::once(tab.focused).chain(tab.leaves()).find(|id| page(id)) {
+                return Ok(id);
+            }
+        }
+        let pages: Vec<PaneId> = self.panes.keys().copied().filter(|id| page(id)).collect();
+        match pages.as_slice() {
+            [one] => Ok(*one),
+            [] => Err("no page is open; open one with `deck open URL`".into()),
+            _ => Err("more than one page is open; say which with --pane N (see `deck pane list`)".into()),
+        }
+    }
+
+    /// `browser.eval`: run JS in a page and answer with its JSON value.
+    /// With `expr` it is one expression, run as written (deck's own page
+    /// actions); otherwise it goes through `eval()`, and a page whose
+    /// Content Security Policy forbids that gets it as an expression. A
+    /// page that does not answer (a dialog is up, a script is spinning)
+    /// fails the call after `timeout` seconds instead of holding it.
+    fn rpc_eval(&mut self, p: &Value, caller: PaneId, reply: Reply, cx: &mut Context<Self>) {
+        let res = self.browser_target(p, caller, cx).and_then(|id| {
             let js = str_param(p, "js").ok_or("missing JS")?;
             match &self.panes[&id].kind {
                 PaneKind::Browser(b) => Ok((b.clone(), js.to_string())),
                 _ => Err(format!("pane {id} is not a browser")),
             }
         });
-        match res {
-            Ok((b, js)) => b
-                .read(cx)
-                .eval(&js, move |r| reply.send(r.map(|v| json!({ "value": v })))),
-            Err(e) => reply.send(Err(e)),
+        let (b, js) = match res {
+            Ok(found) => found,
+            Err(e) => return reply.send(Err(e)),
+        };
+        // A page with a dialog up runs nothing until it is answered.
+        let held = |kind: &str, text: &str| {
+            format!("the page is showing a {kind} ({text:?}) and waits for it; answer it with `deck browser dialog accept` or `deck browser dialog dismiss`")
+        };
+        if let Some((kind, text)) = b.read(cx).pending_dialog() {
+            return reply.send(Err(held(kind, &text)));
         }
+        let expr = p.get("expr").and_then(Value::as_bool).unwrap_or(false);
+        let secs = p.get("timeout").and_then(Value::as_u64).unwrap_or(30).clamp(1, 300);
+        let (tx, rx) = futures::channel::oneshot::channel::<Result<Value, String>>();
+        let done = move |r| {
+            let _ = tx.send(r);
+        };
+        if expr {
+            b.read(cx).eval_expr(&js, done);
+        } else {
+            b.read(cx).eval(&js, done);
+        }
+        cx.spawn(async move |_, cx| {
+            let start = std::time::Instant::now();
+            let mut rx = rx;
+            let r = loop {
+                let tick = cx.background_executor().timer(Duration::from_millis(500));
+                match futures::future::select(rx, tick).await {
+                    futures::future::Either::Left((r, _)) => {
+                        break r.unwrap_or_else(|_| Err("no answer from the page".into()))
+                    }
+                    futures::future::Either::Right((_, waiting)) => {
+                        rx = waiting;
+                        let dialog = b.update(cx, |b, _| b.pending_dialog()).ok().flatten();
+                        if let Some((kind, text)) = dialog {
+                            break Err(held(kind, &text));
+                        }
+                        if start.elapsed() >= Duration::from_secs(secs) {
+                            break Err(format!(
+                                "the page did not answer in {secs}s; a script may be busy"
+                            ));
+                        }
+                    }
+                }
+            };
+            match r {
+                Err(e) if !expr && e.starts_with("EvalError") => {
+                    let sent = b.update(cx, |b, _| {
+                        b.eval_expr(&js, move |r| reply.send(r.map(|v| json!({ "value": v }))))
+                    });
+                    drop(sent);
+                }
+                r => reply.send(r.map(|v| json!({ "value": v }))),
+            }
+        })
+        .detach();
+    }
+
+    /// `browser.dialog`: the alert, confirm, prompt or login a page has up,
+    /// and with `action` accept or dismiss, its answer (`text` for a
+    /// prompt, `user` and `password` for a login).
+    fn rpc_dialog(&mut self, p: &Value, caller: PaneId, cx: &mut Context<Self>) -> Result<Value, String> {
+        let id = self.browser_target(p, caller, cx)?;
+        let PaneKind::Browser(b) = &self.panes[&id].kind else {
+            return Err(format!("pane {id} is not a browser"));
+        };
+        let b = b.read(cx);
+        let accept = match str_param(p, "action") {
+            None => {
+                let open = b.pending_dialog();
+                return Ok(json!({
+                    "pane": id,
+                    "dialog": open.map(|(kind, text)| json!({ "kind": kind, "text": text })),
+                }));
+            }
+            Some("accept" | "ok" | "yes") => true,
+            Some("dismiss" | "cancel" | "no") => false,
+            Some(a) => return Err(format!("a dialog is answered accept or dismiss, not {a:?}")),
+        };
+        let values: Vec<String> = match (str_param(p, "user"), str_param(p, "text")) {
+            (Some(user), _) => vec![user.into(), str_param(p, "password").unwrap_or("").into()],
+            (None, Some(text)) => vec![text.into()],
+            (None, None) => Vec::new(),
+        };
+        let mut v = b.answer_dialog(accept, &values)?;
+        v["pane"] = json!(id);
+        Ok(v)
+    }
+
+    /// `browser.logs`: what a page logged, threw and loaded, as the
+    /// recorder in `browser.rs` saw it.
+    fn rpc_logs(&mut self, p: &Value, caller: PaneId, cx: &mut Context<Self>) -> Result<Value, String> {
+        let id = self.browser_target(p, caller, cx)?;
+        let PaneKind::Browser(b) = &self.panes[&id].kind else {
+            return Err(format!("pane {id} is not a browser"));
+        };
+        let q = crate::browser::LogQuery::from_params(p)?;
+        let mut v = b.update(cx, |b, _| b.logs(&q));
+        v["pane"] = json!(id);
+        Ok(v)
+    }
+
+    /// `browser.shot`: a PNG of one page, cut from the window's picture.
+    fn rpc_browser_shot(
+        &mut self,
+        p: &Value,
+        caller: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let id = self.browser_target(p, caller, cx)?;
+        let PaneKind::Browser(b) = &self.panes[&id].kind else {
+            return Err(format!("pane {id} is not a browser"));
+        };
+        let area = b.read(cx).page_bounds().ok_or_else(|| {
+            format!("pane {id}'s page is not on screen; bring it up with `deck pane focus --pane {id}`")
+        })?;
+        let out = str_param(p, "out")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| control::socket_dir().join(format!("pane-{id}.png")));
+        crate::shot::capture_area(window, area, &out)
+            .map(|(w, h)| json!({ "pane": id, "path": out, "width": w, "height": h }))
     }
 
     // -- rendering ----------------------------------------------------------
@@ -4460,6 +5687,70 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// A side panel's inner edge as a grip: the gutter beside it, with a
+    /// line on hover. `left`: the sidebar's; else the inspector's.
+    fn side_handle(&self, left: bool, cx: &mut Context<Self>) -> AnyElement {
+        let group = SharedString::from(if left { "side-grip-l" } else { "side-grip-r" });
+        let active = self.side_drag.is_some_and(|(l, ..)| l == left);
+        let at = if left { self.sidebar_px } else { self.inspector_px } - theme::GUTTER / 2. - 3.;
+        div()
+            .id(ElementId::Name(group.clone()))
+            .group(group.clone())
+            .absolute()
+            .top(px(theme::TITLEBAR_PX))
+            .bottom(px(0.))
+            .w(u(6.))
+            .when(left, |d| d.left(u(at)))
+            .when(!left, |d| d.right(u(at)))
+            .flex()
+            .justify_center()
+            .cursor_col_resize()
+            .child(
+                div()
+                    .w(u(2.))
+                    .h_full()
+                    .rounded(u(1.))
+                    .bg(rgba(theme::focus_edge()))
+                    .when(!active, |d| d.opacity(0.).group_hover(group, |s| s.opacity(0.6))),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |ws, ev: &gpui::MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    if ev.click_count == 2 {
+                        if left {
+                            ws.sidebar_px = theme::SIDEBAR_PX;
+                        } else {
+                            ws.inspector_px = theme::INSPECTOR_PX;
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    let from = if left { ws.sidebar_px } else { ws.inspector_px };
+                    ws.side_drag = Some((left, f32::from(ev.position.x), from));
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn drag_side(&mut self, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((left, start, from)) = self.side_drag else {
+            return;
+        };
+        if ev.pressed_button != Some(MouseButton::Left) {
+            self.side_drag = None;
+            cx.notify();
+            return;
+        }
+        let moved = (f32::from(ev.position.x) - start) / self.settings.zoom;
+        if left {
+            self.sidebar_px = (from + moved).clamp(SIDEBAR_MIN, SIDEBAR_MAX).round();
+        } else {
+            self.inspector_px = (from - moved).clamp(INSPECTOR_MIN, INSPECTOR_MAX).round();
+        }
+        cx.notify();
+    }
+
     /// The pointer moved while a divider is held: share the two panes'
     /// pixels out again, keeping each at least a usable width.
     fn drag_divider(&mut self, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -4503,17 +5794,12 @@ impl Workspace {
         let body = view
             .cached(StyleRefinement::default().size_full())
             .into_any_element();
-        let dim = multi && !focused;
-        if let PaneKind::Browser(b) = &pane.kind {
-            // A page is a native view gpui cannot paint over, so it dims itself.
-            b.update(cx, |b, _| b.set_dimmed(dim));
-        }
         div()
             .relative()
             .size_full()
             .bg(rgb(theme::pane()))
-            // In a split, the focused card has the brighter edge and the
-            // others step back a little: where keys go, without a stripe.
+            // In a split, the focused card has the brighter edge: where
+            // keys go, without a stripe or fading the others.
             .when(multi, |d| {
                 d.rounded(u(theme::CARD_RADIUS))
                     .overflow_hidden()
@@ -4542,16 +5828,6 @@ impl Workspace {
                 }),
             )
             .child(body)
-            .when(dim && !matches!(pane.kind, PaneKind::Browser(_)), |d| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .bg(rgba(theme::veil())),
-                )
-            })
             .into_any_element()
     }
 
@@ -4571,9 +5847,9 @@ impl Workspace {
                 ..
             }) => (Icon::agent(c.read(cx).agent.as_str()), theme::text()),
             Some(Pane {
-                kind: PaneKind::Browser(_),
+                kind: PaneKind::Browser(b),
                 ..
-            }) => (Icon::Globe, theme::text()),
+            }) => (if b.read(cx).is_editor() { Icon::Code } else { Icon::Globe }, theme::text()),
             Some(Pane {
                 kind: PaneKind::Settings(_),
                 ..
@@ -4593,21 +5869,87 @@ impl Workspace {
     /// The sidebar is an inbox, as in T3 Code: the control chat first, then
     /// threads with what each one needs from you, then the terminals and
     /// pages they opened. Empty sections are not drawn.
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut threads: Vec<(usize, Instant)> = Vec::new();
-        let mut workspace: Vec<usize> = Vec::new();
+    /// The project a tab belongs to: its first pane's (a terminal's or
+    /// chat's folder, an editor's root). Pages and the rest go under "Web".
+    fn tab_project(&self, tab: &Tab, cx: &App) -> (String, Option<PathBuf>) {
+        let first = tab.leaves()[0];
+        if let Some(place) = self.places.get(&first) {
+            let root = crate::inspect::project_root(&place.cwd);
+            return (place.project.clone(), Some(root));
+        }
+        if let Some(PaneKind::Browser(b)) = self.panes.get(&first).map(|p| &p.kind) {
+            if let Some(e) = b.read(cx).editor() {
+                let name = e.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                return (name, Some(e.root));
+            }
+        }
+        (String::new(), None)
+    }
+
+    /// The sidebar's projects, in order (the first one opened first), each
+    /// with its tabs: its chats and agents, most recent first, then the rest
+    /// as they were opened. Tabs in no project come last, as "Web".
+    fn project_groups(&self, cx: &App) -> Vec<ProjectGroup> {
+        let mut groups: Vec<ProjectGroup> = Vec::new();
+        let mut loose = ProjectGroup { name: String::new(), root: None, threads: Vec::new(), others: Vec::new() };
         for (ix, tab) in self.tabs.iter().enumerate() {
             // The control chat has its own row; a task's work, its task's.
             if tab.pinned || self.is_task_tab(tab, cx) {
                 continue;
             }
+            let (name, root) = self.tab_project(tab, cx);
+            let group = if name.is_empty() {
+                &mut loose
+            } else {
+                match groups.iter().position(|g| g.name == name) {
+                    Some(i) => &mut groups[i],
+                    None => {
+                        groups.push(ProjectGroup { name, root, threads: Vec::new(), others: Vec::new() });
+                        groups.last_mut().expect("just pushed")
+                    }
+                }
+            };
             match self.group(tab) {
-                Group::Threads => threads.push((ix, self.last_active(tab.leaves()[0], cx))),
-                Group::Workspace => workspace.push(ix),
+                Group::Threads => group.threads.push((ix, self.last_active(tab.leaves()[0], cx))),
+                Group::Workspace => group.others.push(ix),
             }
         }
-        // Most recent first: the thread that just finished is the one to read.
-        threads.sort_by_key(|t| std::cmp::Reverse(t.1));
+        for g in &mut groups {
+            g.threads.sort_by_key(|t| std::cmp::Reverse(t.1));
+        }
+        loose.threads.sort_by_key(|t| std::cmp::Reverse(t.1));
+        if !loose.threads.is_empty() || !loose.others.is_empty() {
+            groups.push(loose);
+        }
+        groups
+    }
+
+    /// ⌘1 opens Control; ⌘2–⌘9 a project: the tab in it you were last
+    /// in (its most recent chat when there is one).
+    fn go_to_place(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if n == 1 {
+            match self.control_tab() {
+                Some(ix) => self.activate(ix, window, cx),
+                None => self.new_control(window, cx),
+            }
+            return;
+        }
+        let groups = self.project_groups(cx);
+        let Some(g) = groups.get(n - 2).or(if n == 9 { groups.last() } else { None }) else {
+            return;
+        };
+        let ix = g
+            .tabs()
+            .max_by_key(|&ix| self.tabs.get(ix).map(|t| self.last_active(t.focused, cx)))
+            .or_else(|| g.tabs().next());
+        if let Some(ix) = ix {
+            self.folded.remove(&g.name);
+            self.activate(ix, window, cx);
+        }
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let groups = self.project_groups(cx);
 
         let header = |label: &'static str| {
             div()
@@ -4634,20 +5976,22 @@ impl Workspace {
             .px(u(theme::GUTTER))
             .pb(u(theme::GUTTER))
             .child(
+                // The first row, on the same edges as every row under it:
+                // a tint marks it as the action, no box around it.
                 div()
                     .id("new-chat")
+                    .group("new-chat")
                     .flex()
                     .items_center()
                     .gap(u(ROW_GAP))
-                    .h(u(34.))
-                    .pl(u(theme::ROW_PAD - 1.))
-                    .pr(u(ROW_END + 4.))
-                    .mb(u(6.))
-                    .rounded(u(10.))
-                    .bg(rgb(theme::raised()))
-                    .border_1()
-                    .border_color(rgba(theme::hairline()))
+                    .h(u(32.))
+                    .pl(u(theme::ROW_PAD))
+                    .pr(u(ROW_END + 6.))
+                    .mb(u(4.))
+                    .rounded(u(theme::ROW_RADIUS))
+                    .bg(rgba(theme::tint()))
                     .text_size(u(13.))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(rgb(theme::text()))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgb(theme::surface())))
@@ -4656,7 +6000,10 @@ impl Workspace {
                     .child(
                         div()
                             .text_size(u(11.))
+                            .font_weight(FontWeight::NORMAL)
                             .text_color(rgb(theme::dim()))
+                            .invisible()
+                            .group_hover("new-chat", |s| s.visible())
                             .child(hint("new-chat", &self.settings.keys)),
                     )
                     .on_click(cx.listener(|ws, _, window, cx| {
@@ -4665,7 +6012,8 @@ impl Workspace {
                             cwd: ws.focused_cwd(cx),
                         };
                         if ws.new_tab(what, None, window, cx).is_err() {
-                            ws.picker = true;
+                            let at = ws.agent_menu_at();
+                            ws.open_agent_menu(at, window, cx);
                             cx.notify();
                         }
                     })),
@@ -4685,62 +6033,41 @@ impl Workspace {
             }
         }
 
-        list = list.child(
-            header("Threads").child(
-                icon_button(
-                    "agents-plus",
-                    if self.picker {
-                        Icon::ChevronDown
-                    } else {
-                        Icon::Plus
-                    },
-                )
-                .size(u(22.))
-                .on_click(cx.listener(|ws, _, _, cx| {
-                    ws.picker = !ws.picker;
-                    cx.notify();
-                })),
-            ),
-        );
-        if self.picker {
-            list = list.child(self.render_picker(cx));
+        // New agents: the picker, under its own small header.
+        if !groups.is_empty() {
+            list = list.child(
+                header("Projects").child(
+                    icon_button("agents-plus", Icon::Plus)
+                        .size(u(22.))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            ws.open_agent_menu(ev.position, window, cx);
+                        })),
+                ),
+            );
+        } else {
+            list = list.child(self.render_sidebar_empty(cx));
         }
-        for (ix, _) in &threads {
-            list = list.child(self.render_thread_row(*ix, cx));
-        }
-
-        if !workspace.is_empty() {
-            list =
-                list.child(
-                    header("Workspace")
-                        .child(
-                            icon_button("ws-term", Icon::Terminal)
-                                .size(u(22.))
-                                .on_click(cx.listener(|ws, _, w, cx| {
-                                    let what = ws.shell_here(cx);
-                                    let _ = ws.new_tab(what, None, w, cx);
-                                })),
-                        )
-                        .child(icon_button("ws-web", Icon::Globe).size(u(22.)).on_click(
-                            cx.listener(|ws, _, w, cx| {
-                                if ws
-                                    .new_tab(
-                                        Open::Browser {
-                                            url: "about:blank".into(),
-                                        },
-                                        None,
-                                        w,
-                                        cx,
-                                    )
-                                    .is_ok()
-                                {
-                                    ws.focus_address(w, cx);
-                                }
-                            }),
-                        )),
-                );
-            for ix in workspace {
-                list = list.child(self.render_tab_row(ix, &self.tabs[ix], cx));
+        // Folded projects stack close as one list; an open one gets room
+        // after its rows, so groups read by space rather than lines.
+        let mut prev_open = false;
+        for (gi, g) in groups.iter().enumerate() {
+            let gap = if gi == 0 { 2. } else if prev_open { 12. } else { 0. };
+            list = list.child(self.render_project_header(g, gi, gap, cx));
+            prev_open = !self.folded.contains(&g.name);
+            if self.folded.contains(&g.name) {
+                continue;
+            }
+            // In the order they were opened: a row never jumps because its
+            // agent printed something or because claude started in it.
+            let mut ixs: Vec<usize> = g.tabs().collect();
+            ixs.sort_unstable();
+            for ix in ixs {
+                list = list.child(if g.threads.iter().any(|t| t.0 == ix) {
+                    self.render_thread_row(ix, cx)
+                } else {
+                    self.render_tab_row(ix, &self.tabs[ix], cx)
+                });
             }
         }
 
@@ -4748,7 +6075,7 @@ impl Workspace {
             .flex()
             .flex_col()
             .flex_none()
-            .w(u(theme::SIDEBAR_PX))
+            .w(u(self.sidebar_px))
             .h_full()
             .child(
                 // The traffic lights live here; the native titlebar under it
@@ -4809,7 +6136,258 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// When the pane last did something, for ordering and "5m ago".
+    /// The sidebar with nothing open yet: the few ways to start, each with
+    /// its shortcut, instead of empty space.
+    fn render_sidebar_empty(&self, cx: &mut Context<Self>) -> AnyElement {
+        let row = |id: &'static str, glyph: Icon, label: &'static str, key: Option<SharedString>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap(u(ROW_GAP))
+                .h(u(32.))
+                .px(u(theme::ROW_PAD))
+                .rounded(u(theme::ROW_RADIUS))
+                .text_size(u(13.))
+                .text_color(rgb(theme::text_2()))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                .child(icon(glyph, 14., theme::text_2()))
+                .child(div().flex_1().child(label))
+                .children(key.map(|k| div().text_size(u(11.)).text_color(rgb(theme::dim())).child(k)))
+        };
+        let keys = &self.settings.keys;
+        div()
+            .flex()
+            .flex_col()
+            .gap(u(2.))
+            .mt(u(18.))
+            .child(
+                div()
+                    .px(u(theme::ROW_PAD))
+                    .pb(u(8.))
+                    .text_size(u(12.))
+                    .line_height(u(17.))
+                    .text_color(rgb(theme::dim()))
+                    .child("Chats, terminals and pages you open show up here, grouped by project."),
+            )
+            .child(row("empty-term", Icon::Terminal, "New terminal", Some(hint("new-terminal", keys))).on_click(cx.listener(
+                |ws, _, w, cx| {
+                    let what = ws.shell_here(cx);
+                    let _ = ws.new_tab(what, None, w, cx);
+                },
+            )))
+            .child(row("empty-files", Icon::Code, "Open the editor", Some(hint("files", keys))).on_click(cx.listener(
+                |ws, _, w, cx| {
+                    let _ = ws.open_editor("files", None, None, w, cx);
+                },
+            )))
+            .child(row("empty-web", Icon::Globe, "New browser tab", Some(hint("new-browser", keys))).on_click(cx.listener(
+                |ws, _, w, cx| {
+                    if ws.new_tab(Open::Browser { url: "about:blank".into() }, None, w, cx).is_ok() {
+                        ws.focus_address(w, cx);
+                    }
+                },
+            )))
+            .child(
+                row("empty-agents", Icon::Plus, "Start an agent…", Some(hint("agents", keys))).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|ws, ev: &gpui::MouseDownEvent, w, cx| {
+                        cx.stop_propagation();
+                        ws.open_agent_menu(ev.position, w, cx);
+                    }),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// A project's header: its name, whether anything in it works or needs
+    /// you, its ⌘ number, and (on hover) a new chat or terminal there. A
+    /// click folds it.
+    /// A project's header: the fold chevron in the icon column and the name
+    /// on the same edge as every row's title, so the list keeps two edges.
+    /// Folded it says how many tabs it holds; hovered, it offers a new chat
+    /// or terminal there.
+    fn render_project_header(&self, g: &ProjectGroup, gi: usize, gap: f32, cx: &mut Context<Self>) -> AnyElement {
+        let name = g.name.clone();
+        let loose = name.is_empty();
+        let folded = self.folded.contains(&name);
+        let statuses: Vec<Option<Status>> = g
+            .tabs()
+            .filter_map(|ix| self.tabs.get(ix))
+            .flat_map(|t| t.leaves())
+            .map(|id| self.status(id, cx))
+            .collect();
+        let working = statuses.contains(&Some(Status::Working));
+        let wants = statuses.contains(&Some(Status::Attention));
+        // The dot takes the colour of the agent at work, as its row does.
+        let busy_color = g
+            .tabs()
+            .filter_map(|ix| self.tabs.get(ix))
+            .flat_map(|t| t.leaves())
+            .find(|id| self.status(*id, cx) == Some(Status::Working))
+            .map(|id| live(self.tab_icon(id, cx).0))
+            .unwrap_or_else(theme::accent);
+        let here = g.tabs().any(|ix| ix == self.active);
+        let count = g.threads.len() + g.others.len();
+        let hover = SharedString::from(format!("proj-{gi}"));
+        let root = g.root.clone();
+        let (r1, r2) = (root.clone(), root);
+        let label: SharedString = if !loose {
+            name.clone().into()
+        } else if self.loose_is_web(g, cx) {
+            "Web".into()
+        } else {
+            "Other".into()
+        };
+        let toggle = name.clone();
+        div()
+            .id(ElementId::NamedInteger("project".into(), gi as u64))
+            .group(hover.clone())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(ROW_GAP))
+            .h(u(30.))
+            .mt(u(gap))
+            .pl(u(theme::ROW_PAD))
+            .pr(u(ROW_END))
+            .rounded(u(theme::ROW_RADIUS))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(theme::row_hover())))
+            .on_click(cx.listener(move |ws, _, _, cx| {
+                if !ws.folded.remove(&toggle) {
+                    ws.folded.insert(toggle.clone());
+                }
+                cx.notify();
+            }))
+            .child(lead(icon(
+                if folded { Icon::ChevronRight } else { Icon::ChevronDown },
+                12.,
+                theme::dim(),
+            )))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(u(12.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(if here { theme::text() } else { theme::text_2() }))
+                    .child(label),
+            )
+            // What's going on inside, readable even when folded.
+            .when(wants, |d| d.child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(theme::DANGER))))
+            .when(working && !wants, |d| {
+                d.child(div().flex_none().size(u(6.)).rounded_full().bg(rgb(busy_color)))
+            })
+            .child(
+                // The count while folded, swapped for actions on hover.
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_end()
+                    .min_w(u(22.))
+                    .relative()
+                    .child(
+                        div()
+                            .when(!folded, |d| d.invisible())
+                            .when(!loose, |d| d.group_hover(hover.clone(), |s| s.invisible()))
+                            .pr(u(6.))
+                            .text_size(u(11.))
+                            .text_color(rgb(theme::dim()))
+                            .child(count.to_string()),
+                    )
+                    .when(!loose, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .right_0()
+                                .flex()
+                                .gap(u(2.))
+                                .invisible()
+                                .group_hover(hover.clone(), |s| s.visible())
+                                .child(
+                                    icon_button(SharedString::from(format!("proj-chat-{gi}")), Icon::Plus)
+                                        .size(u(22.))
+                                        .on_click(cx.listener(move |ws, _, w, cx| {
+                                            cx.stop_propagation();
+                                            let what = Open::Chat { agent: None, cwd: r1.clone() };
+                                            if ws.new_tab(what, None, w, cx).is_err() {
+                                                let at = ws.agent_menu_at();
+                                                ws.open_agent_menu(at, w, cx);
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    icon_button(SharedString::from(format!("proj-term-{gi}")), Icon::Terminal)
+                                        .size(u(22.))
+                                        .on_click(cx.listener(move |ws, _, w, cx| {
+                                            cx.stop_propagation();
+                                            let what = Open::Terminal { cmd: None, cwd: r2.clone() };
+                                            let _ = ws.new_tab(what, None, w, cx);
+                                        })),
+                                ),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The loose group holds only pages: call it Web, else Other.
+    fn loose_is_web(&self, g: &ProjectGroup, _cx: &App) -> bool {
+        g.tabs().filter_map(|ix| self.tabs.get(ix)).all(|t| {
+            t.leaves()
+                .iter()
+                .all(|id| matches!(self.panes.get(id).map(|p| &p.kind), Some(PaneKind::Browser(_))))
+        })
+    }
+
+    /// A shell's row: what runs in it, the program's own title, or the
+    /// folder; then where it is in the project. Never the same thing twice.
+    fn terminal_row_text(&self, id: PaneId, cx: &App) -> Option<(SharedString, SharedString)> {
+        let pane = self.panes.get(&id)?;
+        if pane.agent.is_some() {
+            return None;
+        }
+        let PaneKind::Terminal(t) = &pane.kind else { return None };
+        let t = t.read(cx);
+        let place = self.places.get(&id);
+        let folder = place.map(|p| if p.sub.is_empty() { p.project.clone() } else { p.sub.clone() });
+        let running = t
+            .job()
+            .filter(|b| b.running())
+            .and_then(|b| b.command)
+            .map(|c| c.lines().next().unwrap_or("").chars().take(60).collect::<String>());
+        let own = clean_title(&t.title).filter(|ti| {
+            !is_shell(ti)
+                && place.and_then(|p| p.front.as_deref()).is_none_or(|f| !is_shell(f) || !ti.eq_ignore_ascii_case(f))
+                && !ti.starts_with('~')
+                && !ti.starts_with('/')
+        });
+        let own = own.map(|t| self.own_agent_title(id, t, cx));
+        let title = running
+            .clone()
+            .or(own)
+            .or_else(|| folder.clone())
+            .unwrap_or_else(|| "Terminal".into());
+        // An agent typed into the shell: say which one.
+        let agent = place
+            .and_then(|p| p.agent.as_ref())
+            .and_then(|(cmd, _)| AGENTS.iter().find(|a| a.cmd == *cmd))
+            .map(|a| a.name.to_string());
+        let sub = match (&running, place) {
+            _ if agent.is_some() => agent.unwrap_or_default(),
+            (Some(_), Some(p)) => p.label(),
+            (None, Some(p)) if !p.sub.is_empty() && title != p.sub => p.label(),
+            _ => "Terminal".into(),
+        };
+        let sub = if sub == title { "Terminal".to_string() } else { sub };
+        Some((title.into(), sub.into()))
+    }
+
     fn last_active(&self, id: PaneId, cx: &App) -> Instant {
         match self.panes.get(&id).map(|p| &p.kind) {
             Some(PaneKind::Chat(c)) => c.read(cx).last_activity,
@@ -4878,11 +6456,24 @@ impl Workspace {
             .rounded(u(theme::ROW_RADIUS))
             .cursor_pointer()
             .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+            .when(!active && (working || wants), |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+            .when(!active && !working && !wants, |d| {
+                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
+            })
             .child(lead(if working {
-                thinking("control-think", glyph, 15., theme::text())
+                thinking("control-think", glyph, 15., live(glyph))
             } else {
-                icon(glyph, 15., theme::text())
+                icon(
+                    glyph,
+                    15.,
+                    if wants {
+                        live(glyph)
+                    } else if active {
+                        theme::text()
+                    } else {
+                        theme::text_2()
+                    },
+                )
             }))
             .child(
                 div()
@@ -4955,6 +6546,7 @@ impl Workspace {
 
     /// A thread: its title, then who is doing it and what it needs from you.
     fn render_thread_row(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let indent = ROW_INDENT;
         let Some(tab) = self.tabs.get(ix) else {
             return div().into_any_element();
         };
@@ -4966,14 +6558,11 @@ impl Workspace {
             Some(Pane {
                 kind: PaneKind::Chat(c),
                 ..
-            }) => match project {
-                Some(p) => format!("{} · {p}", c.read(cx).agent_name()).into(),
-                None => c.read(cx).agent_name(),
-            },
-            Some(Pane { agent: Some(a), .. }) => match project {
-                Some(p) => format!("{} · {p}", a.name).into(),
-                None => format!("{} · terminal", a.name).into(),
-            },
+            }) => {
+                let _ = &project;
+                c.read(cx).agent_name()
+            }
+            Some(Pane { agent: Some(a), .. }) => format!("{} · terminal", a.name).into(),
             _ => "".into(),
         };
         let working = self.status(first, cx) == Some(Status::Working);
@@ -4995,24 +6584,29 @@ impl Workspace {
             .items_center()
             .gap(u(ROW_GAP))
             .h(u(ROW_TWO_LINE))
-            .pl(u(theme::ROW_PAD))
+            .pl(u(theme::ROW_PAD + indent))
             .pr(u(ROW_END))
             .rounded(u(theme::ROW_RADIUS))
             .cursor_pointer()
             .when(active, |d| d.bg(rgb(theme::surface())))
-            .when(!active, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+            .when(!active && loud, |d| d.hover(|s| s.bg(rgb(theme::row_hover()))))
+            .when(!active && !loud, |d| {
+                d.opacity(IDLE_FADE).hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
+            })
             .child(lead(if working {
                 thinking(
                     ElementId::NamedInteger("thread-think".into(), ix as u64),
                     glyph,
                     15.,
-                    theme::text(),
+                    live(glyph),
                 )
             } else {
                 icon(
                     glyph,
                     15.,
-                    if active || loud {
+                    if wants {
+                        live(glyph)
+                    } else if active || loud {
                         theme::text()
                     } else {
                         theme::text_2()
@@ -5100,20 +6694,14 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The agent launcher. A row starts a structured chat (the control
-    /// plane) when deck can drive that agent; the terminal button beside it
-    /// runs the agent's own TUI in a tab instead.
-    fn render_picker(&self, cx: &mut Context<Self>) -> AnyElement {
-        // Concentric: rows are radius 6 inside 4px of padding, so the card is 10.
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .gap(u(2.))
-            .p(u(4.))
-            .rounded(u(10.))
-            .bg(rgb(theme::pane()))
-            .border_1()
-            .border_color(rgb(theme::border()));
+    /// New agents as a menu: a chat with each one that has one, its own
+    /// terminal UI for the rest; ones not installed are listed, greyed.
+    fn open_agent_menu(&mut self, at: gpui::Point<gpui::Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::menu::{Entry, Item};
+        let ws = cx.entity().downgrade();
+        let mut chats: Vec<Entry> = Vec::new();
+        let mut tuis: Vec<Entry> = Vec::new();
+        let mut missing: Vec<Entry> = Vec::new();
         for agent in AGENTS {
             let installed = self.installed.iter().any(|a| a.cmd == agent.cmd);
             let chat = self
@@ -5121,92 +6709,76 @@ impl Workspace {
                 .as_ref()
                 .and_then(|env| env.registry.get(&agent_core::AgentId::new(agent.cmd)))
                 .is_some_and(|e| e.is_ready());
-            let note = match (chat, installed, self.chats.is_some()) {
-                (true, _, _) => "chat",
-                (false, true, false) => "…",
-                (false, true, true) => "terminal",
-                (false, false, _) => "not installed",
-            };
-            col = col.child(
-                div()
-                    .id(ElementId::Name(agent.cmd.into()))
-                    .flex()
-                    .items_center()
-                    .gap(u(10.))
-                    .h(u(32.))
-                    .pl(u(8.))
-                    .pr(u(3.))
-                    .rounded(u(6.))
-                    .text_size(u(13.))
-                    .when(installed, |d| {
-                        d.cursor_pointer()
-                            .text_color(rgb(theme::text()))
-                            .hover(|s| s.bg(rgb(theme::surface())))
-                            .on_click(cx.listener(move |ws, _, window, cx| {
-                                let what = if chat {
-                                    Open::Chat {
-                                        agent: Some(agent.cmd.into()),
-                                        cwd: ws.focused_cwd(cx),
-                                    }
-                                } else {
-                                    Open::Terminal {
-                                        cmd: Some(agent.cmd.into()),
-                                        cwd: ws.focused_cwd(cx),
-                                    }
-                                };
-                                let tui = (!chat).then_some(agent);
-                                let _ = ws.new_tab(what, tui, window, cx);
-                            }))
-                    })
-                    .when(!installed, |d| d.text_color(rgb(theme::dim())))
-                    .child(icon(
-                        Icon::agent(agent.cmd),
-                        15.,
-                        if installed {
-                            theme::text()
+            if !installed {
+                missing.push(
+                    Item::new(agent.name, |_, _| {})
+                        .icon(Icon::agent(agent.cmd))
+                        .shortcut("not installed")
+                        .disabled(true)
+                        .into(),
+                );
+                continue;
+            }
+            let open = |terminal: bool| {
+                let w = ws.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    let _ = w.update(cx, |ws, cx| {
+                        let cwd = ws.focused_cwd(cx);
+                        let what = if terminal {
+                            Open::Terminal { cmd: Some(agent.cmd.into()), cwd }
                         } else {
-                            theme::dim()
-                        },
-                    ))
-                    .child(div().flex_1().child(agent.name))
-                    .child(
-                        div()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(note),
-                    )
-                    .when(installed && chat, |d| {
-                        d.child(
-                            icon_button(
-                                ElementId::Name(format!("tui-{}", agent.cmd).into()),
-                                Icon::Terminal,
-                            )
-                            .size(u(24.))
-                            .on_click(cx.listener(
-                                move |ws, _, window, cx| {
-                                    cx.stop_propagation();
-                                    let what = Open::Terminal {
-                                        cmd: Some(agent.cmd.into()),
-                                        cwd: ws.focused_cwd(cx),
-                                    };
-                                    let _ = ws.new_tab(what, Some(agent), window, cx);
-                                },
-                            )),
-                        )
-                    }),
-            );
+                            Open::Chat { agent: Some(agent.cmd.into()), cwd }
+                        };
+                        let _ = ws.new_tab(what, terminal.then_some(agent), window, cx);
+                    });
+                }
+            };
+            if chat {
+                chats.push(Item::new(agent.name, open(false)).icon(Icon::agent(agent.cmd)).shortcut("chat").into());
+            }
+            tuis.push(Item::new(agent.name, open(true)).icon(Icon::agent(agent.cmd)).shortcut("terminal").into());
         }
-        col.into_any_element()
+        let mut entries = chats;
+        if !tuis.is_empty() {
+            if !entries.is_empty() {
+                entries.push(Entry::Separator);
+            }
+            entries.extend(tuis);
+        }
+        if !missing.is_empty() {
+            entries.push(Entry::Separator);
+            entries.extend(missing);
+        }
+        let restore = window.focused(cx);
+        self.menu = Some(crate::menu::open(entries, at, restore, window, cx, |ws: &mut Self, _, cx| {
+            ws.menu = None;
+            cx.notify();
+        }));
+        cx.notify();
+    }
+
+    /// Where the agents menu opens when no click placed it: under the
+    /// sidebar's New chat button.
+    fn agent_menu_at(&self) -> gpui::Point<gpui::Pixels> {
+        let z = self.settings.zoom;
+        gpui::point(px(theme::GUTTER * z), px(theme::TITLEBAR_PX * z + 44. * z))
     }
 
     fn render_tab_row(&self, ix: usize, tab: &Tab, cx: &mut Context<Self>) -> AnyElement {
+        let indent = ROW_INDENT;
         let active = ix == self.active;
         let first = tab.leaves()[0];
         let (glyph, tint) = self.tab_icon(first, cx);
         let status = self.status(first, cx);
         let count = tab.leaves().len();
         let group = SharedString::from(format!("tab-{ix}"));
-        let subtitle = self.pane_subtitle(tab.focused, cx);
+        // Every row has its second line, so they all stand the same height.
+        let shell = self.terminal_row_text(tab.focused, cx);
+        let subtitle = Some(match &shell {
+            Some((_, sub)) => sub.clone(),
+            None => self.row_detail(tab.focused, cx).unwrap_or_else(|| self.kind_label(tab.focused)),
+        });
+        let row_title = shell.map(|(t, _)| t).unwrap_or_else(|| self.pane_title(tab.focused, cx));
         let is_page = matches!(
             self.panes.get(&first).map(|p| &p.kind),
             Some(PaneKind::Browser(_))
@@ -5222,6 +6794,7 @@ impl Workspace {
             _ => false,
         };
         let busy = status == Some(Status::Working) || self.busy.contains(&first);
+        let wants = status == Some(Status::Attention);
         // An agent typed into a shell is shown as that agent, like a thread.
         let agent = self
             .places
@@ -5240,12 +6813,12 @@ impl Workspace {
                 ElementId::NamedInteger("tab-think".into(), ix as u64),
                 a,
                 15.,
-                theme::text(),
+                live(a),
             ),
             (_, true, None, _) if !is_page => spinner(
                 ElementId::NamedInteger("tab-busy".into(), ix as u64),
                 14.,
-                theme::text_2(),
+                theme::accent(),
             ),
             (_, _, Some(a), _) => icon(a, 15., tone),
             (_, _, _, Some(image)) => crate::browser::site_image(image, 15.),
@@ -5258,12 +6831,8 @@ impl Workspace {
             .flex()
             .items_center()
             .gap(u(ROW_GAP))
-            .h(u(if subtitle.is_some() {
-                ROW_TWO_LINE
-            } else {
-                32.
-            }))
-            .pl(u(theme::ROW_PAD))
+            .h(u(ROW_TWO_LINE))
+            .pl(u(theme::ROW_PAD + indent))
             .pr(u(ROW_END))
             .rounded(u(theme::ROW_RADIUS))
             .text_size(u(13.))
@@ -5271,9 +6840,14 @@ impl Workspace {
             .when(active, |d| {
                 d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
             })
-            .when(!active, |d| {
-                d.text_color(rgb(theme::text_2()))
+            .when(!active && (busy || wants), |d| {
+                d.text_color(rgb(theme::text()))
                     .hover(|s| s.bg(rgb(theme::row_hover())))
+            })
+            .when(!active && !busy && !wants, |d| {
+                d.text_color(rgb(theme::text_2()))
+                    .opacity(IDLE_FADE)
+                    .hover(|s| s.bg(rgb(theme::row_hover())).opacity(1.))
             })
             .child(lead(mark))
             // Definite-width boxes, so gpui knows where to put the ellipsis.
@@ -5283,12 +6857,7 @@ impl Workspace {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .child(
-                        div()
-                            .w_full()
-                            .truncate()
-                            .child(self.pane_title(tab.focused, cx)),
-                    )
+                    .child(div().w_full().truncate().child(row_title))
                     .children(subtitle.map(|sub| {
                         div()
                             .w_full()
@@ -5311,7 +6880,7 @@ impl Workspace {
                 )
             })
             // Something wants you: the bell. Idle needs no mark.
-            .when(status == Some(Status::Attention), |d| d.child(alert_pill()))
+            .when(wants, |d| d.child(alert_pill()))
             .child(
                 icon_button(
                     ElementId::NamedInteger("close".into(), ix as u64),
@@ -5332,6 +6901,190 @@ impl Workspace {
                     ws.open_tab_menu(ix, ev.position, window, cx)
                 }),
             )
+            .into_any_element()
+    }
+
+    /// The status bar: one strip along the window's bottom edge. Where you
+    /// are (branch, project) on the left; on the right what runs in the
+    /// background (commands in any tab, pages), the dev servers on this Mac
+    /// and the AI usage meter. Each item is a click away from its pane.
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let focused = self.focused();
+        let names: HashMap<PaneId, &str> = self.named.iter().map(|(n, id)| (*id, n.as_str())).collect();
+        let green = theme::palette().ansi[2];
+        let red = theme::DANGER;
+        let item = |id: ElementId, on: bool| {
+            div()
+                .id(id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(u(5.))
+                .h(u(20.))
+                .px(u(6.))
+                .rounded(u(5.))
+                .cursor_pointer()
+                .text_color(rgb(if on { theme::text() } else { theme::text_2() }))
+                .when(on, |d| d.bg(rgb(theme::surface())))
+                .when(!on, |d| d.hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))))
+        };
+        let dot = |color: u32| div().flex_none().size(u(6.)).rounded_full().bg(rgb(color));
+        let ring = |color: u32| {
+            div()
+                .flex_none()
+                .size(u(6.))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(color))
+        };
+        let sep = || div().flex_none().w(px(1.)).h(u(12.)).mx(u(6.)).bg(rgba(theme::hairline()));
+
+        // Running commands and pages, in tab order.
+        let mut jobs: Vec<AnyElement> = Vec::new();
+        // Which pane shows each local port, so a port is listed once.
+        let mut port_pane: HashMap<u16, PaneId> = HashMap::new();
+        for tab in &self.tabs {
+            for id in tab.leaves() {
+                let on = focused == Some(id);
+                match self.panes.get(&id).map(|p| &p.kind) {
+                    Some(PaneKind::Terminal(t)) => {
+                        let name = names.get(&id).copied();
+                        let job = t.read(cx).job();
+                        let running = job.as_ref().is_some_and(|b| b.running());
+                        let failed = job.as_ref().is_some_and(|b| !b.running() && b.exit.is_some_and(|c| c != 0));
+                        // Idle shells stay out; named panes and anything
+                        // running or just failed show.
+                        if name.is_none() && !running && !failed {
+                            continue;
+                        }
+                        let cmd = job.as_ref().and_then(|b| b.command.clone()).unwrap_or_default();
+                        let cmd: String = cmd.lines().next().unwrap_or("").chars().take(28).collect();
+                        let label = match name {
+                            Some(n) if !cmd.is_empty() => format!("{n} · {cmd}"),
+                            Some(n) => n.to_string(),
+                            None => cmd,
+                        };
+                        let state = if running { green } else if failed { red } else { theme::dim() };
+                        jobs.push(
+                            item(ElementId::NamedInteger("bar-pane".into(), id), on)
+                                .child(dot(state))
+                                .child(div().max_w(u(200.)).truncate().child(label))
+                                .on_click(cx.listener(move |ws, _, w, cx| ws.focus_pane(id, w, cx)))
+                                .into_any_element(),
+                        );
+                    }
+                    Some(PaneKind::Browser(b)) => {
+                        let b = b.read(cx);
+                        if b.is_blank() || b.is_editor() {
+                            continue;
+                        }
+                        // A local page is its port's item, on the right.
+                        if let Some(port) = url_port(&b.url) {
+                            port_pane.entry(port).or_insert(id);
+                            continue;
+                        }
+                        let host = crate::history::host(&b.url).to_string();
+                        let mark = match b.favicon() {
+                            Some(img) => crate::browser::site_image(img, 12.),
+                            None => icon(Icon::Globe, 12., theme::dim()),
+                        };
+                        jobs.push(
+                            item(ElementId::NamedInteger("bar-pane".into(), id), on)
+                                .child(mark)
+                                .child(div().max_w(u(180.)).truncate().child(host))
+                                .when(b.loading, |d| d.child(dot(theme::accent())))
+                                .on_click(cx.listener(move |ws, _, w, cx| ws.focus_pane(id, w, cx)))
+                                .into_any_element(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Dev servers: a filled dot when a pane shows it (a click goes
+        // there), a ring when none does (a click opens it beside you).
+        let mut ports: Vec<(u16, String)> = self.bar_ports.clone();
+        for &port in port_pane.keys() {
+            if !ports.iter().any(|(p, _)| *p == port) {
+                ports.push((port, String::new()));
+            }
+        }
+        ports.sort_by_key(|(p, _)| *p);
+        let ports: Vec<AnyElement> = ports
+            .into_iter()
+            .take(5)
+            .map(|(port, process)| {
+                let pane = port_pane.get(&port).copied();
+                let on = pane.is_some() && pane == focused;
+                item(ElementId::NamedInteger("bar-port".into(), port as u64), on)
+                    .child(if pane.is_some() { dot(green).into_any_element() } else { ring(green).into_any_element() })
+                    .child(format!("localhost:{port}"))
+                    .when(!process.is_empty(), |d| d.child(div().text_color(rgb(theme::dim())).child(process)))
+                    .on_click(cx.listener(move |ws, _, w, cx| match pane {
+                        Some(id) => ws.focus_pane(id, w, cx),
+                        None => ws.open_url_beside(&format!("http://localhost:{port}"), w, cx),
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        let place = self.bar_git.clone().map(|(project, branch)| {
+            div()
+                .id("bar-git")
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(u(5.))
+                .h(u(20.))
+                .px(u(6.))
+                .rounded(u(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
+                .children(branch.map(|b| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(5.))
+                        .child(icon(Icon::Git, 12., theme::text_2()))
+                        .child(div().max_w(u(160.)).truncate().text_color(rgb(theme::text())).child(b))
+                }))
+                .child(icon(Icon::Folder, 12., theme::dim()))
+                .child(div().max_w(u(160.)).truncate().child(project))
+                .on_click(cx.listener(|ws, _, w, cx| {
+                    if let Err(e) = ws.open_editor("changes", None, None, w, cx) {
+                        tracing::warn!("could not open the editor: {e}");
+                    }
+                }))
+        });
+        let meter = self.render_usage_meter(cx);
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(2.))
+            .h(u(26.))
+            .px(u(6.))
+            .border_t_1()
+            .border_color(rgba(theme::hairline()))
+            .bg(rgb(theme::sidebar()))
+            .text_size(u(11.5))
+            .text_color(rgb(theme::text_2()))
+            .children(place)
+            .child(div().flex_1().min_w(u(12.)))
+            .child(
+                div()
+                    .id("bar-jobs")
+                    .flex()
+                    .flex_shrink()
+                    .min_w_0()
+                    .items_center()
+                    .gap(u(2.))
+                    .overflow_x_scroll()
+                    .children(jobs),
+            )
+            .when(!ports.is_empty(), |d| d.child(sep()).children(ports))
+            .children(meter.map(|m| div().flex().flex_none().items_center().child(sep()).child(m)))
             .into_any_element()
     }
 
@@ -5427,6 +7180,13 @@ pub fn icon_button(id: impl Into<ElementId>, glyph: Icon) -> gpui::Stateful<gpui
 /// The content area never gets narrower than this to make room for chrome:
 /// past it the inspector folds away (and comes back when there is room).
 const MIN_CONTENT_PX: f32 = 520.;
+/// How far the side panels can be dragged.
+const SIDEBAR_MIN: f32 = 200.;
+const SIDEBAR_MAX: f32 = 440.;
+const INSPECTOR_MIN: f32 = 260.;
+const INSPECTOR_MAX: f32 = 560.;
+/// Narrower than this, even the inspector alone would crowd the panes out.
+const MIN_NARROW_PX: f32 = 360.;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Finish {
@@ -5459,8 +7219,136 @@ struct Resize {
 const ROW_SLOT: f32 = 16.;
 const ROW_GAP: f32 = 10.;
 const ROW_END: f32 = 4.;
-/// A row with a title and a line under it.
+/// A project's rows sit one step in from its header: their icons on the
+/// header's name, so the list reads as a tree.
+const ROW_INDENT: f32 = ROW_SLOT + ROW_GAP;
+/// Every sidebar row is this tall, a title and a line under it, so the list
+/// keeps one rhythm whatever is in it.
 const ROW_TWO_LINE: f32 = 44.;
+/// Rows with nothing going on step back; working ones keep full strength
+/// and their agent's colour.
+const IDLE_FADE: f32 = 0.9;
+
+/// The colour of a mark that is working: its agent's, else the accent.
+fn live(glyph: Icon) -> u32 {
+    glyph.brand().unwrap_or_else(theme::accent)
+}
+
+/// A usage bar: the share used, coloured as it nears the cap. `width` 0
+/// fills the row.
+fn meter_bar(pct: f32, width: f32) -> gpui::Div {
+    let track = div()
+        .h(u(if width > 0. { 4. } else { 5. }))
+        .rounded_full()
+        .overflow_hidden()
+        .bg(rgba(theme::alpha(theme::text(), 0x1c)));
+    let track = if width > 0. { track.w(u(width)).flex_none() } else { track.w_full() };
+    track.child(
+        div()
+            .h_full()
+            .w(gpui::relative((pct / 100.).clamp(0.02, 1.)))
+            .rounded_full()
+            .bg(rgb(level_color(pct))),
+    )
+}
+
+/// A share as Claude Code prints it: whole percent, rounded down, so the
+/// meter and its own status line agree.
+fn pct_text(pct: f32) -> String {
+    format!("{}%", pct.max(0.).floor() as u32)
+}
+
+/// Calm until a limit gets close: amber from 75%, red from 90%.
+fn level_color(pct: f32) -> u32 {
+    let p = theme::palette();
+    if pct >= 90. {
+        theme::DANGER
+    } else if pct >= 75. {
+        p.ansi[3]
+    } else {
+        theme::text_2()
+    }
+}
+
+/// "5-hour" → "5h", "Weekly" → "wk", for the meter.
+fn short_limit(label: &str) -> SharedString {
+    let l = label.to_lowercase();
+    if l.starts_with("5") {
+        "5h".into()
+    } else if l.contains("week") {
+        "wk".into()
+    } else {
+        label.to_string().into()
+    }
+}
+
+/// "resets in 2h 14m", or in days past a day.
+fn resets_in(at: std::time::SystemTime) -> String {
+    let secs = at.duration_since(std::time::SystemTime::now()).map(|d| d.as_secs()).unwrap_or(0);
+    match secs {
+        0 => "resets now".into(),
+        s if s < 3600 => format!("resets in {}m", s.div_ceil(60)),
+        s if s < 86_400 => format!("resets in {}h {}m", s / 3600, (s % 3600) / 60),
+        s => format!("resets in {}d {}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// 1234 → "1.2k", 3_400_000 → "3.4M".
+fn tokens(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+/// Whether a listening socket under one of our terminals is a dev server
+/// worth offering: not an app a terminal happened to start (Chrome's
+/// debugging port, an editor's helper), nor a port the system handed out at
+/// random, unless a known server runtime holds it.
+fn dev_server(port: u16, process: &str) -> bool {
+    let p = process.to_lowercase();
+    const APPS: &[&str] = &[
+        "chrome", "safari", "firefox", "arc", "brave", "edge", "electron", "code helper", "cursor", "slack", "discord",
+        "spotify", "figma", "zoom", "controlcenter", "rapportd", "claude", "codex", "ollama",
+    ];
+    if APPS.iter().any(|a| p.contains(a)) {
+        return false;
+    }
+    const RUNTIMES: &[&str] = &[
+        "node", "bun", "deno", "python", "ruby", "php", "java", "go", "dotnet", "beam", "vite", "next", "nuxt", "astro",
+        "wrangler", "workerd", "esbuild", "uvicorn", "gunicorn", "rails", "puma", "hugo", "zola", "caddy", "nginx",
+        "httpd", "trunk", "cargo",
+    ];
+    port < 49152 || RUNTIMES.iter().any(|r| p.starts_with(r))
+}
+
+/// The port of a local address (`http://localhost:3000/x` → 3000).
+fn url_port(url: &str) -> Option<u16> {
+    let rest = url.split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?;
+    let local = host.starts_with("localhost") || host.starts_with("127.0.0.1") || host.starts_with("[::1]") || host.starts_with("0.0.0.0");
+    local.then(|| host.rsplit(':').next()?.parse().ok()).flatten()
+}
+
+/// The branch checked out in `root`, from `.git/HEAD` (a worktree's `.git`
+/// file points at its own); a short hash when detached.
+fn git_head(root: &std::path::Path) -> Option<String> {
+    let dot = root.join(".git");
+    let dir = if dot.is_file() {
+        let text = std::fs::read_to_string(&dot).ok()?;
+        let p = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
+        if p.is_absolute() { p } else { root.join(p) }
+    } else {
+        dot
+    };
+    let head = std::fs::read_to_string(dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    Some(match head.strip_prefix("ref: refs/heads/") {
+        Some(branch) => branch.to_string(),
+        None => head.chars().take(7).collect(),
+    })
+}
 
 /// The leading mark of a sidebar row, centred in the shared slot, so icons,
 /// favicons and spinners of different sizes line up.
@@ -5508,6 +7396,50 @@ impl Render for Island {
         self.ws
             .update(cx, |ws, cx| draw(ws, window, cx))
             .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
+/// What `refresh_places` looks up for one pane, on a background thread.
+enum PlaceJob {
+    /// A terminal, by its shell's pid, and the folder the shell last
+    /// reported (OSC 7) for when its processes can't be read (`sudo`).
+    Shell(u32, Option<PathBuf>),
+    /// A chat, by its folder.
+    Dir(PathBuf),
+}
+
+impl PlaceJob {
+    fn place(self) -> Option<Place> {
+        match self {
+            PlaceJob::Dir(cwd) => Some(place_of(&cwd)),
+            PlaceJob::Shell(shell, said) => {
+                // What is in front is the terminal's foreground process
+                // group, not the deepest process: an agent's helpers (MCP
+                // servers, `caffeinate`) sit below it.
+                let fg = inspect::foreground(shell).unwrap_or(shell);
+                let mut front = (fg, inspect::process_name(fg));
+                let mut agent = agent_of(fg, &front.1);
+                // An agent tab runs its CLI under `sh -c`, which has no job
+                // control: the CLI shares the shell's group, so the group
+                // leader is the shell. Look below it for the agent.
+                if agent.is_none() && is_shell(&front.1) {
+                    if let Some((p, a)) = inspect::descendants(fg)
+                        .into_iter()
+                        .skip(1)
+                        .find_map(|p| agent_of(p.pid, &p.name).map(|a| (p, a)))
+                    {
+                        front = (p.pid, p.name);
+                        agent = Some(a);
+                    }
+                }
+                let cwd = inspect::cwd(front.0).or_else(|| inspect::cwd(shell)).or(said)?;
+                Some(Place {
+                    agent: agent.map(|(a, argv)| (a.cmd, argv)),
+                    front: Some(front.1),
+                    ..place_of(&cwd)
+                })
+            }
+        }
     }
 }
 
@@ -5613,9 +7545,12 @@ fn clean_title(t: &str) -> Option<String> {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let screen = self.locked || !crate::account::allowed();
-        if screen != self.screen_cover {
-            self.screen_cover = screen;
-            self.cover_pages(screen, cx);
+        // Pages are native views drawn above everything gpui paints: while a
+        // menu, the palette or a whole-window screen is up, they step aside.
+        let cover = screen || self.menu.is_some() || self.palette.is_some() || self.usage_open;
+        if cover != self.screen_cover {
+            self.screen_cover = cover;
+            self.cover_pages(cover, cx);
         }
         if self.locked {
             window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
@@ -5628,9 +7563,17 @@ impl Render for Workspace {
         let (sidebar, inspector) = self.islands(cx);
         window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
         let width = f32::from(window.viewport_size().width) / self.settings.zoom;
-        let sidebar_w = if self.sidebar { theme::SIDEBAR_PX } else { 0. };
+        // The inspector, once asked for, shows. In a window too narrow for
+        // both side panels the left one steps aside while it's open, as an
+        // IDE does, rather than the inspector silently not appearing.
         let inspector_shown =
-            self.inspector.open && width - sidebar_w - theme::INSPECTOR_PX >= MIN_CONTENT_PX;
+            self.inspector.open && width - self.inspector_px >= MIN_NARROW_PX;
+        let sidebar_shown = self.sidebar
+            && (!inspector_shown
+                || width - self.sidebar_px - self.inspector_px >= MIN_CONTENT_PX);
+        let code_shown = self
+            .focused_browser_pane()
+            .is_some_and(|b| b.read(cx).is_editor());
         // Native webviews in hidden tabs must be hidden explicitly.
         for (ix, tab) in self.tabs.iter().enumerate() {
             for id in tab.leaves() {
@@ -5660,7 +7603,7 @@ impl Render for Workspace {
             None => self.render_empty(cx),
         };
 
-        let left = if self.sidebar { 0. } else { theme::GUTTER };
+        let left = if sidebar_shown { 0. } else { theme::GUTTER };
         let topbar = div()
             .flex()
             .flex_none()
@@ -5669,20 +7612,25 @@ impl Render for Workspace {
             .h(px(theme::TITLEBAR_PX))
             .pr(u(theme::GUTTER))
             // The title sits on the same edge as the text in the card below.
-            .when(self.sidebar, |d| d.pl(u(theme::PANE_PAD_X + 1.)))
+            .when(sidebar_shown, |d| d.pl(u(theme::PANE_PAD_X + 1.)))
             // Clear of the traffic lights, which do not zoom.
-            .when(!self.sidebar, |d| d.pl(px(80.)))
+            .when(!sidebar_shown, |d| d.pl(px(80.)))
             .on_mouse_down(MouseButton::Left, |ev, window, _| {
                 if ev.click_count == 2 {
                     window.titlebar_double_click();
                 }
             })
-            .when(!self.sidebar, |d| {
+            .when(!sidebar_shown, |d| {
                 d.child(
                     icon_button("show-sidebar", Icon::Sidebar)
                         .mr(u(6.))
-                        .on_click(cx.listener(|ws, _, _, cx| {
+                        .on_click(cx.listener(|ws, _, w, cx| {
                             ws.sidebar = true;
+                            // Too narrow for both: the one asked for wins.
+                            let width = f32::from(w.viewport_size().width) / ws.settings.zoom;
+                            if width - ws.sidebar_px - ws.inspector_px < MIN_CONTENT_PX {
+                                ws.inspector.open = false;
+                            }
                             cx.notify();
                         })),
                 )
@@ -5705,6 +7653,15 @@ impl Render for Workspace {
                         let _ = ws.split(p, what, Axis::Row, w, cx);
                     }
                 })),
+            )
+            .child(
+                icon_button("open-code", Icon::Code)
+                    .when(code_shown, |d| d.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                    .on_click(cx.listener(|ws, _, w, cx| {
+                        if let Err(e) = ws.open_editor("files", None, None, w, cx) {
+                            tracing::warn!("could not open the editor: {e}");
+                        }
+                    })),
             )
             .child(
                 icon_button("open-web", Icon::Globe)
@@ -5744,24 +7701,63 @@ impl Render for Workspace {
                     })
                     .child(content),
             );
+        // The panels side by side, with the status bar under all of them.
+        let body = div()
+            .relative()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .when(sidebar_shown, |d| d.child(self.side_handle(true, cx)))
+            .when(inspector_shown, |d| d.child(self.side_handle(false, cx)))
+            .when(sidebar_shown, |d| {
+                d.child(
+                    AnyView::from(sidebar).cached(
+                        StyleRefinement::default()
+                            .flex_none()
+                            .w(u(self.sidebar_px))
+                            .h_full(),
+                    ),
+                )
+            })
+            .child(main)
+            .when(inspector_shown, |d| {
+                d.child(
+                    AnyView::from(inspector).cached(
+                        StyleRefinement::default()
+                            .flex_none()
+                            .w(u(self.inspector_px))
+                            .h_full(),
+                    ),
+                )
+            });
+        let bar = self.settings.status_bar.then(|| self.render_status_bar(cx));
 
         div()
             .relative()
             .size_full()
             .flex()
+            .flex_col()
             .bg(rgb(theme::sidebar()))
             .font_family(theme::UI)
             .on_mouse_move(cx.listener(Self::drag_divider))
+            .on_mouse_move(cx.listener(Self::drag_side))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|ws, _, _, cx| {
-                    if ws.resizing.take().is_some() {
+                    if ws.resizing.take().is_some() | ws.side_drag.take().is_some() {
                         cx.notify();
                     }
                 }),
             )
             .text_color(rgb(theme::text()))
             .on_action(cx.listener(|ws, _: &CommandPalette, w, cx| ws.toggle_palette(false, w, cx)))
+            .on_action(cx.listener(|ws, _: &QuickOpen, w, cx| {
+                // In the editor ⌘P is its own Quick Open; ⌘K is still Deck's.
+                match ws.focused_browser_pane().filter(|b| b.read(cx).is_editor()) {
+                    Some(b) => b.read(cx).editor_key("quickopen"),
+                    None => ws.toggle_palette(false, w, cx),
+                }
+            }))
             .on_action(cx.listener(|ws, _: &LockDeck, _, cx| ws.lock(cx)))
             .on_action(cx.listener(|ws, _: &InsertSnippet, w, cx| ws.toggle_palette(true, w, cx)))
             .on_action(cx.listener(|ws, _: &SaveSnippet, w, cx| ws.save_snippet(w, cx)))
@@ -5782,9 +7778,20 @@ impl Render for Workspace {
                 };
                 if let Err(e) = ws.new_tab(what, None, w, cx) {
                     tracing::warn!("new chat: {e}");
-                    ws.picker = true;
+                    let at = ws.agent_menu_at();
+                    ws.open_agent_menu(at, w, cx);
                     ws.sidebar = true;
                     cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|ws, _: &OpenFiles, w, cx| {
+                if let Err(e) = ws.open_editor("files", None, None, w, cx) {
+                    tracing::warn!("could not open the editor: {e}");
+                }
+            }))
+            .on_action(cx.listener(|ws, _: &OpenChanges, w, cx| {
+                if let Err(e) = ws.open_editor("changes", None, None, w, cx) {
+                    tracing::warn!("could not open the editor: {e}");
                 }
             }))
             .on_action(cx.listener(|ws, _: &NewBrowser, w, cx| {
@@ -5803,10 +7810,10 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|ws, _: &OpenSettings, w, cx| ws.open_settings(w, cx)))
-            .on_action(cx.listener(|ws, _: &ToggleAgents, _, cx| {
-                ws.picker = !ws.picker;
+            .on_action(cx.listener(|ws, _: &ToggleAgents, w, cx| {
                 ws.sidebar = true;
-                cx.notify();
+                let at = ws.agent_menu_at();
+                ws.open_agent_menu(at, w, cx);
             }))
             .on_action(cx.listener(|ws, _: &SplitRight, w, cx| {
                 if let Some(p) = ws.focused() {
@@ -5828,6 +7835,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|ws, _: &NextTab, w, cx| ws.cycle_tab(1, w, cx)))
             .on_action(cx.listener(|ws, _: &PrevTab, w, cx| ws.cycle_tab(-1, w, cx)))
             .on_action(cx.listener(|ws, _: &NextPane, w, cx| ws.cycle_pane(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &FocusLeft, w, cx| ws.focus_toward(Axis::Row, false, w, cx)))
+            .on_action(cx.listener(|ws, _: &FocusRight, w, cx| ws.focus_toward(Axis::Row, true, w, cx)))
+            .on_action(cx.listener(|ws, _: &FocusUp, w, cx| ws.focus_toward(Axis::Column, false, w, cx)))
+            .on_action(cx.listener(|ws, _: &FocusDown, w, cx| ws.focus_toward(Axis::Column, true, w, cx)))
             .on_action(cx.listener(|ws, _: &PrevPane, w, cx| ws.cycle_pane(-1, w, cx)))
             .on_action(cx.listener(|ws, _: &FocusAddress, w, cx| ws.focus_address(w, cx)))
             .on_action(cx.listener(|ws, _: &Reload, _, cx| {
@@ -5840,7 +7851,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|ws, _: &Find, w, cx| {
                 if let Some(b) = ws.focused_browser_pane() {
-                    b.update(cx, |b, cx| b.open_find(w, cx));
+                    if b.read(cx).is_editor() {
+                        // The editor searches its own files.
+                        b.read(cx).editor_key("find");
+                    } else {
+                        b.update(cx, |b, cx| b.open_find(w, cx));
+                    }
                 }
             }))
             .on_action(cx.listener(|ws, _: &FindNext, _, cx| {
@@ -5875,40 +7891,20 @@ impl Render for Workspace {
                     t.update(cx, |t, cx| t.clear(cx));
                 }
             }))
-            .on_action(cx.listener(|ws, _: &Tab1, w, cx| ws.activate(0, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab2, w, cx| ws.activate(1, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab3, w, cx| ws.activate(2, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab4, w, cx| ws.activate(3, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab5, w, cx| ws.activate(4, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab6, w, cx| ws.activate(5, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab7, w, cx| ws.activate(6, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab8, w, cx| ws.activate(7, w, cx)))
-            .on_action(cx.listener(|ws, _: &Tab9, w, cx| {
-                // ⌘9 is "last tab" everywhere else, so here too.
-                let last = ws.tabs.len().saturating_sub(1);
-                ws.activate(last, w, cx)
-            }))
-            .when(self.sidebar, |d| {
-                d.child(
-                    AnyView::from(sidebar).cached(
-                        StyleRefinement::default()
-                            .flex_none()
-                            .w(u(theme::SIDEBAR_PX))
-                            .h_full(),
-                    ),
-                )
-            })
-            .child(main)
-            .when(inspector_shown, |d| {
-                d.child(
-                    AnyView::from(inspector).cached(
-                        StyleRefinement::default()
-                            .flex_none()
-                            .w(u(theme::INSPECTOR_PX))
-                            .h_full(),
-                    ),
-                )
-            })
+            // ⌘1 is Control; ⌘2–9 are the projects, as the sidebar lists them.
+            .on_action(cx.listener(|ws, _: &Tab1, w, cx| ws.go_to_place(1, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab2, w, cx| ws.go_to_place(2, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab3, w, cx| ws.go_to_place(3, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab4, w, cx| ws.go_to_place(4, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab5, w, cx| ws.go_to_place(5, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab6, w, cx| ws.go_to_place(6, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab7, w, cx| ws.go_to_place(7, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab8, w, cx| ws.go_to_place(8, w, cx)))
+            .on_action(cx.listener(|ws, _: &Tab9, w, cx| ws.go_to_place(9, w, cx)))
+            // The side panels' edges (in `body`): drag to size them,
+            // double-click for the usual width.
+            .child(body)
+            .children(bar)
             .children(self.menu.as_ref().map(crate::menu::Open::render))
             // The palette floats over everything, a little above centre,
             // on a scrim that closes it when clicked.
@@ -5939,6 +7935,9 @@ impl Render for Workspace {
                             .child(p.clone()),
                     )
             }))
+            .when(self.usage_open && self.settings.status_bar, |d| {
+                d.child(self.render_usage_panel(cx))
+            })
             .children(self.notice.as_ref().map(|n| self.render_notice(n, cx)))
             .children(self.toast.as_ref().map(|(text, _)| {
                 div()
@@ -6573,7 +8572,7 @@ impl Workspace {
                 .bg(rgb(theme::accent()))
                 .text_size(u(11.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(rgb(0xffffff))
+                .text_color(rgb(theme::on_accent()))
                 .child(a.initial()),
             None => disc
                 .bg(rgb(theme::surface()))
@@ -6672,9 +8671,16 @@ impl Workspace {
             .into(),
         );
         // Under the avatar, its right edge on the window's.
+        // Hung from the avatar, its right edge just past the button: the
+        // avatar is not always at the window's edge (the inspector can sit
+        // to its right).
+        let zoom = self.settings.zoom;
         let width = window.viewport_size().width;
-        at.x = (width - px(crate::menu::MIN_W * self.settings.zoom + 12.)).max(px(0.));
-        at.y = px(theme::TITLEBAR_PX * self.settings.zoom);
+        let menu_w = px(crate::menu::MIN_W * zoom);
+        at.x = (at.x + px(18. * zoom) - menu_w)
+            .min(width - menu_w - px(8.))
+            .max(px(8.));
+        at.y = px(theme::TITLEBAR_PX * zoom);
         let restore = window.focused(cx);
         self.menu = Some(crate::menu::open(
             entries,
@@ -6729,7 +8735,7 @@ impl Workspace {
                 let State::Ready(_, path) = crate::updates::state() else {
                     return;
                 };
-                match crate::updates::install_on_quit(&path) {
+                match crate::updates::install_on_quit(&path, true) {
                     Ok(()) => cx.quit(),
                     Err(e) => self.flash(format!("Could not update: {e}"), cx),
                 }
@@ -6755,6 +8761,7 @@ impl Workspace {
         self.refresh_settings_panes(cx);
         cx.spawn(async move |this, cx| {
             let r = crate::updates::check().await;
+            let found = matches!(r, Ok(Some(_)));
             crate::updates::set(match r {
                 Ok(Some(rel)) => State::Available(rel),
                 Ok(None) => State::UpToDate,
@@ -6762,7 +8769,13 @@ impl Workspace {
                 Err(e) if by_hand => State::Failed(e),
                 Err(_) => State::Idle,
             });
-            let _ = this.update(cx, |ws, cx| ws.refresh_settings_panes(cx));
+            let _ = this.update(cx, |ws, cx| {
+                // Quiet updates: fetched now, put in place at the next quit.
+                if found && ws.settings.install_updates {
+                    ws.update_action(crate::settings_pane::UpdateAction::Download, cx);
+                }
+                ws.refresh_settings_panes(cx);
+            });
         })
         .detach();
     }
@@ -6833,6 +8846,36 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    #[test]
+    fn status_bar_lists_dev_servers_only() {
+        assert!(dev_server(5173, "node"));
+        assert!(dev_server(8000, "python3.12"));
+        assert!(!dev_server(49755, "Google Chrome"));
+        assert!(!dev_server(9222, "Google Chrome Helper"));
+        assert!(!dev_server(61234, "someapp"));
+        assert!(dev_server(61234, "bun"));
+    }
+
+    #[test]
+    fn status_bar_reads_ports_and_branches() {
+        assert_eq!(url_port("http://localhost:3000/app"), Some(3000));
+        assert_eq!(url_port("http://127.0.0.1:5173"), Some(5173));
+        assert_eq!(url_port("https://example.com:8443/"), None);
+        assert_eq!(url_port("http://localhost/"), None);
+        let root = std::env::temp_dir().join(format!("deck-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/feat/x\n").unwrap();
+        assert_eq!(git_head(&root).as_deref(), Some("feat/x"));
+        let wt = root.join("wt");
+        std::fs::create_dir_all(root.join(".git/worktrees/wt")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", root.join(".git/worktrees/wt").display())).unwrap();
+        std::fs::write(root.join(".git/worktrees/wt/HEAD"), "0123456789abcdef\n").unwrap();
+        assert_eq!(git_head(&wt).as_deref(), Some("0123456"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn leaves(n: &Node) -> Vec<PaneId> {
         let mut v = Vec::new();
         n.leaves(&mut v);
@@ -6871,6 +8914,30 @@ mod tests {
         assert!(t.remove(1));
         assert_eq!(t, Node::Leaf(2));
         assert!(!t.remove(7));
+    }
+
+    #[test]
+    fn neighbours_by_direction() {
+        // 1 | 2
+        //     -
+        //     4 | 5      (and 3 to the right of everything)
+        let mut t = Node::Leaf(1);
+        t.split(1, 2, Axis::Row);
+        t.split(2, 3, Axis::Row);
+        t.split(2, 4, Axis::Column);
+        t.split(4, 5, Axis::Row);
+        let go = |id, axis, fwd| t.neighbor(id, axis, fwd).flatten();
+        assert_eq!(go(1, Axis::Row, true), Some(2));
+        assert_eq!(go(2, Axis::Row, false), Some(1));
+        assert_eq!(go(2, Axis::Column, true), Some(4));
+        assert_eq!(go(4, Axis::Column, false), Some(2));
+        assert_eq!(go(4, Axis::Row, true), Some(5));
+        assert_eq!(go(5, Axis::Row, true), Some(3));
+        // Left from 3 lands on the stack beside it, at its top.
+        assert_eq!(go(3, Axis::Row, false), Some(2));
+        assert_eq!(go(1, Axis::Row, false), None);
+        assert_eq!(go(1, Axis::Column, true), None);
+        assert_eq!(t.neighbor(42, Axis::Row, true), None);
     }
 
     #[test]
