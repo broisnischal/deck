@@ -54,6 +54,27 @@
 	<string>A terminal or agent in Deck wants to use files on an external drive.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>A terminal or agent in Deck wants to use files on a network drive.</string>
+	<key>NSFileProviderDomainUsageDescription</key>
+	<string>A terminal or agent in Deck wants to use files in iCloud Drive, Dropbox or another cloud folder.</string>
+	<!-- Programs in its terminals reach these as Deck. -->
+	<key>NSContactsUsageDescription</key>
+	<string>A program in a Deck terminal wants to read your contacts.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>A program in a Deck terminal wants to use your calendars.</string>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>A program in a Deck terminal wants to use your calendars.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>A program in a Deck terminal wants to use your reminders.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>A program in a Deck terminal wants to use your reminders.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>A program in a Deck terminal wants to use your photo library.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>A program in Deck wants to turn speech into text.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>A program in a Deck terminal wants to use Bluetooth.</string>
+	<key>NSSystemAdministrationUsageDescription</key>
+	<string>A program in a Deck terminal wants to change system settings.</string>
 	<!-- What a terminal opens, so deck can be the default one. -->
 	<key>CFBundleDocumentTypes</key>
 	<array>

@@ -14,5 +14,15 @@
 	<true/>
 	<key>com.apple.security.personal-information.location</key>
 	<true/>
+	<!-- Programs in its terminals that use them (EventKit, Contacts, Photos
+	     scripts, Bluetooth tools) are seen as Deck. -->
+	<key>com.apple.security.personal-information.addressbook</key>
+	<true/>
+	<key>com.apple.security.personal-information.calendars</key>
+	<true/>
+	<key>com.apple.security.personal-information.photos-library</key>
+	<true/>
+	<key>com.apple.security.device.bluetooth</key>
+	<true/>
 </dict>
 </plist>
