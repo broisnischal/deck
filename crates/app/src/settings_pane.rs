@@ -1189,11 +1189,7 @@ impl SettingsPane {
             .copied()
             .enumerate()
             .map(|(ix, a)| {
-                let detail = match a {
-                    Access::Ask => "Asks before every edit and command",
-                    Access::Edits => "Edits files on its own, asks before commands",
-                    Access::Full => "Edits and runs commands without asking",
-                };
+                let detail = a.detail();
                 choice(
                     ElementId::NamedInteger("access".into(), ix as u64),
                     None,

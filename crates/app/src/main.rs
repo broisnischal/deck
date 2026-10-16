@@ -21,6 +21,7 @@ mod net;
 mod notify;
 mod palette;
 mod pasteboard;
+mod preview;
 mod refine;
 mod retry;
 mod review;
@@ -33,6 +34,7 @@ mod terminal;
 mod textbuf;
 mod theme;
 mod threads;
+mod thumb;
 mod workspace;
 
 use gpui::prelude::*;

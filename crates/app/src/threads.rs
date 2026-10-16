@@ -17,6 +17,9 @@ pub struct Saved {
     pub agent: String,
     pub cwd: PathBuf,
     pub full_access: bool,
+    /// Ask first. Older files have only `full_access`, so this stays apart
+    /// from it rather than replacing it.
+    pub ask_first: bool,
     pub title: String,
     pub transcript: Transcript,
     pub draft: String,

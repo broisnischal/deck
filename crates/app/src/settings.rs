@@ -272,8 +272,8 @@ impl Search {
     }
 }
 
-/// What a new chat may do without asking. The chat's own chip still cycles
-/// it per thread; this is only where new threads start.
+/// What a new chat may do without asking. The chat's own chip changes it
+/// per thread; this is only where new threads start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Access {
@@ -294,6 +294,22 @@ impl Access {
             Access::Ask => "Ask first",
             Access::Edits => "Accept edits",
             Access::Full => "Full access",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Access::Ask => "Asks before every edit and command",
+            Access::Edits => "Edits files on its own, asks before commands",
+            Access::Full => "Edits and runs commands without asking",
+        }
+    }
+
+    pub fn of(mode: agent_core::PermissionMode) -> Access {
+        match mode {
+            agent_core::PermissionMode::Yolo => Access::Full,
+            agent_core::PermissionMode::Edit => Access::Edits,
+            _ => Access::Ask,
         }
     }
 
