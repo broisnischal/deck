@@ -2,11 +2,10 @@
 //!
 //! Every flag here was read off the tool's own `--help` on a machine with it
 //! installed, not guessed, and re-checked against these versions:
-//! opencode 1.18.10, codex-cli 0.146.0, gemini 0.53.1, grok 0.2.103,
-//! vibe 2.14.1. Where a CLI offers a structured output mode whose event schema
-//! we have observed (or, for grok, read from the docs shipped inside the
-//! binary), we use it: plain text gives no tool calls, no errors and no session
-//! id to resume with.
+//! opencode 1.18.10, codex-cli 0.146.0, gemini 0.53.1, grok 1.0.60,
+//! vibe 2.26.1. Where a CLI offers a structured output mode whose event schema
+//! we have observed, we use it: plain text gives no tool calls, no errors and
+//! no session id to resume with.
 
 use agent_core::{Caps, ModelSpec, PermissionMode};
 
@@ -71,9 +70,22 @@ pub struct CliSpec {
     pub login: Option<&'static str>,
     pub caps: Caps,
     pub models: &'static [ModelSpec],
+    /// A command that lists the models the CLI can use right now. Once it has
+    /// been read, its list replaces `models`.
+    pub list_models: Option<ListModels>,
+    /// Environment set for every turn, before the session's own.
+    pub env: &'static [(&'static str, &'static str)],
     /// How to install or sign in, when the CLI is missing. Taken from each
     /// project's own published instructions, not invented.
     pub setup: Option<agent_core::Setup>,
+}
+
+/// A command that prints a CLI's models, and how to read what it prints.
+#[derive(Debug, Clone, Copy)]
+pub struct ListModels {
+    /// Argv after the binary.
+    pub args: &'static [&'static str],
+    pub parse: fn(&str) -> Vec<crate::models::Listed>,
 }
 
 impl CliSpec {
@@ -188,7 +200,13 @@ pub const OPENCODE: CliSpec = CliSpec {
         images: false,
         queues_input: false,
     },
+    // Which models there are depends on the providers signed in to.
     models: &[],
+    list_models: Some(ListModels {
+        args: &["models", "--verbose"],
+        parse: crate::models::parse_opencode,
+    }),
+    env: &[],
     setup: Some(agent_core::Setup {
         verb: "Install",
         command: "npm install -g opencode-ai",
@@ -215,6 +233,13 @@ pub const VIBE: CliSpec = CliSpec {
     login: Some("vibe --setup"),
     caps: PLAIN_CAPS,
     models: &[],
+    list_models: None,
+    // In headless mode vibe prints nothing while it retries a failed request,
+    // and it retries for five minutes by default: a 429 from a key with no
+    // quota left was retried silently the whole time, so the chat looked hung.
+    // Twenty seconds covers a passing blip; past that the error reaches the
+    // chat, and deck's own retry, which says what it waits on, takes over.
+    env: &[("VIBE_API_RETRY_MAX_ELAPSED_TIME", "20")],
     setup: Some(agent_core::Setup {
         verb: "Install",
         command: "npm install -g @vibe-kit/vibe",
@@ -235,7 +260,11 @@ pub const GROK: CliSpec = CliSpec {
     prompt_flag: Some("--single"),
     login: Some("grok login"),
     caps: JSON_CAPS,
+    // `grok models` offers this account only `grok-4.7`, its default, so a
+    // picker would have nothing to choose between.
     models: &[],
+    list_models: None,
+    env: &[],
     setup: Some(agent_core::Setup {
         verb: "Install",
         command: "npm install -g @vibe-kit/grok-cli",
@@ -257,6 +286,8 @@ pub const CRUSH: CliSpec = CliSpec {
     login: None,
     caps: PLAIN_CAPS,
     models: &[],
+    list_models: None,
+    env: &[],
     setup: Some(agent_core::Setup {
         verb: "Install",
         command: "npm install -g @charmland/crush",
@@ -280,18 +311,28 @@ pub const GEMINI: CliSpec = CliSpec {
     prompt_flag: Some("--prompt"),
     login: Some("gemini"),
     caps: JSON_CAPS,
+    // gemini's own aliases: it resolves each to the newest model the account
+    // may use (`pro` is gemini-3-pro-preview with preview access, else
+    // gemini-2.5-pro). There is no `gemini-3-pro`.
     models: &[
         ModelSpec {
-            id: "gemini-3-pro",
-            label: "Gemini 3 Pro",
+            id: "pro",
+            label: "Gemini Pro",
             note: "most capable",
         },
         ModelSpec {
-            id: "gemini-3-flash",
-            label: "Gemini 3 Flash",
+            id: "flash",
+            label: "Gemini Flash",
+            note: "fast",
+        },
+        ModelSpec {
+            id: "flash-lite",
+            label: "Gemini Flash Lite",
             note: "fastest",
         },
     ],
+    list_models: None,
+    env: &[],
     setup: Some(agent_core::Setup {
         verb: "Install",
         command: "npm install -g @google/gemini-cli",
@@ -314,7 +355,23 @@ pub const CODEX: CliSpec = CliSpec {
     prompt_flag: None,
     login: Some("codex login"),
     caps: JSON_CAPS,
-    models: &[],
+    // What `codex debug models` lists for a ChatGPT account; both answered a
+    // turn through `exec --json --model`. With none chosen, see
+    // `models::codex_default`.
+    models: &[
+        ModelSpec {
+            id: "gpt-5.6-terra",
+            label: "GPT-5.6 Terra",
+            note: "balanced",
+        },
+        ModelSpec {
+            id: "gpt-5.6-luna",
+            label: "GPT-5.6 Luna",
+            note: "fastest",
+        },
+    ],
+    list_models: None,
+    env: &[],
     setup: Some(agent_core::Setup {
         verb: "Install",
         command: "npm install -g @openai/codex",
@@ -383,6 +440,51 @@ mod tests {
                 "again"
             ]
         );
+    }
+
+    #[test]
+    fn codex_takes_the_model_on_a_first_turn_and_on_a_resumed_one() {
+        // Verified: `exec … --model gpt-5.6-luna -- <prompt>` and
+        // `exec … --model gpt-5.6-terra … resume <id> -- <prompt>` both answer.
+        // Without it, resume falls back to the config's model too.
+        let a = CODEX.args("x", "/r", Some("gpt-5.6-luna"), None, PermissionMode::Ask);
+        let i = a.iter().position(|x| x == "--model").unwrap();
+        assert_eq!(a[i + 1], "gpt-5.6-luna");
+        let a = CODEX.args(
+            "x",
+            "/r",
+            Some("gpt-5.6-terra"),
+            Some("01a14413"),
+            PermissionMode::Yolo,
+        );
+        let m = a.iter().position(|x| x == "--model").unwrap();
+        let r = a.iter().position(|x| x == "resume").unwrap();
+        assert_eq!(a[m + 1], "gpt-5.6-terra");
+        assert!(m < r, "options go before the subcommand: {a:?}");
+        assert_eq!(a[r + 1], "01a14413");
+    }
+
+    #[test]
+    fn the_listed_models_are_ones_the_clis_accept() {
+        let ids = |s: &CliSpec| s.models.iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(&CODEX), ["gpt-5.6-terra", "gpt-5.6-luna"]);
+        // gemini's aliases; `gemini-3-pro` is not a model it knows.
+        assert_eq!(ids(&GEMINI), ["pro", "flash", "flash-lite"]);
+        for spec in ALL {
+            if !spec.models.is_empty() || spec.list_models.is_some() {
+                assert!(spec.model_flag.is_some(), "{} has no model flag", spec.id);
+            }
+        }
+    }
+
+    #[test]
+    fn vibe_gives_up_retrying_before_the_chat_looks_hung() {
+        let budget = VIBE
+            .env
+            .iter()
+            .find(|(k, _)| *k == "VIBE_API_RETRY_MAX_ELAPSED_TIME")
+            .map(|(_, v)| v.parse::<u32>().unwrap());
+        assert!(budget.is_some_and(|s| s <= 30), "{budget:?}");
     }
 
     #[test]

@@ -12,6 +12,7 @@
 
 pub mod decode;
 mod http;
+pub mod models;
 pub mod opencode;
 pub mod spec;
 
@@ -40,14 +41,48 @@ const STDERR_TAIL: usize = 40;
 /// After the CLI exits, how long something it started (a server it ran in
 /// the background) may keep its stdout open before the turn is called over.
 const DRAIN_GRACE: Duration = Duration::from_millis(1500);
+/// How long a probe waits for the CLI's model list. A slower list still
+/// arrives, for the next time the models are asked for.
+const PROBE_MODELS_WAIT: Duration = Duration::from_secs(5);
 
 pub struct CliAdapter {
     spec: &'static CliSpec,
+    /// The models the CLI listed, for one that can list them.
+    listed: Arc<Mutex<models::Cache>>,
 }
 
 impl CliAdapter {
     pub fn new(spec: &'static CliSpec) -> Self {
-        Self { spec }
+        Self {
+            spec,
+            listed: Arc::default(),
+        }
+    }
+
+    /// Read the CLI's model list on a thread of its own, if it has one and a
+    /// read is due. The receiver fires once the list is stored.
+    fn refresh_models(&self) -> Option<oneshot::Receiver<()>> {
+        let list = self.spec.list_models?;
+        if !self.listed.lock().claim() {
+            return None;
+        }
+        let (done, rx) = oneshot::channel();
+        let cache = self.listed.clone();
+        let bin = self.spec.bin;
+        let read = move || {
+            let found = models::read(bin, &list);
+            cache.lock().store(found);
+            let _ = done.send(());
+        };
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("{bin} models"))
+            .spawn(read)
+        {
+            tracing::debug!(error = %e, "could not start the model list read");
+            self.listed.lock().store(None);
+            return None;
+        }
+        Some(rx)
     }
 
     /// Every installed CLI backend, ready to register.
@@ -73,8 +108,14 @@ impl AgentAdapter for CliAdapter {
         self.spec.caps
     }
 
+    /// Cheap enough to call on every frame: the list is read off the CLI in
+    /// the background, at most once a minute, and the last one returned.
     fn models(&self) -> &'static [ModelSpec] {
-        self.spec.models
+        if self.spec.list_models.is_none() {
+            return self.spec.models;
+        }
+        self.refresh_models();
+        self.listed.lock().get().unwrap_or(self.spec.models)
     }
 
     fn setup(&self) -> Option<agent_core::Setup> {
@@ -82,14 +123,19 @@ impl AgentAdapter for CliAdapter {
     }
 
     async fn probe(&self) -> Result<Availability, AgentError> {
+        // Alongside, so the list is there by the time the picker is.
+        let listing = self.refresh_models();
         // `--version` is the cheapest liveness check that does not hit the
         // network or consume credits.
-        match Command::new(self.spec.bin)
+        let version = Command::new(self.spec.bin)
             .arg("--version")
             .stdin(Stdio::null())
             .output()
-            .await
-        {
+            .await;
+        if let (Some(rx), Ok(_)) = (listing, &version) {
+            let _ = tokio::time::timeout(PROBE_MODELS_WAIT, rx).await;
+        }
+        match version {
             Ok(o) if o.status.success() => Ok(Availability::Ready {
                 version: Some(
                     String::from_utf8_lossy(&o.stdout)
@@ -108,9 +154,12 @@ impl AgentAdapter for CliAdapter {
         }
     }
 
-    async fn spawn(&self, ctx: SessionCtx) -> Result<Box<dyn AgentSession>, AgentError> {
+    async fn spawn(&self, mut ctx: SessionCtx) -> Result<Box<dyn AgentSession>, AgentError> {
         if self.spec.wire == Wire::OpenCodeJson {
             return Ok(Box::new(opencode::OpenCodeSession::start(self.spec, ctx)));
+        }
+        if ctx.model.is_none() && self.spec.wire == Wire::CodexJson {
+            ctx.model = models::codex_default(self.spec.bin).await.map(Into::into);
         }
         Ok(Box::new(CliSession::new(self.spec, ctx)))
     }
@@ -211,6 +260,7 @@ pub(crate) fn spawn_turn(
 ) -> Result<TurnHandle, AgentError> {
     let mut cmd = Command::new(spec.bin);
     cmd.args(&args)
+        .envs(spec.env.iter().copied())
         .envs(ctx.env.iter().map(|(k, v)| (k, v)))
         .current_dir(&ctx.cwd)
         // None of these may wait on a terminal: codex reads stdin when it is
@@ -560,6 +610,8 @@ mod tests {
         login: None,
         caps: Caps::DEGRADED,
         models: &[],
+        list_models: None,
+        env: &[],
         setup: None,
     };
 
@@ -615,13 +667,19 @@ mod tests {
         login: Some("sh-login"),
         caps: Caps::DEGRADED,
         models: &[],
+        list_models: None,
+        env: &[],
         setup: None,
     };
 
     async fn turn_of(script: &str) -> Vec<AgentEvent> {
+        turn_on(&SH, script).await
+    }
+
+    async fn turn_on(spec: &'static CliSpec, script: &str) -> Vec<AgentEvent> {
         let mut c = ctx();
         c.system_prompt = Arc::from("");
-        let mut s = CliSession::new(&SH, c);
+        let mut s = CliSession::new(spec, c);
         // `sh -c -- <script>`: `--` ends sh's options, the script follows.
         s.send(UserTurn::text(script)).await.unwrap();
         let mut out = Vec::new();
@@ -657,6 +715,8 @@ mod tests {
         login: None,
         caps: Caps::DEGRADED,
         models: &[],
+        list_models: None,
+        env: &[],
         setup: None,
     };
 
@@ -695,6 +755,59 @@ mod tests {
                 e,
                 AgentEvent::TurnFailed { message, .. }
                     if message == "Shell is not signed in: run `sh-login` in a terminal."
+            )),
+            "{ev:?}"
+        );
+        assert!(matches!(
+            ev.last(),
+            Some(AgentEvent::TurnEnd {
+                stop: agent_core::StopReason::Error
+            })
+        ));
+    }
+
+    /// A fake vibe: a shell standing in for it, with the spec's own
+    /// environment.
+    static FAKE_VIBE: CliSpec = CliSpec {
+        id: "fake-vibe",
+        display_name: "Vibe",
+        bin: "/bin/sh",
+        wire: Wire::PlainText,
+        base_args: &["-c"],
+        cwd_flag: None,
+        model_flag: None,
+        resume: Resume::Never,
+        yolo_args: &[],
+        prompt_flag: None,
+        login: Some("vibe --setup"),
+        caps: Caps::DEGRADED,
+        models: &[],
+        list_models: None,
+        env: &[("DECK_SPEC_ENV", "from-spec")],
+        setup: None,
+    };
+
+    #[tokio::test]
+    async fn the_spec_environment_reaches_the_cli() {
+        let ev = turn_on(&FAKE_VIBE, "echo $DECK_SPEC_ENV").await;
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, AgentEvent::Text { delta } if delta == "from-spec\n")),
+            "{ev:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vibe_that_gave_up_on_a_429_fails_the_turn_with_why() {
+        // What vibe 2.26.1 printed once its retries were spent.
+        let script = r#"printf '%s\n' 'Error: API error occurred: Status 429. Body: {"object":"error","message":"Rate limit exceeded","type":"rate_limited","param":null,"code":"1300","raw_status_code":429}'
+echo 'You are using the new Vibe TUI, currently in preview. Please report this error at https://github.com/mistralai/mistral-vibe/issues. To switch back to the classic TUI, set VIBE_CLI=python.' >&2
+exit 1"#;
+        let ev = turn_on(&FAKE_VIBE, script).await;
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                AgentEvent::TurnFailed { status: Some(429), message } if message == "Rate limit exceeded"
             )),
             "{ev:?}"
         );

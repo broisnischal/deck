@@ -162,7 +162,7 @@ fn retryable_status(s: u16) -> bool {
     matches!(s, 408 | 429 | 500..=599)
 }
 
-/// The agent says nobody is signed in: name the command that fixes it.
+/// Say what fixes a failure the user can fix: signing in, or another model.
 pub fn explain(spec: &CliSpec, message: &str) -> String {
     const SIGNED_OUT: &[&str] = &[
         "not signed in",
@@ -172,15 +172,50 @@ pub fn explain(spec: &CliSpec, message: &str) -> String {
         "please log in",
         "please login",
         "unauthenticated",
+        // vibe: "Missing MISTRAL_API_KEY environment variable for mistral provider."
+        "_api_key environment variable",
+    ];
+    // codex: "The 'gpt-5.5' model is not supported when using Codex with a
+    // ChatGPT account."
+    const MODEL_REFUSED: &[&str] = &[
+        "model is not supported",
+        "unknown model",
+        "model not found",
+        "model_not_found",
     ];
     let lower = message.to_lowercase();
+    let pickable = !spec.models.is_empty() || spec.list_models.is_some();
     match spec.login {
         Some(login) if SIGNED_OUT.iter().any(|n| lower.contains(n)) => format!(
             "{} is not signed in: run `{login}` in a terminal.",
             spec.display_name
         ),
+        // All vibe's preview TUI says when it cannot open a session, most
+        // often for want of an API key.
+        Some(login) if lower == "session/start" => format!(
+            "{} could not start a session. If it is not signed in, run `{login}` in a terminal.",
+            spec.display_name
+        ),
+        // Short enough that the app's 80-character reason keeps the fix.
+        _ if pickable && MODEL_REFUSED.iter().any(|n| lower.contains(n)) => match quoted(message) {
+            Some(model) => format!(
+                "{} cannot use {model} with this account: pick a model in the composer.",
+                spec.display_name
+            ),
+            None => format!("{message} Pick a model in the composer."),
+        },
         _ => message.to_string(),
     }
+}
+
+/// The first word in quotes: `gpt-5.5` from "The 'gpt-5.5' model is…".
+fn quoted(s: &str) -> Option<&str> {
+    let (i, q) = s
+        .char_indices()
+        .find(|(_, c)| matches!(c, '\'' | '`' | '"'))?;
+    let rest = &s[i + 1..];
+    let word = &rest[..rest.find(q)?];
+    (!word.is_empty() && word.len() <= 60 && !word.contains(char::is_whitespace)).then_some(word)
 }
 
 /// The readable part of an error a CLI reported, and its HTTP status if it
@@ -215,11 +250,17 @@ fn embedded_json(s: &str) -> Option<Value> {
 }
 
 fn dig(v: &Value) -> (Option<u16>, Option<String>) {
-    let status = ["status", "code", "http_status", "statusCode"]
-        .iter()
-        .find_map(|k| v.get(k).and_then(Value::as_u64))
-        .and_then(|n| u16::try_from(n).ok())
-        .filter(|n| (100..600).contains(n));
+    let status = [
+        "status",
+        "code",
+        "http_status",
+        "statusCode",
+        "raw_status_code",
+    ]
+    .iter()
+    .find_map(|k| v.get(k).and_then(Value::as_u64))
+    .and_then(|n| u16::try_from(n).ok())
+    .filter(|n| (100..600).contains(n));
     let own = v.get("message").and_then(Value::as_str).map(str::to_string);
     for k in ["error", "data"] {
         match v.get(k) {
@@ -262,6 +303,8 @@ pub fn from_stderr(lines: &[String]) -> Option<String> {
         "level=info",
         "level=debug",
         "level=warn",
+        // vibe's preview TUI, on every failure.
+        "you are using the new vibe tui",
     ];
     let mut kept: Vec<String> = Vec::new();
     for line in lines {
@@ -1110,9 +1153,15 @@ fn shell_command(cmd: &str) -> String {
 /// Everything on stdout is the reply. ANSI escapes are stripped, because several
 /// of these colour their output even when not attached to a TTY, and raw escape
 /// bytes in a chat bubble look like corruption.
+///
+/// Except a failure printed there: vibe's preview TUI ends a failed run with
+/// `Error: <why>` on stdout, not stderr. From a line starting `Error: ` on,
+/// output is held until the exit says which it was: the reply after a clean
+/// exit, the failure after any other.
 #[derive(Default)]
 pub struct PlainDecoder {
     seen_any: bool,
+    held: Vec<String>,
     turn: Turn,
     spec: Option<&'static CliSpec>,
 }
@@ -1136,6 +1185,10 @@ impl PlainDecoder {
             return Vec::new();
         }
         self.seen_any = true;
+        if !self.held.is_empty() || clean.starts_with("Error: ") {
+            self.held.push(clean);
+            return Vec::new();
+        }
         let out = vec![AgentEvent::Text {
             delta: format!("{clean}\n"),
         }];
@@ -1155,7 +1208,25 @@ impl Decode for PlainDecoder {
 
     fn end(&mut self, exit: &Exit) -> Vec<AgentEvent> {
         self.seen_any = false;
-        self.turn.conclude(exit, self.spec)
+        let held = std::mem::take(&mut self.held);
+        let mut out = Vec::new();
+        if !held.is_empty() {
+            if exit.code == Some(0) || exit.interrupted {
+                out = held
+                    .into_iter()
+                    .map(|l| AgentEvent::Text {
+                        delta: format!("{l}\n"),
+                    })
+                    .collect();
+                self.turn.note(&out);
+            } else {
+                let said = held.join(" ");
+                self.turn
+                    .fail(said.strip_prefix("Error: ").unwrap_or(&said));
+            }
+        }
+        out.extend(self.turn.conclude(exit, self.spec));
+        out
     }
 }
 
@@ -1475,9 +1546,10 @@ mod tests {
             CODEX_BAD_MODEL,
             failed(1, &["Reading additional input from stdin..."]),
         );
-        let want = "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.";
+        let want = "Codex cannot use gpt-5.5 with this account: pick a model in the composer.";
         // A 400 is left out so the app reads these words, not "rejected".
         assert_eq!(failure_of(&ev), Some((None, want.to_string())));
+        assert!(want.len() <= 80, "the app clips longer reasons");
         assert_eq!(text_of(&ev), want, "the reply shows the reason");
         assert_eq!(stop_of(&ev), Some(StopReason::Error));
     }
@@ -1678,6 +1750,111 @@ mod tests {
             .unwrap()
             .1
             .ends_with("vibe: error: unrecognized arguments: --auto-approve"));
+    }
+
+    /// vibe 2.26.1's preview TUI, `vibe --output text … --prompt=…` with a
+    /// key whose plan allows 0 requests a minute, once its retries were spent:
+    /// exit 1, the failure on stdout and a notice on stderr.
+    const VIBE_429_STDOUT: &str = r#"Error: API error occurred: Status 429. Body: {"object":"error","message":"Rate limit exceeded","type":"rate_limited","param":null,"code":"1300","raw_status_code":429}"#;
+    const VIBE_PREVIEW_NOTICE: &str = "You are using the new Vibe TUI, currently in preview. Please report this error at https://github.com/mistralai/mistral-vibe/issues. To switch back to the classic TUI, set VIBE_CLI=python.";
+
+    #[test]
+    fn vibe_failure_on_stdout_fails_the_turn_instead_of_being_the_reply() {
+        let mut d = PlainDecoder::for_spec(&spec::VIBE);
+        let ev = run(
+            &mut d,
+            &[VIBE_429_STDOUT],
+            failed(1, &[VIBE_PREVIEW_NOTICE]),
+        );
+        assert_eq!(
+            failure_of(&ev),
+            Some((Some(429), "Rate limit exceeded".into()))
+        );
+        assert_eq!(text_of(&ev), "Rate limit exceeded", "not the raw error");
+        assert_eq!(stop_of(&ev), Some(StopReason::Error));
+    }
+
+    #[test]
+    fn vibe_classic_failure_on_stderr_reads_the_same() {
+        // VIBE_CLI=python: the same words, on stderr, exit 2.
+        let mut d = PlainDecoder::for_spec(&spec::VIBE);
+        let ev = run(&mut d, &[], failed(2, &[VIBE_429_STDOUT]));
+        assert_eq!(failure_of(&ev).unwrap().1, "Rate limit exceeded");
+    }
+
+    #[test]
+    fn vibe_without_an_api_key_names_the_fix() {
+        // Real, with an empty VIBE_HOME: the classic CLI says why on stderr...
+        let mut d = PlainDecoder::for_spec(&spec::VIBE);
+        let ev = run(
+            &mut d,
+            &[],
+            failed(1, &["Error: Missing MISTRAL_API_KEY environment variable for mistral provider. Set the environment variable (e.g. in ~/.vibe/.env or your shell), or run `vibe --setup` once interactively."]),
+        );
+        assert_eq!(
+            failure_of(&ev).unwrap().1,
+            "Vibe is not signed in: run `vibe --setup` in a terminal."
+        );
+        // ...the preview TUI only that it could not start.
+        let ev = run(
+            &mut d,
+            &["Error: session/start"],
+            failed(1, &[VIBE_PREVIEW_NOTICE]),
+        );
+        assert_eq!(
+            failure_of(&ev).unwrap().1,
+            "Vibe could not start a session. If it is not signed in, run `vibe --setup` in a terminal."
+        );
+    }
+
+    #[test]
+    fn a_reply_line_that_starts_with_error_is_still_the_reply() {
+        let mut d = PlainDecoder::for_spec(&spec::VIBE);
+        let ev = run(
+            &mut d,
+            &["The log says:", "Error: disk full", "so free some space."],
+            Exit::clean(),
+        );
+        assert!(failure_of(&ev).is_none());
+        assert_eq!(
+            text_of(&ev),
+            "The log says:\nError: disk full\nso free some space.\n"
+        );
+    }
+
+    #[test]
+    fn real_grok_1_0_stream_decodes() {
+        // grok 1.0.60, `--output-format streaming-json --single=Reply with ok`,
+        // with the tool list and the repeated thought deltas cut.
+        let lines = [
+            r#"{"type":"available_commands","tools":["run_terminal_command","read_file"]}"#,
+            r#"{"type":"thought","data":"The user wants me to reply with \"ok\"."}"#,
+            r#"{"type":"text","data":"ok"}"#,
+            r#"{"type":"usage","usage":{"input_tokens":11883,"output_tokens":25,"cache_read_input_tokens":8576,"cache_creation_input_tokens":0,"reasoning_tokens":24},"signature":"yFZE"}"#,
+            r#"{"type":"end","stopReason":"end_turn","sessionId":"01a14416-6906-70a1-bfd5-fceab713bc69","requestId":"b5b830ae-24c8-4dc9-9f22-e18de1f0a4ed","cwd":"/tmp/grok-probe","usage":{"input_tokens":11883,"cache_read_input_tokens":8576,"cache_creation_input_tokens":0,"output_tokens":25,"reasoning_tokens":24,"total_tokens":20484}}"#,
+        ];
+        let mut d = GrokDecoder::new(&spec::GROK);
+        let ev = run(&mut d, &lines, Exit::clean());
+        assert_eq!(text_of(&ev), "ok");
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            AgentEvent::Started { native_session_id: Some(id), .. }
+                if id == "01a14416-6906-70a1-bfd5-fceab713bc69"
+        )));
+        assert_eq!(stop_of(&ev), Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn grok_unknown_model_is_reported_in_its_words() {
+        // Real: `--model grok-nope`. Grok has no model list, so no picker to
+        // point at.
+        let line = r#"{"type":"error","message":"Couldn't set model 'grok-nope': Invalid params: \"unknown model id\". Run 'grok models' to see available models."}"#;
+        let mut d = GrokDecoder::new(&spec::GROK);
+        let ev = run(&mut d, &[line], failed(1, &[]));
+        assert!(failure_of(&ev)
+            .unwrap()
+            .1
+            .starts_with("Couldn't set model 'grok-nope'"));
     }
 
     #[test]
