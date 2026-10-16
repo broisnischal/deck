@@ -49,7 +49,13 @@ struct PartialTool {
     id: String,
     name: String,
     json: String,
+    /// Already sent as a `ToolCall` before its input finished arriving.
+    shown: bool,
 }
+
+/// How far into a streaming tool input to look for its title field. The
+/// field comes first in practice; past this the card waits for the end.
+const TITLE_SCAN_LIMIT: usize = 4096;
 
 impl Default for Decoder {
     fn default() -> Self {
@@ -291,6 +297,12 @@ impl Decoder {
                         ..Default::default()
                     }));
                 }
+                if r.is_error {
+                    out.push(AgentEvent::TurnFailed {
+                        status: r.api_error_status,
+                        message: r.result.clone().unwrap_or_default(),
+                    });
+                }
                 let stop = match r.subtype.as_deref() {
                     Some("error_max_turns") => StopReason::MaxTurns,
                     Some("error_during_execution") => StopReason::Error,
@@ -318,12 +330,18 @@ impl Decoder {
             } => match content_block {
                 ContentBlock::ToolUse { id, name, .. } => {
                     self.tool_names.insert(id.clone(), name.clone());
+                    // A title that comes from the name alone is real already.
+                    let shown = title_key(&name).is_none();
+                    if shown {
+                        out.push(tool_call_event(&id, &name, Value::Null));
+                    }
                     self.partial_tools.insert(
                         index,
                         PartialTool {
                             id,
                             name,
                             json: String::new(),
+                            shown,
                         },
                     );
                 }
@@ -350,13 +368,25 @@ impl Decoder {
                 BlockDelta::InputJsonDelta { partial_json } => {
                     if let Some(p) = self.partial_tools.get_mut(&index) {
                         p.json.push_str(&partial_json);
+                        // Show the card as soon as its title field has closed,
+                        // so a long input (a whole file for Write) streams
+                        // under a real title instead of nothing at all.
+                        if !p.shown && p.json.len() <= TITLE_SCAN_LIMIT {
+                            if let Some(k) = title_key(&p.name) {
+                                if let Some(v) = closed_string_field(&p.json, k) {
+                                    p.shown = true;
+                                    let input = serde_json::json!({ k: v });
+                                    out.push(tool_call_event(&p.id, &p.name, input));
+                                }
+                            }
+                        }
                     }
                 }
                 BlockDelta::Unknown => {}
             },
 
-            // Emit the tool call only once its input JSON is complete, so the
-            // card has a real title instead of a placeholder that reflows.
+            // The complete input. A call already shown gets it as a repeat
+            // `ToolCall`, which the transcript applies to the same card.
             RawEvent::ContentBlockStop { index } => {
                 if let Some(p) = self.partial_tools.remove(&index) {
                     let input = if p.json.trim().is_empty() {
@@ -388,26 +418,83 @@ fn tool_call_event(id: &str, name: &str, input: Value) -> AgentEvent {
     }
 }
 
+/// The input field a tool's card title is read from; `None` when the title
+/// comes from the tool's name.
+fn title_key(name: &str) -> Option<&'static str> {
+    match name {
+        "Bash" | "bash" => Some("command"),
+        "Read" | "read" | "Write" | "write" | "Edit" | "edit" => Some("file_path"),
+        "Glob" | "glob" | "Grep" | "grep" => Some("pattern"),
+        "WebFetch" => Some("url"),
+        "Task" => Some("description"),
+        _ => None,
+    }
+}
+
 /// Short label for the collapsed tool card, mirroring what the CLI shows.
 fn tool_title(name: &str, input: &Value) -> String {
-    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("");
-    match name {
-        "Bash" | "bash" => truncate(s("command"), 160).to_string(),
-        "Read" | "read" => truncate(s("file_path"), 160).to_string(),
-        "Write" | "write" => truncate(s("file_path"), 160).to_string(),
-        "Edit" | "edit" => truncate(s("file_path"), 160).to_string(),
-        "Glob" | "glob" => s("pattern").to_string(),
-        "Grep" | "grep" => s("pattern").to_string(),
-        "WebFetch" => s("url").to_string(),
-        "Task" => s("description").to_string(),
-        other => {
-            // MCP tools are named `mcp__server__tool`; show `server/tool`.
-            match other.strip_prefix("mcp__") {
-                Some(rest) => rest.replacen("__", "/", 1),
-                None => other.to_string(),
+    match title_key(name) {
+        Some(k) => {
+            let s = input.get(k).and_then(Value::as_str).unwrap_or("");
+            match k {
+                "command" | "file_path" => truncate(s, 160).to_string(),
+                _ => s.to_string(),
             }
         }
+        // MCP tools are named `mcp__server__tool`; show `server/tool`.
+        None => match name.strip_prefix("mcp__") {
+            Some(rest) => rest.replacen("__", "/", 1),
+            None => name.to_string(),
+        },
     }
+}
+
+/// The string at top-level `key` of a JSON object still being streamed, once
+/// its closing quote has arrived.
+fn closed_string_field(json: &str, key: &str) -> Option<String> {
+    let b = json.as_bytes();
+    // Index of the quote closing the string opened at `open`, if it has come.
+    let close = |open: usize| {
+        let mut i = open + 1;
+        while i < b.len() {
+            match b[i] {
+                b'\\' => i += 2,
+                b'"' => return Some(i),
+                _ => i += 1,
+            }
+        }
+        None
+    };
+    let after_ws = |mut i: usize| {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b'"' => {
+                let end = close(i)?;
+                let colon = after_ws(end + 1);
+                if depth == 1 && b.get(colon) == Some(&b':') && &json[i + 1..end] == key {
+                    let open = after_ws(colon + 1);
+                    if b.get(open) != Some(&b'"') {
+                        return None;
+                    }
+                    let end = close(open)?;
+                    return serde_json::from_str(&json[open..=end]).ok();
+                }
+                i = end;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Pick a renderer for a tool result based on which tool produced it.
@@ -564,58 +651,99 @@ mod tests {
         assert_eq!(ev_text(&all), "Hello", "text emitted exactly once");
     }
 
-    #[test]
-    fn streamed_tool_input_emits_one_call_with_parsed_input() {
-        let mut d = Decoder::new();
-        let mut all = Vec::new();
-        all.extend(d.decode_line(
-            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"Bash","input":{}}}}"#,
-        ));
-        assert!(all.is_empty(), "no call until input is complete");
-        for frag in [r#"{"comm"#, r#"and":"ls -la"}"#] {
-            let line = serde_json::json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_delta",
-                    "index": 1,
-                    "delta": {"type": "input_json_delta", "partial_json": frag}
-                }
-            });
-            all.extend(d.decode_line(&line.to_string()));
-        }
-        all.extend(d.decode_line(
-            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
-        ));
-
-        let calls: Vec<_> = all
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::ToolCall { .. }))
-            .collect();
-        assert_eq!(calls.len(), 1);
-        match calls[0] {
-            AgentEvent::ToolCall {
-                id,
-                name,
-                title,
-                input,
-                ..
-            } => {
-                assert_eq!(id.as_str(), "tu_1");
-                assert_eq!(name, "Bash");
-                assert_eq!(title, "ls -la");
-                assert_eq!(input["command"], "ls -la");
+    fn input_delta(d: &mut Decoder, frag: &str) -> Vec<AgentEvent> {
+        let line = serde_json::json!({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": frag}
             }
-            _ => unreachable!(),
+        });
+        d.decode_line(&line.to_string())
+    }
+
+    #[test]
+    fn streamed_tool_input_shows_the_card_once_its_title_has_arrived() {
+        let mut d = Decoder::new();
+        let start = d.decode_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"Write","input":{}}}}"#,
+        );
+        assert!(start.is_empty(), "no card before its title is known");
+        assert!(input_delta(&mut d, r#"{"file_path": "/tmp/a"#).is_empty());
+
+        // The path has closed; the file's content is still on its way.
+        let early = input_delta(&mut d, r#".py", "content": "one\n"#);
+        match early.as_slice() {
+            [AgentEvent::ToolCall {
+                id, title, input, ..
+            }] => {
+                assert_eq!(id.as_str(), "tu_1");
+                assert_eq!(title, "/tmp/a.py");
+                assert_eq!(input, &serde_json::json!({"file_path": "/tmp/a.py"}));
+            }
+            other => panic!("expected the card early, got {other:?}"),
+        }
+        assert!(input_delta(&mut d, r#"two"}"#).is_empty(), "shown once");
+
+        // The end carries the whole input, for the same card.
+        let end = d.decode_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":1}}"#,
+        );
+        match end.as_slice() {
+            [AgentEvent::ToolCall {
+                id, title, input, ..
+            }] => {
+                assert_eq!(id.as_str(), "tu_1");
+                assert_eq!(title, "/tmp/a.py");
+                assert_eq!(input["content"], "one\ntwo");
+            }
+            other => panic!("expected the full input, got {other:?}"),
         }
 
-        // The trailing complete assistant message must not duplicate the call.
+        // The trailing complete assistant message must not add another call.
         let dup = d.decode_line(
-            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Bash","input":{"command":"ls -la"}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Write","input":{"file_path":"/tmp/a.py","content":"one\ntwo"}}]}}"#,
         );
         assert!(
             !dup.iter().any(|e| matches!(e, AgentEvent::ToolCall { .. })),
-            "tool call must not be emitted twice"
+            "tool call must not be emitted again"
         );
+    }
+
+    #[test]
+    fn a_tool_titled_by_its_name_shows_at_once() {
+        let mut d = Decoder::new();
+        let start = d.decode_line(
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_2","name":"mcp__deck__deck_panes","input":{}}}}"#,
+        );
+        assert!(matches!(
+            start.as_slice(),
+            [AgentEvent::ToolCall { title, .. }] if title == "deck/deck_panes"
+        ));
+    }
+
+    #[test]
+    fn closed_string_field_reads_only_a_finished_top_level_key() {
+        let f = closed_string_field;
+        assert_eq!(f(r#"{"command": "ls"#, "command"), None, "still open");
+        assert_eq!(f(r#"{"command""#, "command"), None, "no value yet");
+        assert_eq!(
+            f(r#"{"command": "echo \"hi\" \\", "#, "command").as_deref(),
+            Some(r#"echo "hi" \"#),
+            "escapes"
+        );
+        assert_eq!(
+            f(r#"{"description": "command", "command": "ls"}"#, "command").as_deref(),
+            Some("ls"),
+            "a value equal to the key is not the key"
+        );
+        assert_eq!(
+            f(r#"{"opts": {"pattern": "x"}, "pattern": "y"}"#, "pattern").as_deref(),
+            Some("y"),
+            "nested keys are skipped"
+        );
+        assert_eq!(f(r#"{"timeout": 5, "command": 3}"#, "command"), None);
     }
 
     #[test]
@@ -680,6 +808,28 @@ mod tests {
                 stop: StopReason::EndTurn
             }
         ));
+    }
+
+    #[test]
+    fn a_failed_result_says_its_status() {
+        let mut d = Decoder::new();
+        let ev = d.decode_line(
+            r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"result":"API Error: overloaded"}"#,
+        );
+        assert!(matches!(
+            &ev[0],
+            AgentEvent::TurnFailed { status: Some(529), message } if message == "API Error: overloaded"
+        ));
+        assert!(matches!(
+            ev.last(),
+            Some(AgentEvent::TurnEnd {
+                stop: StopReason::Error
+            })
+        ));
+        let ok = d.decode_line(r#"{"type":"result","subtype":"success","api_error_status":null}"#);
+        assert!(!ok
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnFailed { .. })));
     }
 
     #[test]

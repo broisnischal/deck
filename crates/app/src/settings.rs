@@ -45,6 +45,16 @@ pub struct Settings {
     pub refine_model: String,
     /// Say "continue" when a turn dies on an API or network error.
     pub auto_retry: bool,
+    /// The first launch offered to make deck the default terminal; it asks
+    /// once.
+    pub asked_default_terminal: bool,
+    /// Look for a newer deck now and then.
+    pub check_updates: bool,
+    /// Programs' coloured backgrounds in terminals drawn as a tint.
+    pub soften_backgrounds: bool,
+    /// Your shortcuts, by `workspace::SHORTCUTS` id: a key in gpui's form
+    /// ("cmd-shift-k"), or "" for none. Absent ones keep Deck's.
+    pub keys: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -66,6 +76,10 @@ impl Default for Settings {
             refine: crate::refine::Mode::default(),
             refine_model: "haiku".into(),
             auto_retry: true,
+            asked_default_terminal: false,
+            check_updates: true,
+            soften_backgrounds: true,
+            keys: Default::default(),
             access: Access::default(),
         }
     }
@@ -322,6 +336,7 @@ impl Settings {
             cursor: self.cursor.shape(),
             blink: self.cursor_blink,
             option_meta: self.option_as_meta,
+            soften: self.soften_backgrounds,
         }
     }
 
@@ -390,6 +405,14 @@ struct Stored {
     refine_model: Option<String>,
     #[serde(deserialize_with = "lenient")]
     auto_retry: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    asked_default_terminal: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    check_updates: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    soften_backgrounds: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
+    keys: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// A value that does not parse (a scheme a newer build added, a string
@@ -444,6 +467,16 @@ fn from_stored(s: Stored) -> Settings {
             .filter(|m| !m.trim().is_empty())
             .unwrap_or(d.refine_model),
         auto_retry: s.auto_retry.unwrap_or(d.auto_retry),
+        asked_default_terminal: s.asked_default_terminal.unwrap_or(d.asked_default_terminal),
+        check_updates: s.check_updates.unwrap_or(d.check_updates),
+        soften_backgrounds: s.soften_backgrounds.unwrap_or(d.soften_backgrounds),
+        // A key that does not parse is dropped, so Deck's comes back.
+        keys: s
+            .keys
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, k)| k.is_empty() || gpui::Keystroke::parse(k).is_ok())
+            .collect(),
     }
 }
 
@@ -525,6 +558,10 @@ mod tests {
             refine: crate::refine::Mode::Review,
             refine_model: "sonnet".into(),
             auto_retry: false,
+            asked_default_terminal: true,
+            check_updates: false,
+            soften_backgrounds: false,
+            keys: [("palette".to_string(), "cmd-p".to_string())].into(),
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(parse(&json), s);

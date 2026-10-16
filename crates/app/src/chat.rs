@@ -11,8 +11,9 @@
 use crate::field::{Field, FieldEvent};
 use crate::icon::{icon, spinner, Icon};
 use crate::markdown::{self, MdBlock, Spans};
-use crate::menu::{self, Item};
+use crate::menu::{self, Entry, Item};
 use crate::pasteboard::{self, Pasted};
+use crate::select;
 use crate::theme::{self, u};
 use crate::threads;
 use agent_core::{
@@ -23,14 +24,16 @@ use agent_core::{
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
-    div, img, list, px, relative, rgb, rgba, Animation, AnimationExt, AnyElement, Context,
+    canvas, div, img, list, px, relative, rgb, rgba, Animation, AnimationExt, AnyElement, Context,
     ElementId, Entity, EventEmitter, ExternalPaths, FontStyle, FontWeight, InteractiveText,
     ListAlignment, ListState, SharedString, StrikethroughStyle, StyledImage, StyledText,
     Subscription, Task, TextRun, UnderlineStyle, Window,
 };
 use session::{Conn, DriverEvent};
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -225,6 +228,14 @@ pub struct ChatPane {
     pub composer: Entity<Field>,
     list: ListState,
     expanded: HashSet<String>,
+    /// Work logs showing every step while the agent works (else the newest
+    /// few), by (message, group).
+    log_all: HashSet<(usize, usize)>,
+    /// How much of each streaming text block is on screen, and when that
+    /// last moved: text comes out at a steady pace instead of in bursts.
+    reveal: HashMap<(usize, usize), (f32, Instant)>,
+    /// Some text was still catching up when last drawn.
+    revealing: Cell<bool>,
     /// Steps that open by themselves (the latest plan) but were closed.
     collapsed: HashSet<String>,
     /// When each tool started and, once done, how long it took.
@@ -255,6 +266,19 @@ pub struct ChatPane {
     /// Work logs the user opened or closed by hand, by (message, group).
     log_open: HashMap<(usize, usize), bool>,
     copied: Option<String>,
+    /// Text selected with the mouse in the transcript, for ⌘C.
+    selection: Option<select::Selection>,
+    /// The button went down over text and is still held.
+    selecting: bool,
+    /// The message being drawn and the number of its next piece of text, so
+    /// every piece gets its key in reading order.
+    sel_msg: Cell<usize>,
+    sel_unit: Cell<usize>,
+    /// Text as painted last frame, to find what is under the mouse.
+    painted: Rc<RefCell<Vec<select::Painted>>>,
+    /// Every piece of text drawn, by key, so a selection reaching out of
+    /// view still copies whole.
+    units: RefCell<BTreeMap<select::Key, select::Unit>>,
     /// The right-click menu on a message, while open.
     menu: Option<menu::Open>,
     /// A prompt rewrite in flight: its number, and whether it sends after.
@@ -272,6 +296,14 @@ pub struct ChatPane {
     retry: Option<(u32, Instant, String)>,
     /// Tries in a row since the last turn that went through.
     retries: u32,
+    /// The HTTP status and message of the API call that failed this turn,
+    /// when the agent reported one.
+    failed: Option<(Option<u16>, String)>,
+    /// The project's files as they were when each of your messages was
+    /// sent, by message: a commit to go back to.
+    checkpoints: HashMap<usize, String>,
+    /// The files as they were just before going back, to put them back.
+    undo_rewind: Option<String>,
     _retry: Option<Task<()>>,
     /// Files and images going out with the next message.
     attachments: Vec<PathBuf>,
@@ -365,6 +397,7 @@ impl ChatPane {
                     chat.as_typed = false;
                     chat.refine_note = None;
                 }
+                chat.expand_keyword(cx);
                 chat.update_mention(cx);
                 chat.sync_popup(cx);
                 chat.schedule_save(cx);
@@ -393,6 +426,9 @@ impl ChatPane {
             composer,
             list: ListState::new(0, ListAlignment::Bottom, px(800.)),
             expanded: HashSet::new(),
+            log_all: HashSet::new(),
+            reveal: HashMap::new(),
+            revealing: Cell::new(false),
             collapsed: HashSet::new(),
             tool_times: HashMap::new(),
             switching: false,
@@ -412,6 +448,12 @@ impl ChatPane {
             worked: HashMap::new(),
             log_open: HashMap::new(),
             copied: None,
+            selection: None,
+            selecting: false,
+            sel_msg: Cell::new(0),
+            sel_unit: Cell::new(0),
+            painted: Rc::default(),
+            units: RefCell::default(),
             menu: None,
             refining: None,
             refine_seq: 0,
@@ -420,6 +462,9 @@ impl ChatPane {
             as_typed: false,
             refine_note: None,
             retry: None,
+            failed: None,
+            checkpoints: HashMap::new(),
+            undo_rewind: None,
             retries: 0,
             _retry: None,
             attachments: Vec::new(),
@@ -464,6 +509,7 @@ impl ChatPane {
             PermissionMode::Edit
         };
         c.native_id = saved.native_id;
+        c.checkpoints = saved.checkpoints.into_iter().collect();
         c.attachments = saved
             .attachments
             .into_iter()
@@ -512,6 +558,11 @@ impl ChatPane {
                 .worked
                 .iter()
                 .map(|(ix, d)| (*ix, d.as_millis() as u64))
+                .collect(),
+            checkpoints: self
+                .checkpoints
+                .iter()
+                .map(|(ix, c)| (*ix, c.clone()))
                 .collect(),
             updated: now(),
         }
@@ -566,6 +617,11 @@ impl ChatPane {
         self.archived = true;
         self._save = None;
         threads::archive(&self.thread_id);
+        // Its checkpoints go with it; git drops the commits at its next gc.
+        if !self.checkpoints.is_empty() {
+            let (dir, id) = (self.cwd.clone(), self.thread_id.clone());
+            std::thread::spawn(move || crate::checkpoint::forget(&dir, &id));
+        }
     }
 
     /// A turn is running, whether or not it is waiting on the user.
@@ -684,14 +740,14 @@ impl ChatPane {
         if !crate::retry::enabled() {
             return;
         }
-        let said = self
-            .error
-            .as_ref()
-            .map(|e| e.to_string())
+        let (status, reported) = self.failed.take().unwrap_or_default();
+        let said = Some(reported)
+            .filter(|e| !e.is_empty())
+            .or_else(|| self.error.as_ref().map(|e| e.to_string()))
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| self.last_reply_text());
         let (epoch, clock) = crate::retry::now();
-        match crate::retry::classify(&said, epoch, clock) {
+        match crate::retry::classify(status, &said, epoch, clock) {
             crate::retry::Verdict::Blocked(why) => {
                 self.retries = 0;
                 self.retry = None;
@@ -905,7 +961,14 @@ impl ChatPane {
             resume,
         );
         ctx.env = self.agent_env.clone();
-        ctx.allowed_tools = vec!["Bash(deck:*)".into()];
+        // deck's own tools, acting for this chat, allowed without asking
+        // like the `deck` command is.
+        if let Some(deck) = crate::mcp::server_for(&self.agent_env) {
+            let mut servers = (*ctx.mcp).clone();
+            servers.push(deck);
+            ctx.mcp = Arc::new(servers);
+        }
+        ctx.allowed_tools = vec!["Bash(deck:*)".into(), "mcp__deck".into()];
         let mut conn = session::spawn(
             self.env.backend.handle(),
             entry.adapter.clone(),
@@ -1080,6 +1143,7 @@ impl ChatPane {
         let before = self.transcript.messages.len();
         self.transcript
             .push_user(out.text.clone(), out.blocks(), now());
+        self.checkpoint(before, cx);
         self.sync_list(before, &[], cx);
         let turn = out.turn(uuid_like());
         if let Some(prior) = prior {
@@ -1775,8 +1839,14 @@ impl ChatPane {
                                 self.status = ChatStatus::Working;
                             }
                         }
+                        AgentEvent::TurnFailed { status, message } => {
+                            self.failed = Some((*status, message.clone()));
+                        }
                         AgentEvent::TurnEnd { stop } => {
                             self.resuming = None;
+                            if stop.is_clean() {
+                                self.failed = None;
+                            }
                             // Whatever it was waiting on no longer matters.
                             self.asks.clear();
                             // Claude reports a turn stopped by Esc as an error.
@@ -1955,18 +2025,63 @@ impl ChatPane {
     }
 
     /// Right-click on a message: copy all of its text, as Copy under it does.
+    /// The right-click menu on a message. Your own messages (`mine` is the
+    /// message's place) can also take the thread back to before them.
     fn open_message_menu(
         &mut self,
         text: String,
+        mine: Option<usize>,
         at: gpui::Point<gpui::Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entries = vec![Item::new("Copy Message", move |_, cx| {
+        let mut entries = vec![Item::new("Copy Message", move |_, cx| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()))
         })
         .icon(Icon::Copy)
         .into()];
+        if let Some(ix) = mine {
+            let chat = cx.entity().downgrade();
+            let files = self.checkpoints.contains_key(&ix);
+            entries.push(Entry::Separator);
+            entries.push(
+                Item::new("Edit from Here", {
+                    let chat = chat.clone();
+                    move |_, cx| {
+                        let _ = chat.update(cx, |c, cx| c.rewind(ix, true, cx));
+                    }
+                })
+                .icon(Icon::Pencil)
+                .into(),
+            );
+            entries.push(
+                Item::new(
+                    if files {
+                        "Undo to Here (Files and Chat)"
+                    } else {
+                        "Undo to Here"
+                    },
+                    {
+                        let chat = chat.clone();
+                        move |_, cx| {
+                            let _ = chat.update(cx, |c, cx| c.rewind(ix, false, cx));
+                        }
+                    },
+                )
+                .icon(Icon::Refresh)
+                .into(),
+            );
+        }
+        if self.undo_rewind.is_some() {
+            let chat = cx.entity().downgrade();
+            entries.push(
+                Item::new("Put Files Back", move |_, cx| {
+                    let _ = chat.update(cx, |c, cx| c.put_files_back(cx));
+                })
+                .icon(Icon::ArrowUpRight)
+                .into(),
+            );
+        }
         let restore = Some(self.composer.read(cx).focus.clone());
         self.menu = Some(menu::open(
             entries,
@@ -1979,7 +2094,31 @@ impl ChatPane {
         cx.notify();
     }
 
-    fn render_message(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_message(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.sel_msg.set(ix);
+        self.sel_unit.set(0);
+        let el = self.render_message_body(ix, window, cx);
+        // Pieces it no longer has (a reply that re-rendered shorter) go.
+        let n = self.sel_unit.get();
+        let mut units = self.units.borrow_mut();
+        let gone: Vec<select::Key> = units.range((ix, n)..(ix + 1, 0)).map(|(k, _)| *k).collect();
+        for k in gone {
+            units.remove(&k);
+        }
+        el
+    }
+
+    fn render_message_body(
+        &mut self,
+        ix: usize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(msg) = self.transcript.messages.get(ix) else {
             return div().into_any_element();
         };
@@ -2017,10 +2156,20 @@ impl ChatPane {
                             .on_mouse_down(
                                 gpui::MouseButton::Right,
                                 cx.listener(move |c, ev: &gpui::MouseDownEvent, window, cx| {
-                                    c.open_message_menu(copy.clone(), ev.position, window, cx)
+                                    c.open_message_menu(
+                                        copy.clone(),
+                                        Some(ix),
+                                        ev.position,
+                                        window,
+                                        cx,
+                                    )
                                 }),
                             )
-                            .child(text),
+                            .child({
+                                let runs = plain_runs(text.len(), theme::UI, theme::text());
+                                let (t, rec) = self.unit_text(text.into(), runs, "\n\n", "");
+                                selectable(t.into_any_element(), rec)
+                            }),
                     );
                 }
                 // Sent, and nothing back yet: say it is being worked on.
@@ -2073,7 +2222,7 @@ impl ChatPane {
                     col = col.on_mouse_down(
                         gpui::MouseButton::Right,
                         cx.listener(move |c, ev: &gpui::MouseDownEvent, window, cx| {
-                            c.open_message_menu(copy.clone(), ev.position, window, cx)
+                            c.open_message_menu(copy.clone(), None, ev.position, window, cx)
                         }),
                     );
                 }
@@ -2086,6 +2235,34 @@ impl ChatPane {
                             self.render_work_log(ix, pi, bixes, &blocks, running, duration, cx)
                         }
                     });
+                }
+                // Working, but nothing new for a few seconds and no step
+                // turning: say it is thinking, and for how long, so it never
+                // looks stuck.
+                let quiet = self.last_activity.elapsed();
+                let stepping = matches!(parts.last(), Some(Part::Work(_)));
+                if live && !parts.is_empty() && !stepping && quiet >= Duration::from_secs(3) {
+                    col = col.child(rise_in(
+                        format!("quiet-{ix}"),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(u(6.))
+                            .h(u(24.))
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::text_2()))
+                            .child(crate::icon::thinking(
+                                ElementId::Name(format!("quiet-spin-{ix}").into()),
+                                Icon::agent(self.agent.as_str()),
+                                13.,
+                                theme::text_2(),
+                            ))
+                            .child(working_label(
+                                format!("quiet-label-{ix}"),
+                                format!("Thinking · {}", human_duration(quiet)).into(),
+                            ))
+                            .into_any_element(),
+                    ));
                 }
                 // The agent is working but has not said or done anything yet.
                 if live && parts.is_empty() {
@@ -2161,9 +2338,39 @@ impl ChatPane {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match block {
-            Block::Text { text, .. } => {
-                let doc = self.docs.entry((ix, bix)).or_default().update(text).clone();
-                self.render_doc(&format!("{ix}-{bix}"), &doc, cx)
+            Block::Text { text, open } => {
+                let shown = self.reveal_prefix((ix, bix), text, *open);
+                let caret = shown.len() < text.len() || (*open && self.busy());
+                let doc = self
+                    .docs
+                    .entry((ix, bix))
+                    .or_default()
+                    .update(shown)
+                    .clone();
+                let doc = self.render_doc(&format!("{ix}-{bix}"), &doc, cx);
+                if !caret {
+                    return doc;
+                }
+                // A soft pulse where the text is still coming out.
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(doc)
+                    .child(
+                        div()
+                            .mt(u(6.))
+                            .size(u(7.))
+                            .rounded_full()
+                            .bg(rgb(theme::text_2()))
+                            .with_animation(
+                                ElementId::Name(format!("caret-{ix}-{bix}").into()),
+                                Animation::new(Duration::from_millis(900))
+                                    .repeat()
+                                    .with_easing(gpui::ease_in_out),
+                                |d, t| d.opacity(0.25 + 0.75 * (1. - (t * 2. - 1.).abs())),
+                            ),
+                    )
+                    .into_any_element()
             }
             Block::Handoff { to, mode, .. } => div()
                 .text_size(u(12.))
@@ -2300,13 +2507,64 @@ impl ChatPane {
             let last_plan = blocks
                 .iter()
                 .rposition(|b| matches!(b, Block::Tool(t) if plan_items(t).is_some()));
-            for &bix in bixes {
-                list = list.child(match &blocks[bix] {
+            // A thought with nothing to read is no step at all; one still
+            // coming shows while it is the newest thing.
+            let shown: Vec<usize> = bixes
+                .iter()
+                .copied()
+                .filter(|&b| match &blocks[b] {
+                    Block::Reasoning { text, open } => {
+                        !text.trim().is_empty() || (*open && Some(&b) == bixes.last())
+                    }
+                    _ => true,
+                })
+                .collect();
+            // While it works, the newest few steps; the rest wait behind a
+            // line that opens them.
+            const LIVE_STEPS: usize = 4;
+            let all = !running || self.log_all.contains(&key);
+            let hidden = if all {
+                0
+            } else {
+                shown.len().saturating_sub(LIVE_STEPS)
+            };
+            if hidden > 0 {
+                list = list.child(
+                    div()
+                        .id(ElementId::Name(format!("log-more-{ix}-{pi}").into()))
+                        .flex()
+                        .items_center()
+                        .gap(u(6.))
+                        .h(u(24.))
+                        .text_size(u(12.))
+                        .text_color(rgb(theme::dim()))
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(rgb(theme::text_2())))
+                        .child(icon(Icon::ChevronUp, 11., theme::dim()))
+                        .child(if hidden == 1 {
+                            "1 earlier step".to_string()
+                        } else {
+                            format!("{hidden} earlier steps")
+                        })
+                        .on_click(cx.listener(move |c, _, _, cx| {
+                            c.log_all.insert(key);
+                            cx.notify();
+                        })),
+                );
+            }
+            for &bix in &shown[hidden..] {
+                let step = match &blocks[bix] {
                     Block::Tool(t) => self.render_step(t, Some(bix) == last_plan, cx),
                     Block::Reasoning { text, open } => {
                         self.render_thought(ix, bix, text, *open, cx)
                     }
                     _ => div().into_any_element(),
+                };
+                // A step slides in as it arrives.
+                list = list.child(if running {
+                    rise_in(format!("step-{ix}-{bix}"), step)
+                } else {
+                    step
                 });
             }
             log = log.child(fade_in(
@@ -3315,29 +3573,335 @@ impl ChatPane {
 
     /// A paragraph's text with its inline styles: inline code in the mono
     /// face, links underlined and clickable (they open in deck's browser).
+    #[allow(clippy::too_many_arguments)]
     fn rich_text(
         &self,
         id: String,
         spans: &Spans,
         color: u32,
         weight: FontWeight,
+        sep: &'static str,
+        prefix: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let text = StyledText::new(spans.text.clone()).with_runs(text_runs(spans, color, weight));
+        let (text, rec) = self.unit_text(
+            spans.text.clone().into(),
+            text_runs(spans, color, weight),
+            sep,
+            prefix,
+        );
         if spans.links.is_empty() {
-            return text.into_any_element();
+            return selectable(text.into_any_element(), rec);
         }
         let ranges: Vec<std::ops::Range<usize>> =
             spans.links.iter().map(|(r, _)| r.clone()).collect();
         let urls: Vec<String> = spans.links.iter().map(|(_, u)| u.clone()).collect();
         let chat = cx.entity().downgrade();
-        InteractiveText::new(ElementId::Name(id.into()), text)
+        let linked = InteractiveText::new(ElementId::Name(id.into()), text)
             .on_click(ranges, move |i, _, cx| {
                 if let Some(url) = urls.get(i).cloned() {
                     let _ = chat.update(cx, |_, cx| cx.emit(ChatEvent::OpenUrl(url)));
                 }
             })
-            .into_any_element()
+            .into_any_element();
+        selectable(linked, rec)
+    }
+
+    /// A piece of selectable text: its key in reading order, the selected
+    /// part lit, and its layout kept once painted. Returns the text and an
+    /// element to lay over it that records where it was painted.
+    fn unit_text(
+        &self,
+        text: SharedString,
+        runs: Vec<TextRun>,
+        sep: &'static str,
+        prefix: &str,
+    ) -> (StyledText, AnyElement) {
+        let key = (self.sel_msg.get(), self.sel_unit.get());
+        self.sel_unit.set(key.1 + 1);
+        self.units.borrow_mut().insert(
+            key,
+            select::Unit {
+                text: text.clone(),
+                sep,
+                prefix: prefix.to_string().into(),
+            },
+        );
+        let runs = match self.selection.and_then(|s| s.covers(key, text.len())) {
+            Some(r) => select::highlight(runs, r, rgb(theme::selection()).into()),
+            None => runs,
+        };
+        let styled = StyledText::new(text).with_runs(runs);
+        let layout = styled.layout().clone();
+        let painted = self.painted.clone();
+        // Laid over the text and prepainted after it, so the layout it
+        // keeps has this frame's position.
+        let rec = canvas(
+            move |bounds, _, _| {
+                painted.borrow_mut().push(select::Painted {
+                    key,
+                    layout,
+                    bounds,
+                })
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .into_any_element();
+        (styled, rec)
+    }
+
+    // -- selecting text ---------------------------------------------------------
+
+    fn select_down(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
+        let hit = select::hit(&self.painted.borrow(), ev.position);
+        let had = self.selection.is_some();
+        self.selection = None;
+        self.selecting = false;
+        if let Some(spot) = hit {
+            let len = self
+                .units
+                .borrow()
+                .get(&spot.key)
+                .map_or(0, |u| u.text.len());
+            let range = match ev.click_count {
+                1 => spot.at..spot.at,
+                2 => self
+                    .units
+                    .borrow()
+                    .get(&spot.key)
+                    .map_or(spot.at..spot.at, |u| select::word(&u.text, spot.at)),
+                _ => 0..len,
+            };
+            self.selection = Some(select::Selection {
+                anchor: select::Spot {
+                    key: spot.key,
+                    at: range.start,
+                },
+                focus: select::Spot {
+                    key: spot.key,
+                    at: range.end,
+                },
+            });
+            self.selecting = ev.click_count == 1;
+        }
+        if had || hit.is_some() {
+            cx.notify();
+        }
+    }
+
+    fn select_drag(&mut self, p: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let Some(sel) = self.selection.as_mut() else {
+            return;
+        };
+        if let Some(spot) = select::nearest(&self.painted.borrow(), p) {
+            if sel.focus != spot {
+                sel.focus = spot;
+                cx.notify();
+            }
+        }
+    }
+
+    fn select_up(&mut self, cx: &mut Context<Self>) {
+        self.selecting = false;
+        if self.selection.is_some_and(|s| s.is_empty()) {
+            self.selection = None;
+            cx.notify();
+        }
+    }
+
+    // -- checkpoints ------------------------------------------------------------
+
+    /// Keep the project's files as they are now, in the background, as the
+    /// checkpoint for message `ix`. The agent takes seconds to make its
+    /// first change; the snapshot takes milliseconds.
+    fn checkpoint(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let dir = self.cwd.clone();
+        let name = crate::checkpoint::refname(&self.thread_id, &ix.to_string());
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn(async move { crate::checkpoint::save(&dir, &name) })
+                .await;
+            match saved {
+                Ok(commit) => {
+                    let _ = this.update(cx, |c, cx| {
+                        c.checkpoints.insert(ix, commit);
+                        c.schedule_save(cx);
+                    });
+                }
+                Err(e) => tracing::debug!("no checkpoint: {e}"),
+            }
+        })
+        .detach();
+    }
+
+    /// Go back to before message `ix`: the project's files as they were
+    /// when it was sent (when a checkpoint has them) and the thread cut
+    /// there. With `edit`, the message comes back into the composer.
+    fn rewind(&mut self, ix: usize, edit: bool, cx: &mut Context<Self>) {
+        let Some(msg) = self.transcript.messages.get(ix) else {
+            return;
+        };
+        let text = message_text(msg);
+        // The agent's session holds the turns being dropped: it ends, and
+        // the next message starts a fresh one with the thread so far.
+        if let Some(conn) = self.conn.take() {
+            conn.shutdown();
+        }
+        self.native_id = None;
+        self.status = ChatStatus::Idle;
+        self.asks.clear();
+        self.inflight.clear();
+        self.queued.clear();
+        self.retry = None;
+        self._retry = None;
+        self.retries = 0;
+        self.error = None;
+        self.failed = None;
+        self.turn_started = None;
+        self.resuming = None;
+        self.interrupting = false;
+        self.selection = None;
+        self.transcript.messages.truncate(ix);
+        self.docs.retain(|(m, _), _| *m < ix);
+        self.worked.retain(|m, _| *m < ix);
+        self.reveal.retain(|(m, _), _| *m < ix);
+        self.log_all.retain(|(m, _)| *m < ix);
+        self.log_open.retain(|(m, _), _| *m < ix);
+        self.units.borrow_mut().retain(|k, _| k.0 < ix);
+        let target = self.checkpoints.get(&ix).cloned();
+        self.checkpoints.retain(|m, _| *m < ix);
+        self.list.reset(self.transcript.messages.len());
+        if edit {
+            self.composer.update(cx, |f, cx| f.set_text(&text, cx));
+        }
+        match target {
+            Some(target) => {
+                self.refine_note = Some("Putting the files back…".into());
+                self.restore_files(target, "before-rewind", true, cx);
+            }
+            None => {
+                self.refine_note = Some(
+                    "Went back. That message has no checkpoint, so the files are as they were."
+                        .into(),
+                );
+            }
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Undo the last going back: the files as they were just before it.
+    fn put_files_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(commit) = self.undo_rewind.take() {
+            self.restore_files(commit, "after-rewind", false, cx);
+        }
+    }
+
+    /// Restore the files to `target` in the background, first keeping how
+    /// they are now under `keep_as` (kept to undo it when `undoable`).
+    fn restore_files(
+        &mut self,
+        target: String,
+        keep_as: &str,
+        undoable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self.cwd.clone();
+        let keep = crate::checkpoint::refname(&self.thread_id, keep_as);
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    let now = crate::checkpoint::save(&dir, &keep)?;
+                    let n = crate::checkpoint::restore(&dir, &target, &now)?;
+                    Ok::<_, String>((now, n))
+                })
+                .await;
+            let _ = this.update(cx, |c, cx| {
+                c.refine_note = Some(match done {
+                    Ok((now, n)) => {
+                        let files = if n == 1 { "file" } else { "files" };
+                        if undoable {
+                            c.undo_rewind = Some(now);
+                            format!("Went back: {n} {files} restored. Right-click a message to put them back.")
+                        } else {
+                            format!("Put back: {n} {files} restored.")
+                        }
+                        .into()
+                    }
+                    Err(e) => format!("The files could not be restored: {e}").into(),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `;keyword ` just typed in the composer: put that snippet in its place.
+    fn expand_keyword(&mut self, cx: &mut Context<Self>) {
+        let found = {
+            let f = self.composer.read(cx);
+            crate::snippets::trigger(f.before_caret()).map(|(len, w)| (len, w.to_string()))
+        };
+        let Some((len, word)) = found else { return };
+        let root = crate::inspect::project_root(&self.cwd);
+        let Some(s) = crate::snippets::load_all(Some(&root))
+            .into_iter()
+            .find(|s| s.keyword == word)
+        else {
+            return;
+        };
+        let text = crate::snippets::expand(&s.body, |var| match var {
+            "clipboard" => cx.read_from_clipboard().and_then(|c| c.text()),
+            "selection" => self.selected_text(),
+            "branch" => crate::snippets::branch(&self.cwd),
+            "folder" => Some(self.cwd.display().to_string()),
+            _ => None,
+        });
+        self.composer
+            .update(cx, |f, cx| f.replace_before_caret(len, &text, cx));
+    }
+
+    /// The part of a streaming text block to show now. Text arrives in
+    /// bursts; on screen it comes out at a steady pace that speeds up with
+    /// how far behind it is (all of it within a fraction of a second), so
+    /// nothing jumps. A block first seen finished (a restored thread, a
+    /// reply that arrived whole) shows at once.
+    fn reveal_prefix<'a>(&mut self, key: (usize, usize), text: &'a str, open: bool) -> &'a str {
+        let now = Instant::now();
+        let total = text.len() as f32;
+        let (shown, at) = self
+            .reveal
+            .entry(key)
+            .or_insert((if open { 0. } else { total }, now));
+        if *shown >= total {
+            *shown = total;
+            *at = now;
+            return text;
+        }
+        let dt = now.duration_since(*at).as_secs_f32().min(0.1);
+        let behind = total - *shown;
+        let pace = (behind * 4.).max(90.);
+        *shown = (*shown + pace * dt).min(total);
+        *at = now;
+        self.revealing.set(true);
+        let mut cut = *shown as usize;
+        while cut < text.len() && !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        &text[..cut]
+    }
+
+    /// The selected text, if any is selected.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.filter(|s| !s.is_empty())?;
+        let text = select::text(&self.units.borrow(), &sel);
+        (!text.is_empty()).then_some(text)
     }
 
     /// Markdown blocks as elements: monochrome, one text layout per paragraph.
@@ -3351,7 +3915,7 @@ impl ChatPane {
             let id = format!("md-{key}-{bi}");
             col = col.child(match block {
                 MdBlock::Paragraph(s) => div()
-                    .child(self.rich_text(id, s, theme::text(), FontWeight::NORMAL, cx))
+                    .child(self.rich_text(id, s, theme::text(), FontWeight::NORMAL, "\n\n", "", cx))
                     .into_any_element(),
                 MdBlock::Heading { level, spans } => div()
                     .pt(u(if *level <= 2 { 8. } else { 4. }))
@@ -3365,7 +3929,15 @@ impl ChatPane {
                         2 => 23.,
                         _ => 21.,
                     }))
-                    .child(self.rich_text(id, spans, theme::text(), FontWeight::SEMIBOLD, cx))
+                    .child(self.rich_text(
+                        id,
+                        spans,
+                        theme::text(),
+                        FontWeight::SEMIBOLD,
+                        "\n\n",
+                        "",
+                        cx,
+                    ))
                     .into_any_element(),
                 MdBlock::Code { lang, code, open } => self.render_code(&id, lang, code, *open, cx),
                 MdBlock::List { items } => {
@@ -3373,6 +3945,17 @@ impl ChatPane {
                     for (ii, item) in items.iter().enumerate() {
                         let task = item.marker == "☐" || item.marker == "☑";
                         let ordered = item.marker.ends_with('.');
+                        // Copied as Markdown would write it.
+                        let prefix = format!(
+                            "{}{} ",
+                            "  ".repeat(item.depth as usize),
+                            match item.marker.as_str() {
+                                "☐" => "- [ ]",
+                                "☑" => "- [x]",
+                                m if ordered => m,
+                                _ => "-",
+                            }
+                        );
                         l = l.child(
                             div()
                                 .flex()
@@ -3399,6 +3982,8 @@ impl ChatPane {
                                         theme::text()
                                     },
                                     FontWeight::NORMAL,
+                                    if ii == 0 { "\n\n" } else { "\n" },
+                                    &prefix,
                                     cx,
                                 ))),
                         );
@@ -3409,7 +3994,15 @@ impl ChatPane {
                     .pl(u(12.))
                     .border_l_2()
                     .border_color(rgb(theme::surface_hover()))
-                    .child(self.rich_text(id, s, theme::text_2(), FontWeight::NORMAL, cx))
+                    .child(self.rich_text(
+                        id,
+                        s,
+                        theme::text_2(),
+                        FontWeight::NORMAL,
+                        "\n\n",
+                        "> ",
+                        cx,
+                    ))
                     .into_any_element(),
                 MdBlock::Rule => div()
                     .my(u(4.))
@@ -3442,11 +4035,18 @@ impl ChatPane {
                             } else {
                                 FontWeight::NORMAL
                             };
+                            let sep = match (ri, ci) {
+                                (0, 0) => "\n\n",
+                                (_, 0) => "\n",
+                                _ => "\t",
+                            };
                             r = r.child(div().flex_1().min_w_0().child(self.rich_text(
                                 format!("{id}-{ri}-{ci}"),
                                 c,
                                 theme::text(),
                                 weight,
+                                sep,
+                                "",
                                 cx,
                             )));
                         }
@@ -3537,7 +4137,11 @@ impl ChatPane {
                     .text_size(u(12.))
                     .line_height(u(18.))
                     .text_color(rgb(theme::text()))
-                    .child(div().whitespace_nowrap().child(code.to_string())),
+                    .child(div().whitespace_nowrap().child({
+                        let runs = plain_runs(code.len(), theme::MONO, theme::text());
+                        let (t, rec) = self.unit_text(code.to_string().into(), runs, "\n\n", "");
+                        selectable(t.into_any_element(), rec)
+                    })),
             )
             .into_any_element()
     }
@@ -3547,6 +4151,31 @@ impl ChatPane {
 enum Part {
     One(usize),
     Work(Vec<usize>),
+}
+
+/// One run over all of a plain text.
+fn plain_runs(len: usize, family: &'static str, color: u32) -> Vec<TextRun> {
+    if len == 0 {
+        return Vec::new();
+    }
+    vec![TextRun {
+        len,
+        font: gpui::font(family),
+        color: rgb(color).into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }]
+}
+
+/// Selectable text with the I-beam, and the recorder laid over it.
+fn selectable(text: AnyElement, rec: AnyElement) -> AnyElement {
+    div()
+        .relative()
+        .cursor_text()
+        .child(text)
+        .child(rec)
+        .into_any_element()
 }
 
 /// The width readable text never exceeds.
@@ -4070,6 +4699,19 @@ fn render_command(command: &str, output: &str, failed: bool, running: bool) -> A
 
 /// Content that eases in as it appears, so opening a log or a step does not
 /// pop.
+/// Fades in while rising a few points into place, for steps and lines that
+/// arrive while the agent works.
+fn rise_in(id: String, el: AnyElement) -> AnyElement {
+    div()
+        .child(el)
+        .with_animation(
+            ElementId::Name(id.into()),
+            Animation::new(Duration::from_millis(220)).with_easing(gpui::ease_in_out),
+            |d, t| d.opacity(t).mt(u(6. * (1. - t))),
+        )
+        .into_any_element()
+}
+
 fn fade_in(id: String, el: AnyElement) -> AnyElement {
     div()
         .child(el)
@@ -4206,6 +4848,12 @@ fn render_output(text: &str, diff: bool, keep: usize) -> AnyElement {
 impl Render for ChatPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let empty = self.transcript.messages.is_empty();
+        // Refilled as the transcript's text is painted below.
+        self.painted.borrow_mut().clear();
+        // Text still coming out on screen: draw again next frame.
+        if self.revealing.replace(false) {
+            window.request_animation_frame();
+        }
         div()
             .size_full()
             .flex()
@@ -4215,8 +4863,32 @@ impl Render for ChatPane {
             .line_height(u(21.))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Focused)),
+                cx.listener(|c, ev: &gpui::MouseDownEvent, _, cx| {
+                    c.select_down(ev, cx);
+                    cx.emit(ChatEvent::Focused)
+                }),
             )
+            .on_mouse_move(cx.listener(|c, ev: &gpui::MouseMoveEvent, _, cx| {
+                if c.selecting && ev.pressed_button == Some(gpui::MouseButton::Left) {
+                    c.select_drag(ev.position, cx);
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|c, _, _, cx| c.select_up(cx)),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|c, _, _, cx| c.select_up(cx)),
+            )
+            // ⌘C copies the transcript's selection before the composer,
+            // which has the keyboard, can take it.
+            .capture_action(cx.listener(|c, _: &crate::workspace::Copy, _, cx| {
+                if let Some(text) = c.selected_text() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                    cx.stop_propagation();
+                }
+            }))
             // Files dragged in from Finder are attached to the next message.
             .on_drop(cx.listener(|c, paths: &ExternalPaths, window, cx| {
                 c.attach_paths(paths.paths(), cx);
@@ -4274,6 +4946,39 @@ const FILES_STALE: Duration = Duration::from_secs(20);
 
 /// Most files offered to `@`; past this a project is better found by typing.
 const MAX_FILES: usize = 50_000;
+
+/// Listings by project, shared by every ⌘K, so a big repository is not
+/// listed again each time the palette opens.
+#[allow(clippy::type_complexity)]
+static FILE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, (Instant, Arc<Vec<String>>)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// `project_files`, from the cache when it has the project. One older than
+/// `FILES_STALE` is still returned at once and listed again behind it, for
+/// next time. Blocking on a miss: call it off the main thread.
+pub fn project_files_cached(cwd: &std::path::Path) -> Arc<Vec<String>> {
+    let cache = || FILE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let hit = cache().get(cwd).cloned();
+    if let Some((at, files)) = hit {
+        if at.elapsed() > FILES_STALE {
+            // Marked fresh first, so opening ⌘K twice lists it once.
+            cache().insert(cwd.to_path_buf(), (Instant::now(), files.clone()));
+            let cwd = cwd.to_path_buf();
+            std::thread::spawn(move || {
+                let files = Arc::new(project_files(&cwd));
+                FILE_CACHE
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(cwd, (Instant::now(), files));
+            });
+        }
+        return files;
+    }
+    let files = Arc::new(project_files(cwd));
+    cache().insert(cwd.to_path_buf(), (Instant::now(), files.clone()));
+    files
+}
 
 /// Paths under `cwd`, relative to it, with each folder listed once (ending
 /// in `/`) so folders can be mentioned too.

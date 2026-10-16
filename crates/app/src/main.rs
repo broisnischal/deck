@@ -3,19 +3,25 @@
 //! One binary is both the app and its control CLI: `deck` opens a window;
 //! `deck pane list` (and friends), run from a terminal inside it, drives it.
 
+mod account;
 mod browser;
 mod chat;
+mod checkpoint;
 mod cli;
 mod control;
 mod favicon;
 mod field;
 mod fuzzy;
+mod handler;
 mod history;
 mod icon;
 mod inspect;
 mod inspector;
+mod keys;
 mod launcher;
+mod lock;
 mod markdown;
+mod mcp;
 mod menu;
 mod net;
 mod notify;
@@ -24,15 +30,18 @@ mod pasteboard;
 mod refine;
 mod retry;
 mod review;
+mod select;
 mod session;
 mod settings;
 mod settings_pane;
+mod shot;
 mod snippets;
 mod tasks;
 mod terminal;
 mod textbuf;
 mod theme;
 mod threads;
+mod updates;
 mod workspace;
 
 use gpui::prelude::*;
@@ -61,41 +70,43 @@ fn main() {
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/"));
 
-    Application::new()
-        .with_assets(icon::Assets)
-        .run(move |cx: &mut App| {
-            workspace::install(cx);
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-
-            let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
-            let background = std::env::var_os("DECK_BACKGROUND").is_some();
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    // The sidebar draws under a transparent titlebar, with the
-                    // traffic lights sitting in its top strip.
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Deck".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(14.), px(14.))),
-                    }),
-                    // Scripted checks open a window that does not take the
-                    // keyboard from whatever the user is typing in.
-                    focus: !background,
-                    ..Default::default()
-                },
-                |window, cx| cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx)),
-            )
-            .expect("failed to open window");
-            if !background {
-                cx.activate(true);
+    let app = Application::new().with_assets(icon::Assets);
+    // Scripts and terminal links macOS hands deck (when it is the default
+    // terminal) open in new tabs; the window picks them up when it exists.
+    app.on_open_urls(handler::opened);
+    app.run(move |cx: &mut App| {
+        workspace::install(cx);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
             }
-        });
+        })
+        .detach();
+
+        let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
+        let background = std::env::var_os("DECK_BACKGROUND").is_some();
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // The sidebar draws under a transparent titlebar, with the
+                // traffic lights sitting in its top strip.
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Deck".into()),
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(14.), px(14.))),
+                }),
+                // Scripted checks open a window that does not take the
+                // keyboard from whatever the user is typing in.
+                focus: !background,
+                ..Default::default()
+            },
+            |window, cx| cx.new(|cx| workspace::Workspace::new(cwd.clone(), window, cx)),
+        )
+        .expect("failed to open window");
+        if !background {
+            cx.activate(true);
+        }
+    });
 }
 
 /// Apps started from Finder or the Dock get launchd's bare `PATH`
@@ -138,8 +149,18 @@ pub(crate) fn adopt_shell_path() {
         let _ = stdout.read_to_string(&mut out);
     }
     if let Some(path) = shell_path(&out) {
-        std::env::set_var("PATH", path);
+        std::env::set_var("PATH", tidy_path(path));
     }
+}
+
+/// `PATH` with each folder once, first place kept. Without it every deck
+/// started from a deck terminal added its own folder again.
+pub fn tidy_path(path: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    path.split(':')
+        .filter(|p| !p.is_empty() && seen.insert(*p))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// The `PATH` line from the shell's output, skipping whatever its startup
@@ -152,7 +173,12 @@ fn shell_path(out: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_path;
+    use super::{shell_path, tidy_path};
+
+    #[test]
+    fn path_keeps_each_folder_once() {
+        assert_eq!(tidy_path("/a:/b:/a::/c:/b"), "/a:/b:/c");
+    }
 
     #[test]
     fn the_path_line_is_found_among_shell_noise() {

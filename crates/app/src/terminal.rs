@@ -106,6 +106,8 @@ pub struct Look {
     pub blink: bool,
     /// Option sends Esc+key (Meta) instead of typing Option-characters.
     pub option_meta: bool,
+    /// Programs' coloured backgrounds (diffs, highlights) drawn as a tint.
+    pub soften: bool,
 }
 
 /// Half a blink cycle, as macOS text fields use.
@@ -1008,6 +1010,25 @@ fn on_grid(ch: char) -> bool {
     matches!(ch as u32, 0x20..=0x7e | 0xa0..=0x17f | 0x2500..=0x259f)
 }
 
+/// A program's coloured background as a tint of the pane rather than a
+/// solid block: a third of its saturation taken out, then 40% of the way to
+/// the pane's colour. Claude Code's diffs, for one, otherwise paint whole
+/// lines in deep green and red. Greys (bars, input boxes) are left as they
+/// are; they carry the layout.
+fn soften(color: u32, pane: u32) -> u32 {
+    let ch = |c: u32, shift: u32| ((c >> shift) & 0xff) as f32;
+    let (r, g, b) = (ch(color, 16), ch(color, 8), ch(color, 0));
+    if r.max(g).max(b) - r.min(g).min(b) < 24. {
+        return color;
+    }
+    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    let mix = |c: f32, p: f32| {
+        let grey = c + (luma - c) * 0.35;
+        (grey * 0.6 + p * 0.4).round().clamp(0., 255.) as u32
+    };
+    (mix(r, ch(pane, 16)) << 16) | (mix(g, ch(pane, 8)) << 8) | mix(b, ch(pane, 0))
+}
+
 /// One screen row, shaped: glyph runs at their column and background fills
 /// as (column, width in columns, colour). Positions are in columns so the
 /// row can be reused wherever the grid is painted.
@@ -1212,6 +1233,17 @@ impl Element for Grid {
             pane.look.palette.fg,
             pane.look.cursor_color,
         );
+        let mut fills = fills;
+        if pane.look.soften {
+            let p = &pane.look.palette;
+            // Deck's own fills (selection, find) keep the colour chosen for them.
+            let ours = [p.selection, p.search, p.search_focus];
+            for (_, c) in fills.iter_mut() {
+                if !ours.contains(c) {
+                    *c = soften(*c, bg);
+                }
+            }
+        }
         let cursor = cursor_at
             .filter(|_| pane.blink_on)
             .map(|b| (b, snap.cursor_shape));
@@ -1447,6 +1479,25 @@ fn meta_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use gpui::Modifiers;
+
+    #[test]
+    fn coloured_backgrounds_become_tints_and_greys_stay() {
+        let pane = 0x232323;
+        // Claude Code's diff lines, measured off a screenshot.
+        let green = soften(0x0e2705, pane);
+        let red = soften(0x370603, pane);
+        let sat = |c: u32| {
+            let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+            r.max(g).max(b) - r.min(g).min(b)
+        };
+        assert!(sat(green) < sat(0x0e2705) / 2, "{green:06x}");
+        assert!(sat(red) < sat(0x370603) / 2, "{red:06x}");
+        // Still green and still red.
+        assert!((green >> 8) & 0xff > green >> 16 && (green >> 8) & 0xff > green & 0xff);
+        assert!(red >> 16 > (red >> 8) & 0xff);
+        // A grey bar is left alone.
+        assert_eq!(soften(0x373737, pane), 0x373737);
+    }
 
     fn ks(key: &str, ch: Option<&str>, m: Modifiers) -> Keystroke {
         Keystroke {

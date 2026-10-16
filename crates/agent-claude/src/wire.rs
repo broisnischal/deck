@@ -138,6 +138,9 @@ pub struct ResultLine {
     pub is_error: bool,
     #[serde(default)]
     pub result: Option<String>,
+    /// The HTTP status of the API call that failed the turn, when one did.
+    #[serde(default)]
+    pub api_error_status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]

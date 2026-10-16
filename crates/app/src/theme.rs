@@ -255,6 +255,10 @@ pub fn dim() -> u32 {
 pub fn accent() -> u32 {
     current().accent
 }
+/// Red for what takes something away (Lock, Delete), readable on every
+/// theme's menu.
+pub const DANGER: u32 = 0xe5534b;
+
 pub fn selection() -> u32 {
     current().selection
 }

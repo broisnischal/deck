@@ -3,3 +3,4 @@
 
 # Local Claude Code / plugin state
 .claude/
+/dist

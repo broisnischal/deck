@@ -715,6 +715,31 @@ const STALE_ENV: &[&str] = &[
     "CLAUDE_CODE_MESSAGING_TOKEN",
 ];
 
+/// The user's login shell, without the `Last login: …` banner.
+///
+/// Left to itself `alacritty_terminal` runs the shell through `/usr/bin/login`
+/// so it gets a utmp entry, and `login` prints the last-login line unless
+/// `~/.hushlogin` exists. This is the same command with `-q` added, so the
+/// banner is gone without anyone having to create that file.
+#[cfg(target_os = "macos")]
+fn login_shell() -> Option<tty::Shell> {
+    let user = std::env::var("USER").ok().filter(|u| !u.is_empty())?;
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let name = shell.rsplit('/').next().unwrap_or("zsh");
+    // -f skips authentication, -l keeps the cwd, -p keeps the environment.
+    // zsh runs the `exec -a` that makes the real shell a login shell.
+    let exec = format!("exec -a -{name} {shell}");
+    Some(tty::Shell::new(
+        "/usr/bin/login".into(),
+        vec!["-qflp".into(), user, "/bin/zsh".into(), "-fc".into(), exec],
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn login_shell() -> Option<tty::Shell> {
+    None
+}
+
 fn base_env() -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
     env.insert("TERM".into(), TERM_NAME.into());
@@ -830,9 +855,10 @@ impl Terminal {
         let mut env = base_env();
         env.extend(spawn.env);
         let options = tty::Options {
-            shell: spawn
-                .program
-                .map(|program| tty::Shell::new(program, spawn.args)),
+            shell: match spawn.program {
+                Some(program) => Some(tty::Shell::new(program, spawn.args)),
+                None => login_shell(),
+            },
             working_directory: spawn.cwd,
             drain_on_exit: true,
             env,

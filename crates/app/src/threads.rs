@@ -26,6 +26,9 @@ pub struct Saved {
     pub native_id: Option<String>,
     /// How long each finished turn took: (assistant message, millis).
     pub worked: Vec<(usize, u64)>,
+    /// The project's files when each message was sent: (message, commit),
+    /// to go back to.
+    pub checkpoints: Vec<(usize, String)>,
     /// Unix millis of the last change; restored threads open oldest first.
     pub updated: i64,
 }
@@ -37,6 +40,64 @@ pub fn dir() -> PathBuf {
 /// Where pasted images are kept until the thread is done with them.
 pub fn attachments_dir() -> PathBuf {
     crate::control::socket_dir().join("attachments")
+}
+
+/// Pasted images are kept this long even when no thread names them: one
+/// pasted into a terminal goes to the agent there, which deck cannot see.
+const KEEP_UNUSED: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Delete pasted images no saved thread (open or archived) refers to, once
+/// they are a week old. Runs at startup, off the main thread.
+pub fn prune_attachments() {
+    let Ok(entries) = std::fs::read_dir(attachments_dir()) else {
+        return;
+    };
+    let mut used = std::collections::HashSet::new();
+    for d in [dir(), dir().join("archive")] {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            if let Ok(text) = std::fs::read_to_string(e.path()) {
+                used.extend(pasted_names(&text));
+            }
+        }
+    }
+    let now = std::time::SystemTime::now();
+    let mut freed = 0u64;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("pasted-") || used.contains(&name) {
+            continue;
+        }
+        let Ok(meta) = e.metadata() else { continue };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age > KEEP_UNUSED);
+        if old && std::fs::remove_file(e.path()).is_ok() {
+            freed += meta.len();
+        }
+    }
+    if freed > 0 {
+        tracing::info!("pruned {freed} bytes of pasted images no thread uses");
+    }
+}
+
+/// The `pasted-<millis>.<ext>` file names that appear in `text`.
+fn pasted_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find("pasted-") {
+        let tail = &rest[i..];
+        let end = tail[7..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+            .map_or(tail.len(), |j| 7 + j);
+        let name = tail[..end].trim_end_matches('.');
+        if name.len() > 7 && name.contains('.') {
+            out.push(name.to_string());
+        }
+        rest = &tail[7..];
+    }
+    out
 }
 
 /// Every saved thread, oldest first. A file that no longer parses is left
@@ -87,6 +148,12 @@ pub fn archive(id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_names_are_found_in_thread_text() {
+        let text = r#"{"path":"/x/attachments/pasted-1712.png","b":"see pasted-99.jpeg."} pasted- pasted-x"#;
+        assert_eq!(pasted_names(text), ["pasted-1712.png", "pasted-99.jpeg"]);
+    }
 
     #[test]
     fn an_older_file_with_missing_fields_still_loads() {

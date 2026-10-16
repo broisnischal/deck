@@ -1332,7 +1332,9 @@ impl BrowserPane {
             .max_w(relative(0.9));
 
         if !self.top.is_empty() {
-            let mut grid = div().flex().flex_wrap().gap(u(4.));
+            // Rows of four, built as rows: a wrapping flex box is measured
+            // as one line, so its tiles stacked and ran over what followed.
+            let mut tiles: Vec<AnyElement> = Vec::new();
             for (i, v) in self.top.iter().enumerate() {
                 let url = v.url.clone();
                 let host = history::host(&v.url).to_string();
@@ -1350,7 +1352,7 @@ impl BrowserPane {
                         )
                         .into_any_element(),
                 };
-                grid = grid.child(
+                tiles.push(
                     div()
                         .id(ElementId::NamedInteger("top".into(), i as u64))
                         .group("tile")
@@ -1384,10 +1386,23 @@ impl BrowserPane {
                                 .text_color(rgb(theme::text_2()))
                                 .child(host),
                         )
-                        .on_click(cx.listener(move |p, _, _, cx| p.open(&url, cx))),
+                        .on_click(cx.listener(move |p, _, _, cx| p.open(&url, cx)))
+                        .into_any_element(),
                 );
             }
-            col = col.child(div().child(label("Frequently visited")).child(grid));
+            let mut grid = div().flex().flex_col().gap(u(4.));
+            let mut tiles = tiles.into_iter().peekable();
+            while tiles.peek().is_some() {
+                grid = grid.child(div().flex().gap(u(4.)).children(tiles.by_ref().take(4)));
+            }
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(label("Frequently visited"))
+                    .child(grid),
+            );
         }
 
         if !self.servers.is_empty() {
@@ -1423,7 +1438,14 @@ impl BrowserPane {
                         .on_click(cx.listener(move |p, _, _, cx| p.open(&url, cx))),
                 );
             }
-            col = col.child(div().child(label("Running on this Mac")).child(rows));
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(label("Running on this Mac"))
+                    .child(rows),
+            );
         }
 
         if self.top.is_empty() && self.servers.is_empty() {

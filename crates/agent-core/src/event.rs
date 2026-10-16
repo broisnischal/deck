@@ -29,7 +29,9 @@ pub enum AgentEvent {
     },
 
     /// A tool invocation began. `title` is a short human label the UI shows on
-    /// the collapsed card (e.g. `ls vendor/gpui-component`).
+    /// the collapsed card (e.g. `ls vendor/gpui-component`). A backend may send
+    /// it early with partial `input` and again with the same `id` once all of
+    /// the input has arrived; the repeat updates the same call.
     ToolCall {
         id: ToolId,
         name: SmolStr,
@@ -77,6 +79,13 @@ pub enum AgentEvent {
     },
 
     Usage(Usage),
+
+    /// The turn failed: the API's HTTP status when the backend reports it,
+    /// and what it said. Comes just before its `TurnEnd`.
+    TurnFailed {
+        status: Option<u16>,
+        message: String,
+    },
 
     TurnEnd {
         stop: StopReason,

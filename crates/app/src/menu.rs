@@ -23,8 +23,10 @@ type Run = Rc<dyn Fn(&mut Window, &mut App)>;
 pub struct Item {
     label: SharedString,
     icon: Option<Icon>,
-    shortcut: Option<&'static str>,
+    shortcut: Option<SharedString>,
     disabled: bool,
+    /// Drawn in red: it takes something away (Lock, Delete).
+    danger: bool,
     action: Run,
 }
 
@@ -38,6 +40,7 @@ impl Item {
             icon: None,
             shortcut: None,
             disabled: false,
+            danger: false,
             action: Rc::new(action),
         }
     }
@@ -48,8 +51,13 @@ impl Item {
     }
 
     /// The key that does the same thing, shown as a hint ("⌘C").
-    pub fn shortcut(mut self, keys: &'static str) -> Self {
-        self.shortcut = Some(keys);
+    pub fn shortcut(mut self, keys: impl Into<SharedString>) -> Self {
+        self.shortcut = Some(keys.into()).filter(|k: &SharedString| !k.is_empty());
+        self
+    }
+
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
         self
     }
 
@@ -276,11 +284,15 @@ impl Render for ContextMenu {
                     let lit = self.highlight == Some(ix) && !item.disabled;
                     let fg = if item.disabled {
                         theme::dim()
+                    } else if item.danger {
+                        theme::DANGER
                     } else {
                         theme::text()
                     };
                     let glyph = if item.disabled {
                         theme::dim()
+                    } else if item.danger {
+                        theme::DANGER
                     } else {
                         theme::text_2()
                     };
@@ -299,7 +311,7 @@ impl Render for ContextMenu {
                             None => d.child(div().flex_none().size(u(14.))),
                         })
                         .child(div().flex_1().whitespace_nowrap().child(item.label.clone()))
-                        .when_some(item.shortcut, |d, keys| {
+                        .when_some(item.shortcut.clone(), |d, keys| {
                             d.child(
                                 div()
                                     .pl(u(20.))

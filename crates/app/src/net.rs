@@ -45,6 +45,51 @@ pub async fn get(url: &str, timeout: f64) -> Option<Vec<u8>> {
     rx.await.ok().flatten()
 }
 
+/// An HTTP request with a method, headers and a body: the status and body
+/// of whatever came back (any status), or `None` when nothing did.
+pub async fn request(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<Vec<u8>>,
+    timeout: f64,
+) -> Option<(u16, Vec<u8>)> {
+    use objc2_foundation::NSMutableURLRequest;
+    let url = NSURL::URLWithString(&NSString::from_str(url))?;
+    let request = NSMutableURLRequest::requestWithURL(&url);
+    request.setHTTPMethod(&NSString::from_str(method));
+    request.setTimeoutInterval(timeout);
+    for (k, v) in headers {
+        request.setValue_forHTTPHeaderField(Some(&NSString::from_str(v)), &NSString::from_str(k));
+    }
+    if let Some(b) = body {
+        request.setHTTPBody(Some(&NSData::from_vec(b)));
+    }
+    let (tx, rx) = oneshot::channel::<Option<(u16, Vec<u8>)>>();
+    let tx = Mutex::new(Some(tx));
+    let done = RcBlock::new(
+        move |data: *mut NSData, response: *mut NSURLResponse, error: *mut NSError| {
+            // SAFETY: NSURLSession hands over valid objects or null.
+            let (data, response) = unsafe { (data.as_ref(), response.as_ref()) };
+            let status = response
+                .and_then(|r| r.downcast_ref::<NSHTTPURLResponse>())
+                .map(|r| r.statusCode() as u16);
+            let answer = status
+                .filter(|_| error.is_null())
+                .map(|st| (st, data.map(|d| d.to_vec()).unwrap_or_default()));
+            if let Some(tx) = tx.lock().ok().and_then(|mut t| t.take()) {
+                let _ = tx.send(answer);
+            }
+        },
+    );
+    // SAFETY: as in `get`.
+    let task = unsafe {
+        NSURLSession::sharedSession().dataTaskWithRequest_completionHandler(&request, &done)
+    };
+    task.resume();
+    rx.await.ok().flatten()
+}
+
 /// The search engine's suggestions for `query`, best first. Each of these
 /// answers in the OpenSearch shape; Kagi needs a login, so it borrows
 /// DuckDuckGo's.

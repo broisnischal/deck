@@ -73,7 +73,8 @@ pub struct Item {
     pub title: SharedString,
     pub detail: SharedString,
     pub icon: Icon,
-    pub hint: Option<&'static str>,
+    /// Its shortcut, as the UI shows it.
+    pub hint: Option<SharedString>,
     pub pick: Pick,
 }
 
@@ -356,14 +357,14 @@ impl Render for Palette {
                 StyledText,
                 SharedString,
                 Icon,
-                Option<&'static str>,
+                Option<SharedString>,
                 Option<Kind>,
             ) = match r {
                 Ref::NewTask => (
                     StyledText::new(SharedString::from(format!("Start a task: {q}"))),
                     "A new branch and worktree, with an agent working on it".into(),
                     Icon::Git,
-                    Some("⏎"),
+                    Some("⏎".into()),
                     None,
                 ),
                 Ref::NewSnippet => (
@@ -379,7 +380,7 @@ impl Render for Palette {
                         lit(&it.title, at),
                         it.detail.clone(),
                         it.icon,
-                        it.hint,
+                        it.hint.clone(),
                         Some(it.kind),
                     )
                 }

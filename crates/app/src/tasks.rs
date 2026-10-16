@@ -395,9 +395,79 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
     files
 }
 
+// -- preview -------------------------------------------------------------------
+
+/// The command that starts the project's dev server, from what the project
+/// has, with `$PORT` for the port it should take. A fresh worktree has no
+/// `node_modules`, so it installs first.
+pub fn dev_command(dir: &Path) -> Option<String> {
+    if let Ok(b) = std::fs::read(dir.join("package.json")) {
+        let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
+        let scripts = v.get("scripts")?;
+        let script = ["dev", "start", "serve"]
+            .into_iter()
+            .find(|s| scripts.get(s).is_some())?;
+        let pm = if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
+            "bun"
+        } else if dir.join("pnpm-lock.yaml").exists() {
+            "pnpm"
+        } else if dir.join("yarn.lock").exists() {
+            "yarn"
+        } else {
+            "npm"
+        };
+        let install = if dir.join("node_modules").exists() {
+            String::new()
+        } else {
+            format!("{pm} install && ")
+        };
+        return Some(format!("{install}{pm} run {script}"));
+    }
+    if dir.join("bin/dev").exists() {
+        return Some("bin/dev".into());
+    }
+    if dir.join("manage.py").exists() {
+        return Some("python manage.py runserver 127.0.0.1:$PORT".into());
+    }
+    if dir.join("Gemfile").exists() && dir.join("config.ru").exists() {
+        return Some("bundle exec rails server -p $PORT".into());
+    }
+    None
+}
+
+/// A port nothing listens on right now, for the preview's server to take.
+pub fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dev_command_comes_from_the_project() {
+        let d = std::env::temp_dir().join(format!("deck-dev-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(dev_command(&d), None);
+        std::fs::write(
+            d.join("package.json"),
+            r#"{"scripts":{"build":"x","start":"y"}}"#,
+        )
+        .unwrap();
+        std::fs::write(d.join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(
+            dev_command(&d).as_deref(),
+            Some("pnpm install && pnpm run start")
+        );
+        std::fs::create_dir_all(d.join("node_modules")).unwrap();
+        std::fs::write(d.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).unwrap();
+        assert_eq!(dev_command(&d).as_deref(), Some("pnpm run dev"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(free_port().is_some_and(|p| p > 0));
+    }
 
     #[test]
     fn slugs_are_short_and_safe() {

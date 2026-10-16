@@ -8,6 +8,7 @@ const HELP: &str = "\
 deck: drive the deck window you are running in.
 
   deck doctor                       show the PATH and which agent CLIs deck can find
+  deck mcp                          serve these commands as MCP tools on stdin/stdout
   deck open URL                     open URL in a browser beside this terminal
   deck pane list
   deck pane split [--dir right|down] [--kind terminal|browser] [--cmd CMD] [--url URL] [--pane N]
@@ -19,6 +20,8 @@ deck: drive the deck window you are running in.
       --chat starts a structured chat with that agent; --agent runs its TUI in a terminal
   deck browser open [--pane N] URL
   deck browser eval --pane N JS
+  deck settings open [--page general|appearance|terminal|browser|agents|keyboard|snippets]
+  deck window shot [PATH]            a PNG of this deck window (default: shot.png in deck's data folder)
   deck task new [--agent claude|codex|…] [--cwd DIR] BRIEF
       a sub-agent on its own branch and worktree of this project
   deck task list
@@ -35,6 +38,9 @@ Output is JSON on stdout; errors go to stderr with exit code 1.
 pub fn run(args: &[String]) -> i32 {
     if args.first().map(String::as_str) == Some("doctor") {
         return doctor();
+    }
+    if args.first().map(String::as_str) == Some("mcp") {
+        return crate::mcp::run();
     }
     if args.len() >= 2 && args[0] == "task" && args[1] == "wait" {
         return wait(&args[2..]);
@@ -177,6 +183,7 @@ fn parse(args: &[String]) -> Result<Option<(String, Value)>, String> {
             "pane.send" | "task.new" | "task.send" => "text",
             "browser.open" => "url",
             "browser.eval" => "js",
+            "window.shot" => "out",
             m => return Err(format!("{m} takes no positional arguments")),
         };
         params.insert(key.into(), Value::String(positional.join(" ")));

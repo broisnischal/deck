@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,7 @@ actions!(
         InsertSnippet,
         SaveSnippet,
         EditSnippets,
+        LockDeck,
         RewritePrompt,
         MyWords,
         NewControl,
@@ -83,42 +85,194 @@ actions!(
     ]
 );
 
+/// A shortcut you can change in Settings › Keyboard.
+pub struct Shortcut {
+    /// Its key in settings.json's `keys`.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// The section Settings lists it under.
+    pub group: &'static str,
+    /// What Deck ships with; the first is the one shown.
+    pub defaults: &'static [&'static str],
+    context: Option<&'static str>,
+    bind: fn(&str, Option<&str>) -> KeyBinding,
+}
+
+macro_rules! shortcut {
+    ($id:literal, $name:literal, $group:literal, [$($k:literal),*], $action:expr) => {
+        shortcut!($id, $name, $group, [$($k),*], $action, None)
+    };
+    ($id:literal, $name:literal, $group:literal, [$($k:literal),*], $action:expr, $ctx:expr) => {
+        Shortcut {
+            id: $id,
+            name: $name,
+            group: $group,
+            defaults: &[$($k),*],
+            context: $ctx,
+            bind: |keys, ctx| KeyBinding::new(keys, $action, ctx),
+        }
+    };
+}
+
+/// ⌘N the new tab page, ⌘T a shell, ⌘L the browser: only ⌘ by default,
+/// since in a terminal ⌃L clears the screen and ⌃N / ⌃T are editing keys.
+pub static SHORTCUTS: &[Shortcut] = &[
+    shortcut!("new-tab", "New tab page", "Tabs", ["cmd-n"], NewTab),
+    shortcut!(
+        "new-terminal",
+        "New terminal",
+        "Tabs",
+        ["cmd-t"],
+        NewTerminal
+    ),
+    shortcut!("new-chat", "New chat", "Tabs", ["cmd-shift-n"], NewChat),
+    shortcut!(
+        "new-browser",
+        "New browser tab",
+        "Tabs",
+        ["cmd-shift-t"],
+        NewBrowser
+    ),
+    shortcut!("agents", "Agents", "Tabs", ["cmd-shift-a"], ToggleAgents),
+    shortcut!("close", "Close pane", "Tabs", ["cmd-w"], ClosePane),
+    shortcut!(
+        "next-tab",
+        "Next tab",
+        "Tabs",
+        ["cmd-shift-]", "ctrl-tab"],
+        NextTab
+    ),
+    shortcut!(
+        "prev-tab",
+        "Previous tab",
+        "Tabs",
+        ["cmd-shift-[", "ctrl-shift-tab"],
+        PrevTab
+    ),
+    shortcut!("split-right", "Split right", "Panes", ["cmd-d"], SplitRight),
+    shortcut!(
+        "split-down",
+        "Split down",
+        "Panes",
+        ["cmd-shift-d"],
+        SplitDown
+    ),
+    shortcut!("next-pane", "Next pane", "Panes", ["cmd-]"], NextPane),
+    shortcut!("prev-pane", "Previous pane", "Panes", ["cmd-["], PrevPane),
+    shortcut!(
+        "palette",
+        "Command palette",
+        "Window",
+        ["cmd-k"],
+        CommandPalette
+    ),
+    shortcut!(
+        "snippet",
+        "Insert snippet",
+        "Window",
+        ["cmd-;"],
+        InsertSnippet
+    ),
+    shortcut!("settings", "Settings", "Window", ["cmd-,"], OpenSettings),
+    shortcut!(
+        "sidebar",
+        "Show or hide the sidebar",
+        "Window",
+        ["cmd-b"],
+        ToggleSidebar
+    ),
+    shortcut!(
+        "inspector",
+        "Show or hide the inspector",
+        "Window",
+        ["cmd-i"],
+        ToggleInspector
+    ),
+    shortcut!("zoom-in", "Zoom in", "Window", ["cmd-=", "cmd-+"], ZoomIn),
+    shortcut!("zoom-out", "Zoom out", "Window", ["cmd--"], ZoomOut),
+    shortcut!("zoom-reset", "Actual size", "Window", ["cmd-0"], ZoomReset),
+    shortcut!("lock", "Lock Deck", "Window", ["cmd-shift-l"], LockDeck),
+    shortcut!("address", "Address bar", "Browser", ["cmd-l"], FocusAddress),
+    shortcut!("reload", "Reload page", "Browser", ["cmd-r"], Reload),
+    shortcut!(
+        "devtools",
+        "Web inspector",
+        "Browser",
+        ["alt-cmd-i"],
+        ToggleDevTools
+    ),
+    shortcut!(
+        "clear",
+        "Clear terminal",
+        "Terminal",
+        ["cmd-shift-k"],
+        ClearTerminal,
+        Some("Terminal")
+    ),
+    shortcut!(
+        "rewrite",
+        "Rewrite the prompt",
+        "Chat",
+        ["ctrl-o"],
+        RewritePrompt,
+        Some("Composer")
+    ),
+    shortcut!(
+        "my-words",
+        "Bring back my words",
+        "Chat",
+        ["ctrl-z"],
+        MyWords,
+        Some("Composer")
+    ),
+];
+
+impl Shortcut {
+    /// The keys it answers to: yours from Settings (empty: none), else
+    /// Deck's.
+    pub fn keys<'a>(
+        &'a self,
+        keys: &'a std::collections::BTreeMap<String, String>,
+    ) -> Vec<&'a str> {
+        match keys.get(self.id) {
+            Some(k) if k.is_empty() => Vec::new(),
+            Some(k) => vec![k.as_str()],
+            None => self.defaults.to_vec(),
+        }
+    }
+}
+
+/// The shortcut for `id` as the UI shows it ("⇧⌘N"), or "" when it has none.
+pub fn hint(id: &str, keys: &std::collections::BTreeMap<String, String>) -> SharedString {
+    SHORTCUTS
+        .iter()
+        .find(|s| s.id == id)
+        .and_then(|s| s.keys(keys).first().map(|k| crate::keys::pretty(k)))
+        .unwrap_or_default()
+        .into()
+}
+
 pub fn install(cx: &mut App) {
-    let mut keys = vec![
-        // ⌘N the new tab page, ⌘T a shell, ⌘L the browser. Only ⌘: in a
-        // terminal ⌃L clears the screen and ⌃N / ⌃T are editing keys.
-        KeyBinding::new("cmd-n", NewTab, None),
-        KeyBinding::new("cmd-t", NewTerminal, None),
-        KeyBinding::new("cmd-shift-n", NewChat, None),
-        KeyBinding::new("cmd-shift-t", NewBrowser, None),
-        KeyBinding::new("cmd-shift-a", ToggleAgents, None),
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-d", SplitRight, None),
-        KeyBinding::new("cmd-shift-d", SplitDown, None),
-        KeyBinding::new("cmd-w", ClosePane, None),
-        KeyBinding::new("cmd-shift-]", NextTab, None),
-        KeyBinding::new("cmd-shift-[", PrevTab, None),
-        KeyBinding::new("ctrl-tab", NextTab, None),
-        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
-        KeyBinding::new("cmd-]", NextPane, None),
-        KeyBinding::new("cmd-[", PrevPane, None),
-        KeyBinding::new("cmd-l", FocusAddress, None),
-        KeyBinding::new("cmd-r", Reload, None),
-        KeyBinding::new("cmd-b", ToggleSidebar, None),
-        KeyBinding::new("cmd-i", ToggleInspector, None),
+    rebind(cx, &crate::settings::load().keys);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+}
+
+/// Put the keymap in place with your shortcuts from Settings, and the menus
+/// that show them. At launch, and whenever a shortcut changes.
+pub fn rebind(cx: &mut App, mine: &std::collections::BTreeMap<String, String>) {
+    cx.clear_key_bindings();
+    let mut keys = Vec::new();
+    for s in SHORTCUTS {
+        for k in s.keys(mine) {
+            // A key settings.json holds that does not parse is skipped, not
+            // a crash.
+            if gpui::Keystroke::parse(k).is_ok() {
+                keys.push((s.bind)(k, s.context));
+            }
+        }
+    }
+    keys.extend([
         KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd-+", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ZoomReset, None),
-        // ⌘K is the palette everywhere; clearing a terminal moves to ⇧⌘K.
-        KeyBinding::new("cmd-k", CommandPalette, None),
-        // Saved messages, into the composer or the terminal you are in.
-        KeyBinding::new("cmd-;", InsertSnippet, None),
-        // In a chat's composer: rewrite into the box, or bring my words back.
-        KeyBinding::new("ctrl-o", RewritePrompt, Some("Composer")),
-        KeyBinding::new("ctrl-z", MyWords, Some("Composer")),
-        KeyBinding::new("cmd-shift-k", ClearTerminal, Some("Terminal")),
         KeyBinding::new("cmd-f", Find, Some("Terminal")),
         KeyBinding::new("cmd-g", FindNext, Some("Terminal")),
         KeyBinding::new("cmd-shift-g", FindPrevious, Some("Terminal")),
@@ -126,8 +280,7 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-f", Find, None),
         KeyBinding::new("cmd-g", FindNext, None),
         KeyBinding::new("cmd-shift-g", FindPrevious, None),
-        KeyBinding::new("alt-cmd-i", ToggleDevTools, None),
-    ];
+    ]);
     for ctx in ["Terminal", "Field"] {
         keys.push(KeyBinding::new("cmd-c", Copy, Some(ctx)));
         keys.push(KeyBinding::new("cmd-v", Paste, Some(ctx)));
@@ -149,7 +302,6 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("cmd-9", Tab9, None),
     ]);
     cx.bind_keys(keys);
-    cx.on_action(|_: &Quit, cx| cx.quit());
     // Menus are not decoration here: AppKit routes ⌘ shortcuts through them,
     // so they keep working while a webview holds the keyboard.
     cx.set_menus(vec![
@@ -157,6 +309,7 @@ pub fn install(cx: &mut App) {
             name: "Deck".into(),
             items: vec![
                 MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("Lock Deck", LockDeck),
                 MenuItem::separator(),
                 MenuItem::action("Quit Deck", Quit),
             ],
@@ -559,6 +712,17 @@ pub struct Workspace {
     palette: Option<(Entity<Palette>, Option<PaneId>, Subscription)>,
     /// A one-line message at the foot of the window, and when it goes.
     toast: Option<(SharedString, Instant)>,
+    /// A card in the corner that asks something (make deck the default
+    /// terminal, restart for an update) until it is answered or closed.
+    notice: Option<Notice>,
+    /// Locked (⇧⌘L): only the lock screen is drawn until you unlock.
+    locked: bool,
+    /// The browser is open on the sign-in page.
+    signing_in: bool,
+    /// The last account problem, shown on the sign-in screen.
+    account_note: Option<SharedString>,
+    /// Pages are hidden for the lock or sign-in screen.
+    screen_cover: bool,
     _requests: Option<Task<()>>,
     _tick: Task<()>,
 }
@@ -627,15 +791,37 @@ impl Workspace {
                 .filter(|t| t.len() >= 16),
             control: None,
             menu: None,
+            notice: None,
+            locked: false,
+            signing_in: false,
+            account_note: None,
+            screen_cover: false,
             _requests: None,
             _tick: tick,
         };
+        // Scripts and links macOS opened deck with, now and later.
+        if let Some(mut opened) = crate::handler::receiver() {
+            cx.spawn_in(window, async move |this, cx| {
+                use futures::StreamExt;
+                while let Some(url) = opened.next().await {
+                    let ok = this.update_in(cx, |ws, window, cx| ws.open_handled(&url, window, cx));
+                    if ok.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         // Probing every agent CLI takes a moment; the window does not wait.
         // When it is ready, the control chat opens as the first tab.
         cx.spawn_in(window, async move |this, cx| {
             let (env, saved) = cx
                 .background_executor()
-                .spawn(async { (ChatEnv::start(), crate::threads::load_all()) })
+                .spawn(async {
+                    let loaded = (ChatEnv::start(), crate::threads::load_all());
+                    crate::threads::prune_attachments();
+                    loaded
+                })
                 .await;
             let _ = this.update_in(cx, |ws, window, cx| {
                 match env {
@@ -652,6 +838,9 @@ impl Workspace {
                     }
                 }
                 ws.restore(saved, window, cx);
+                ws.offer_default_terminal(cx);
+                ws.start_account(cx);
+                ws.start_update_checks(cx);
             });
         })
         .detach();
@@ -1376,7 +1565,10 @@ impl Workspace {
             // open links in a pane here instead of another app.
             if let Some(dir) = exe.parent() {
                 let path = std::env::var("PATH").unwrap_or_default();
-                env.insert("PATH".into(), format!("{}:{path}", dir.display()));
+                env.insert(
+                    "PATH".into(),
+                    crate::tidy_path(&format!("{}:{path}", dir.display())),
+                );
             }
             env.insert("BROWSER".into(), format!("{} open", exe.display()));
         }
@@ -2028,6 +2220,9 @@ impl Workspace {
         }
         let zoomed = next.zoom != self.settings.zoom;
         let themed = next.theme != self.settings.theme;
+        if next.keys != self.settings.keys {
+            rebind(cx, &next.keys);
+        }
         crate::browser::set_search_engine(next.search);
         crate::refine::set(next.refine, &next.refine_model);
         crate::retry::set_enabled(next.auto_retry);
@@ -2113,10 +2308,16 @@ impl Workspace {
         let agents = self.ready_agents();
         let settings = self.settings.clone();
         let s = cx.new(|cx| SettingsPane::new(settings, agents, window, cx));
-        let sub = cx.subscribe_in(&s, window, |ws, _, ev: &SettingsEvent, window, cx| {
-            let SettingsEvent::Changed(next) = ev;
-            ws.apply_settings(next.clone(), window, cx)
-        });
+        let sub = cx.subscribe_in(
+            &s,
+            window,
+            |ws, _, ev: &SettingsEvent, window, cx| match ev {
+                SettingsEvent::Changed(next) => ws.apply_settings(next.clone(), window, cx),
+                SettingsEvent::DefaultTerminal(on) => ws.make_default_terminal(*on, window, cx),
+                SettingsEvent::Account(a) => ws.account_action(*a, cx),
+                SettingsEvent::Update(a) => ws.update_action(*a, cx),
+            },
+        );
         (PaneKind::Settings(s), None, sub)
     }
 
@@ -2134,7 +2335,7 @@ impl Workspace {
         let cwd = self.focused_cwd(cx).unwrap_or_else(|| self.cwd.clone());
         let in_repo = cwd.ancestors().any(|d| d.join(".git").exists());
         let palette = if snippets_only {
-            let items = snippet_items();
+            let items = snippet_items(Some(&crate::inspect::project_root(&cwd)));
             cx.new(|cx| Palette::snippets(items, cx))
         } else {
             let items = self.palette_items(cx);
@@ -2184,14 +2385,14 @@ impl Workspace {
                 .background_executor()
                 .spawn({
                     let root = root.clone();
-                    async move { crate::chat::project_files(&root) }
+                    async move { crate::chat::project_files_cached(&root) }
                 })
                 .await;
             let items: Vec<Item> = files
-                .into_iter()
+                .iter()
                 .filter(|f| !f.ends_with('/'))
                 .map(|f| {
-                    let name = f.rsplit('/').next().unwrap_or(&f).to_string();
+                    let name = f.rsplit('/').next().unwrap_or(f).to_string();
                     let dir = f
                         .rsplit_once('/')
                         .map(|(d, _)| d.to_string())
@@ -2202,7 +2403,7 @@ impl Workspace {
                         detail: dir.into(),
                         icon: Icon::File,
                         hint: None,
-                        pick: crate::palette::Pick::File(root.join(&f)),
+                        pick: crate::palette::Pick::File(root.join(f)),
                     }
                 })
                 .collect();
@@ -2249,7 +2450,7 @@ impl Workspace {
                 title: self.pane_title(id, cx),
                 detail: self.pane_subtitle(id, cx).unwrap_or_default(),
                 icon: glyph,
-                hint: HINTS.get(ix).copied(),
+                hint: HINTS.get(ix).map(|h| SharedString::from(*h)),
                 pick: P::Pane(id),
             });
         }
@@ -2267,10 +2468,12 @@ impl Workspace {
                 pick: P::Review(t.id.clone()),
             });
         }
+        // Shortcuts as they are now, yours from Settings or Deck's.
+        let key = |id: &str| Some(hint(id, &self.settings.keys)).filter(|h| !h.is_empty());
         let action = |title: &'static str,
                       detail: &'static str,
                       icon: Icon,
-                      hint: Option<&'static str>,
+                      hint: Option<SharedString>,
                       a: Box<dyn gpui::Action>| Item {
             kind: Kind::Action,
             title: title.into(),
@@ -2284,21 +2487,21 @@ impl Workspace {
                 "New Tab",
                 "A terminal, a page or an agent",
                 Icon::Plus,
-                Some("⌘N"),
+                key("new-tab"),
                 Box::new(NewTab),
             ),
             action(
                 "New Terminal",
                 "",
                 Icon::Terminal,
-                Some("⌘T"),
+                key("new-terminal"),
                 Box::new(NewTerminal),
             ),
             action(
                 "New Chat",
                 "With the agent new chats start with",
                 Icon::Claude,
-                Some("⇧⌘N"),
+                key("new-chat"),
                 Box::new(NewChat),
             ),
             action(
@@ -2319,7 +2522,7 @@ impl Workspace {
                 "Insert Snippet",
                 "A saved message, into the composer or terminal",
                 Icon::Snippet,
-                Some("⌘;"),
+                key("snippet"),
                 Box::new(InsertSnippet),
             ),
             action(
@@ -2340,111 +2543,120 @@ impl Workspace {
                 "New Browser Tab",
                 "",
                 Icon::Globe,
-                Some("⇧⌘T"),
+                key("new-browser"),
                 Box::new(NewBrowser),
             ),
             action(
                 "Open Location",
                 "The browser's address bar",
                 Icon::Search,
-                Some("⌘L"),
+                key("address"),
                 Box::new(FocusAddress),
             ),
             action(
                 "Settings",
                 "Theme, terminal, browser, agents",
                 Icon::Settings,
-                Some("⌘,"),
+                key("settings"),
                 Box::new(OpenSettings),
             ),
             action(
                 "Split Right",
                 "",
                 Icon::Split,
-                Some("⌘D"),
+                key("split-right"),
                 Box::new(SplitRight),
             ),
             action(
                 "Split Down",
                 "",
                 Icon::SplitDown,
-                Some("⇧⌘D"),
+                key("split-down"),
                 Box::new(SplitDown),
             ),
             action(
                 "Close",
                 "The focused pane",
                 Icon::Close,
-                Some("⌘W"),
+                key("close"),
                 Box::new(ClosePane),
             ),
             action(
                 "Find",
                 "In the terminal or page",
                 Icon::Search,
-                Some("⌘F"),
+                Some("⌘F".into()),
                 Box::new(Find),
             ),
             action(
                 "Clear Terminal",
                 "Screen and scrollback",
                 Icon::Eraser,
-                Some("⇧⌘K"),
+                key("clear"),
                 Box::new(ClearTerminal),
             ),
             action(
                 "Reload Page",
                 "",
                 Icon::Refresh,
-                Some("⌘R"),
+                key("reload"),
                 Box::new(Reload),
             ),
             action(
                 "Web Inspector",
                 "For the focused page",
                 Icon::Info,
-                Some("⌥⌘I"),
+                key("devtools"),
                 Box::new(ToggleDevTools),
             ),
             action(
                 "Toggle Sidebar",
                 "",
                 Icon::Sidebar,
-                Some("⌘B"),
+                key("sidebar"),
                 Box::new(ToggleSidebar),
             ),
             action(
                 "Toggle Inspector",
                 "",
                 Icon::PanelRight,
-                Some("⌘I"),
+                key("inspector"),
                 Box::new(ToggleInspector),
             ),
-            action("Zoom In", "", Icon::Plus, Some("⌘+"), Box::new(ZoomIn)),
-            action("Zoom Out", "", Icon::Plus, Some("⌘−"), Box::new(ZoomOut)),
+            action("Zoom In", "", Icon::Plus, key("zoom-in"), Box::new(ZoomIn)),
+            action(
+                "Zoom Out",
+                "",
+                Icon::Plus,
+                key("zoom-out"),
+                Box::new(ZoomOut),
+            ),
             action(
                 "Actual Size",
                 "Zoom back to 100%",
                 Icon::Plus,
-                Some("⌘0"),
+                key("zoom-reset"),
                 Box::new(ZoomReset),
             ),
             action(
                 "Next Tab",
                 "",
                 Icon::ChevronDown,
-                Some("⇧⌘]"),
+                key("next-tab"),
                 Box::new(NextTab),
             ),
             action(
                 "Previous Tab",
                 "",
                 Icon::ChevronUp,
-                Some("⇧⌘["),
+                key("prev-tab"),
                 Box::new(PrevTab),
             ),
         ]);
-        items.extend(snippet_items());
+        let root = self
+            .focused_cwd(cx)
+            .map(|d| crate::inspect::project_root(&d));
+        items.extend(snippet_items(root.as_deref()));
         items
     }
 
@@ -2476,8 +2688,7 @@ impl Workspace {
     /// composer, or at a terminal's prompt (as a paste, so nothing runs until
     /// you press ⏎). Anywhere else it goes on the clipboard.
     fn insert_snippet(&mut self, body: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let text =
-            crate::snippets::expand(body, || cx.read_from_clipboard().and_then(|c| c.text()));
+        let text = self.expand_snippet(body, cx);
         let kind = self
             .focused()
             .and_then(|id| self.panes.get(&id))
@@ -2499,6 +2710,28 @@ impl Workspace {
                 self.flash("Snippet copied. ⌘V to paste it.", cx);
             }
         }
+    }
+
+    /// A snippet's text with its fill-ins: the clipboard, what is selected
+    /// in the focused pane, and that pane's branch and folder.
+    fn expand_snippet(&self, body: &str, cx: &App) -> String {
+        let pane = self.focused().and_then(|id| self.panes.get(&id));
+        let cwd = self.focused_cwd(cx);
+        crate::snippets::expand(body, |var| match var {
+            "clipboard" => cx.read_from_clipboard().and_then(|c| c.text()),
+            "selection" => pane.and_then(|p| match &p.kind {
+                PaneKind::Terminal(t) => t.read(cx).selection_text(),
+                PaneKind::Chat(c) => {
+                    let c = c.read(cx);
+                    c.selected_text()
+                        .or_else(|| c.composer.read(cx).selected_text().map(str::to_string))
+                }
+                _ => None,
+            }),
+            "branch" => cwd.as_deref().and_then(crate::snippets::branch),
+            "folder" => cwd.as_ref().map(|d| d.display().to_string()),
+            _ => None,
+        })
     }
 
     /// Keep what you are writing as a snippet: the composer's text, or what
@@ -2534,6 +2767,94 @@ impl Workspace {
         }
     }
 
+    // -- default terminal ----------------------------------------------------------
+
+    /// A script or terminal link macOS opened deck with: a new terminal tab
+    /// running it, in front.
+    fn open_handled(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if url.starts_with("deck://") {
+            self.deck_url(url, cx);
+            cx.activate(true);
+            return;
+        }
+        let Some((cmd, cwd)) = crate::handler::command_for(url) else {
+            tracing::info!("nothing opens {url}");
+            return;
+        };
+        if let Err(e) = self.new_tab(
+            Open::Terminal {
+                cmd: Some(cmd),
+                cwd,
+            },
+            None,
+            window,
+            cx,
+        ) {
+            self.flash(format!("Could not open {url}: {e}"), cx);
+        }
+        cx.activate(true);
+    }
+
+    /// Once, on a first launch: offer to make deck the Mac's terminal.
+    fn offer_default_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.settings.asked_default_terminal || crate::handler::is_default() {
+            return;
+        }
+        self.notice = Some(Notice {
+            title: "Make Deck your default terminal?".into(),
+            detail: Some(
+                "Shell scripts, .command files and ssh: links will open in Deck. You can change this in Settings › General."
+                    .into(),
+            ),
+            buttons: vec![
+                (
+                    "Make Default".into(),
+                    Rc::new(|ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                        ws.make_default_terminal(true, window, cx)
+                    }),
+                ),
+                (
+                    "Not Now".into(),
+                    Rc::new(|ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                        ws.mark_default_terminal_asked(window, cx)
+                    }),
+                ),
+            ],
+        });
+        cx.notify();
+    }
+
+    fn mark_default_terminal_asked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut next = self.settings.clone();
+        next.asked_default_terminal = true;
+        self.apply_settings(next, window, cx);
+    }
+
+    /// Hand shell scripts and terminal links to deck (`on`) or back to
+    /// Terminal.
+    pub fn make_default_terminal(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let id = if on {
+            crate::handler::BUNDLE_ID
+        } else {
+            crate::handler::TERMINAL_APP
+        };
+        let failed = crate::handler::set_default(id);
+        self.mark_default_terminal_asked(window, cx);
+        self.flash(
+            match (on, failed) {
+                (true, 0) => "Deck is now your default terminal.".to_string(),
+                (false, 0) => "Terminal opens scripts and links again.".to_string(),
+                (_, n) => format!("macOS refused {n} of the changes; try again from Settings."),
+            },
+            cx,
+        );
+        for pane in self.panes.values() {
+            if let PaneKind::Settings(s) = &pane.kind {
+                s.update(cx, |s, cx| s.refresh_system(cx));
+            }
+        }
+    }
+
     fn flash(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.toast = Some((text.into(), Instant::now()));
         cx.spawn(async move |this, cx| {
@@ -2554,6 +2875,91 @@ impl Workspace {
     }
 
     // -- tasks ----------------------------------------------------------------
+
+    /// The task's app running from its own worktree, beside its review: the
+    /// project's dev command in a terminal below it, on a port of its own so
+    /// it does not fight the server in your main checkout, and the page
+    /// opening beside that once something there listens. With no command
+    /// deck knows, the terminal is there to start it by hand and the page
+    /// still follows.
+    fn preview_task(
+        &mut self,
+        review: PaneId,
+        task: &crate::tasks::Task,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let port = crate::tasks::free_port();
+        let cmd = crate::tasks::dev_command(&task.worktree).map(|c| match port {
+            Some(p) => format!("export PORT={p}; {c}"),
+            None => c,
+        });
+        let known = cmd.is_some();
+        let term = match self.split(
+            review,
+            Open::Terminal {
+                cmd,
+                cwd: Some(task.worktree.clone()),
+            },
+            Axis::Column,
+            window,
+            cx,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.flash(format!("Could not start the preview: {e}"), cx);
+                return;
+            }
+        };
+        self.flash(
+            if known {
+                "Starting the task's dev server; its page opens once it listens."
+            } else {
+                "No dev script found: start the server in this terminal and its page opens once it listens."
+            },
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            // Installing can take a while; give it a few minutes.
+            for _ in 0..360 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let Ok(found) = this.update(cx, |ws, cx| {
+                    let Some(PaneKind::Terminal(t)) = ws.panes.get(&term).map(|p| &p.kind) else {
+                        return Err(());
+                    };
+                    let pids: Vec<u32> = inspect::descendants(t.read(cx).pid())
+                        .into_iter()
+                        .map(|p| p.pid)
+                        .collect();
+                    let ports: Vec<u16> = inspect::listening_ports(&pids)
+                        .into_iter()
+                        .map(|p| p.port)
+                        .collect();
+                    // The port it was given, else its lowest (a dev server's
+                    // reload socket usually sits on a higher one).
+                    Ok(port
+                        .filter(|p| ports.contains(p))
+                        .or_else(|| ports.iter().min().copied()))
+                }) else {
+                    return;
+                };
+                match found {
+                    Err(()) => return, // the terminal was closed
+                    Ok(None) => continue,
+                    Ok(Some(p)) => {
+                        let _ = this.update_in(cx, |ws, window, cx| {
+                            let url = format!("http://localhost:{p}");
+                            let _ = ws.split(term, Open::Browser { url }, Axis::Row, window, cx);
+                        });
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
 
     /// A task from a brief: its own branch and worktree off the project you
     /// are in, and a chat with the default agent working in it.
@@ -2879,6 +3285,7 @@ impl Workspace {
                         cx,
                     );
                 }
+                ReviewEvent::Preview => ws.preview_task(pane, &task, window, cx),
                 ReviewEvent::Merge => ws.finish_task(pane, task, Finish::Merge, window, cx),
                 ReviewEvent::Discard => ws.finish_task(pane, task, Finish::Discard, window, cx),
                 ReviewEvent::OpenPr => ws.finish_task(pane, task, Finish::Pr, window, cx),
@@ -3611,6 +4018,30 @@ impl Workspace {
             }),
             "browser.open" => self.rpc_open(p, caller, window, cx),
             "browser.eval" => return self.rpc_eval(p, reply, cx),
+            "settings.open" => {
+                use crate::settings_pane::Page;
+                let page = match str_param(p, "page").unwrap_or("general") {
+                    "general" | "account" | "updates" => Ok(Page::General),
+                    "appearance" | "theme" => Ok(Page::Appearance),
+                    "terminal" => Ok(Page::Terminal),
+                    "browser" => Ok(Page::Browser),
+                    "agents" => Ok(Page::Agents),
+                    "keyboard" | "shortcuts" | "keys" => Ok(Page::Keyboard),
+                    "snippets" => Ok(Page::Snippets),
+                    other => Err(format!("no settings page {other}")),
+                };
+                page.map(|page| {
+                    self.open_settings_at(page, window, cx);
+                    json!({ "page": format!("{page:?}").to_lowercase() })
+                })
+            }
+            "window.shot" => {
+                let out = str_param(p, "out")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| control::socket_dir().join("shot.png"));
+                crate::shot::capture(window, &out)
+                    .map(|(w, h)| json!({ "path": out, "width": w, "height": h }))
+            }
             "task.new" => return self.rpc_task_new(p, caller, reply, window, cx),
             "task.list" => Ok(json!({
                 "tasks": self
@@ -4226,7 +4657,7 @@ impl Workspace {
                         div()
                             .text_size(u(11.))
                             .text_color(rgb(theme::dim()))
-                            .child("⇧⌘N"),
+                            .child(hint("new-chat", &self.settings.keys)),
                     )
                     .on_click(cx.listener(|ws, _, window, cx| {
                         let what = Open::Chat {
@@ -4368,7 +4799,7 @@ impl Workspace {
                                 div()
                                     .text_size(u(11.))
                                     .text_color(rgb(theme::dim()))
-                                    .child("⌘,"),
+                                    .child(hint("settings", &self.settings.keys)),
                             )
                             .on_click(
                                 cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)),
@@ -5181,6 +5612,19 @@ fn clean_title(t: &str) -> Option<String> {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let screen = self.locked || !crate::account::allowed();
+        if screen != self.screen_cover {
+            self.screen_cover = screen;
+            self.cover_pages(screen, cx);
+        }
+        if self.locked {
+            window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
+            return self.lock_screen(cx);
+        }
+        if screen {
+            window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
+            return self.sign_in_screen(cx);
+        }
         let (sidebar, inspector) = self.islands(cx);
         window.set_rem_size(px(theme::REM_PX * self.settings.zoom));
         let width = f32::from(window.viewport_size().width) / self.settings.zoom;
@@ -5272,7 +5716,9 @@ impl Render for Workspace {
                         d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
                     })
                     .on_click(cx.listener(|ws, _, w, cx| ws.toggle_inspector(w, cx))),
-            );
+            )
+            .children(self.update_pill(cx))
+            .child(self.avatar_button(cx));
 
         let main = div()
             .flex()
@@ -5316,6 +5762,7 @@ impl Render for Workspace {
             )
             .text_color(rgb(theme::text()))
             .on_action(cx.listener(|ws, _: &CommandPalette, w, cx| ws.toggle_palette(false, w, cx)))
+            .on_action(cx.listener(|ws, _: &LockDeck, _, cx| ws.lock(cx)))
             .on_action(cx.listener(|ws, _: &InsertSnippet, w, cx| ws.toggle_palette(true, w, cx)))
             .on_action(cx.listener(|ws, _: &SaveSnippet, w, cx| ws.save_snippet(w, cx)))
             .on_action(cx.listener(|ws, _: &EditSnippets, w, cx| ws.edit_snippets(w, cx)))
@@ -5492,6 +5939,7 @@ impl Render for Workspace {
                             .child(p.clone()),
                     )
             }))
+            .children(self.notice.as_ref().map(|n| self.render_notice(n, cx)))
             .children(self.toast.as_ref().map(|(text, _)| {
                 div()
                     .absolute()
@@ -5515,6 +5963,7 @@ impl Render for Workspace {
                             .child(text.clone()),
                     )
             }))
+            .into_any_element()
     }
 }
 
@@ -5636,6 +6085,750 @@ fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Your snippets and the project's as palette rows.
+fn snippet_items(root: Option<&std::path::Path>) -> Vec<Item> {
+    crate::snippets::load_all(root)
+        .into_iter()
+        .filter(|s| !s.body.trim().is_empty())
+        .map(|s| Item {
+            kind: Kind::Snippet,
+            detail: crate::snippets::detail(&s).into(),
+            title: if s.name.trim().is_empty() {
+                crate::snippets::preview(&s.body).into()
+            } else {
+                s.name.into()
+            },
+            icon: Icon::Snippet,
+            hint: None,
+            pick: crate::palette::Pick::Snippet(s.body),
+        })
+        .collect()
+}
+
+/// A question in the corner of the window, with its answers as buttons.
+struct Notice {
+    title: SharedString,
+    detail: Option<SharedString>,
+    /// The first is the main answer. Each closes the notice, then runs.
+    buttons: Vec<(SharedString, NoticeAction)>,
+}
+
+type NoticeAction = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
+impl Workspace {
+    fn render_notice(&self, n: &Notice, cx: &mut Context<Self>) -> AnyElement {
+        let mut buttons = div().flex().gap(u(8.)).pt(u(4.));
+        for (ix, (label, action)) in n.buttons.iter().enumerate() {
+            let action = action.clone();
+            let primary = ix == 0;
+            buttons = buttons.child(
+                div()
+                    .id(ElementId::NamedInteger("notice".into(), ix as u64))
+                    .flex()
+                    .items_center()
+                    .h(u(26.))
+                    .px(u(12.))
+                    .rounded(u(7.))
+                    .text_size(u(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .when(primary, |d| {
+                        d.bg(rgb(theme::text()))
+                            .text_color(rgb(theme::pane()))
+                            .hover(|s| s.opacity(0.9))
+                    })
+                    .when(!primary, |d| {
+                        d.border_1()
+                            .border_color(rgba(theme::alpha(theme::text(), 0x26)))
+                            .text_color(rgb(theme::text()))
+                            .hover(|s| s.bg(rgb(theme::surface())))
+                    })
+                    .child(label.clone())
+                    .on_click(cx.listener(move |ws, _, window, cx| {
+                        ws.notice = None;
+                        action(ws, window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .absolute()
+            .bottom(u(18.))
+            .right(u(18.))
+            .w(u(340.))
+            .flex()
+            .flex_col()
+            .gap(u(6.))
+            .p(u(14.))
+            .rounded(u(12.))
+            .bg(rgb(theme::menu()))
+            .border_1()
+            .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
+            .shadow_lg()
+            .occlude()
+            .child(
+                div()
+                    .text_size(u(13.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme::text()))
+                    .child(n.title.clone()),
+            )
+            .children(n.detail.clone().map(|d| {
+                div()
+                    .text_size(u(12.))
+                    .line_height(u(17.))
+                    .text_color(rgb(theme::text_2()))
+                    .child(d)
+            }))
+            .child(buttons)
+            .into_any_element()
+    }
+}
+
+// -- account, updates and the lock ------------------------------------------------------
+
+/// A button on the sign-in and lock screens: filled for the main action.
+fn screen_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    primary: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(u(36.))
+        .min_w(u(240.))
+        .px(u(18.))
+        .rounded(u(9.))
+        .text_size(u(13.))
+        .font_weight(FontWeight::MEDIUM)
+        .cursor_pointer()
+        .when(primary, |d| {
+            d.bg(rgb(theme::text()))
+                .text_color(rgb(theme::pane()))
+                .hover(|s| s.opacity(0.9))
+        })
+        .when(!primary, |d| {
+            d.border_1()
+                .border_color(rgba(theme::alpha(theme::text(), 0x26)))
+                .text_color(rgb(theme::text()))
+                .hover(|s| s.bg(rgb(theme::surface())))
+        })
+        .child(label.into())
+}
+
+impl Workspace {
+    fn refresh_settings_panes(&self, cx: &mut Context<Self>) {
+        for pane in self.panes.values() {
+            if let PaneKind::Settings(s) = &pane.kind {
+                s.update(cx, |_, cx| cx.notify());
+            }
+        }
+        cx.notify();
+    }
+
+    // -- account --------------------------------------------------------------------
+
+    fn account_action(&mut self, a: crate::settings_pane::AccountAction, cx: &mut Context<Self>) {
+        use crate::settings_pane::AccountAction as A;
+        match a {
+            A::SignIn => self.sign_in(cx),
+            A::SignOut => {
+                cx.spawn(async move |this, cx| {
+                    crate::account::sign_out().await;
+                    let _ = this.update(cx, |ws, cx| {
+                        ws.flash("Signed out.", cx);
+                        ws.refresh_settings_panes(cx);
+                    });
+                })
+                .detach();
+            }
+            A::Checkout => {
+                if let Some(u) = crate::account::checkout_url() {
+                    cx.open_url(&u);
+                }
+            }
+            A::Billing => {
+                if let Some(u) = crate::account::billing_url() {
+                    cx.open_url(&u);
+                }
+            }
+        }
+    }
+
+    /// Open the sign-in page in the browser; it comes back as a `deck://`
+    /// link.
+    fn sign_in(&mut self, cx: &mut Context<Self>) {
+        match crate::account::sign_in_url() {
+            Some(url) => {
+                self.signing_in = true;
+                self.account_note = None;
+                cx.open_url(&url);
+            }
+            None => self.flash("This build of Deck has no account server.", cx),
+        }
+        cx.notify();
+    }
+
+    /// `deck://auth/callback?…` after signing in, or `deck://refresh` after
+    /// paying: load the account again.
+    fn deck_url(&mut self, url: &str, cx: &mut Context<Self>) {
+        if url.starts_with("deck://refresh") {
+            self.refresh_account(cx);
+            return;
+        }
+        match crate::account::callback(url) {
+            Some(Ok(code)) => {
+                cx.spawn(async move |this, cx| {
+                    let r = crate::account::exchange(&code).await;
+                    let _ = this.update(cx, |ws, cx| {
+                        ws.signing_in = false;
+                        match r {
+                            Ok(a) => {
+                                ws.account_note = None;
+                                ws.flash(format!("Signed in as {}.", a.display_name()), cx);
+                            }
+                            Err(e) => ws.account_note = Some(e.into()),
+                        }
+                        ws.refresh_settings_panes(cx);
+                    });
+                })
+                .detach();
+            }
+            Some(Err(e)) => {
+                self.signing_in = false;
+                self.account_note = Some(e.into());
+                cx.notify();
+            }
+            None => tracing::info!("nothing handles {url}"),
+        }
+    }
+
+    fn refresh_account(&mut self, cx: &mut Context<Self>) {
+        if !crate::account::required() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let r = crate::account::refresh().await;
+            let _ = this.update(cx, |ws, cx| {
+                ws.account_note = r.err().map(Into::into);
+                ws.refresh_settings_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// With an account server: check the account now and every six hours,
+    /// so a lapsed plan or a session ended elsewhere is noticed.
+    fn start_account(&mut self, cx: &mut Context<Self>) {
+        if !crate::account::required() {
+            return;
+        }
+        cx.spawn(async move |this, cx| loop {
+            if this.update(cx, |ws, cx| ws.refresh_account(cx)).is_err() {
+                return;
+            }
+            cx.background_executor()
+                .timer(Duration::from_secs(6 * 3600))
+                .await;
+        })
+        .detach();
+    }
+
+    fn sign_in_screen(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let account = crate::account::current();
+        let note = self.account_note.clone();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(u(12.))
+            .w(u(360.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(u(64.))
+                    .mb(u(8.))
+                    .rounded(u(16.))
+                    .bg(rgb(theme::text()))
+                    .text_size(u(30.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(theme::pane()))
+                    .child("D"),
+            );
+        let title = |t: &str| {
+            div()
+                .text_size(u(22.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::text()))
+                .child(t.to_string())
+        };
+        let words = |t: String| {
+            div()
+                .text_size(u(13.))
+                .line_height(u(19.))
+                .text_center()
+                .text_color(rgb(theme::text_2()))
+                .child(t)
+        };
+        match account {
+            Some(a) if !a.active || a.trial_days_left() == Some(0) => {
+                let (head, why) = if a.trial_ends.is_some() {
+                    (
+                        "Your free trial has ended",
+                        "Choose a plan to keep using Deck. Your chats, tabs and settings are all still here.".to_string(),
+                    )
+                } else {
+                    (
+                        "Choose a plan",
+                        format!("{} has no active plan. Pick one to keep using Deck.", a.email),
+                    )
+                };
+                col = col.child(title(head)).child(words(why))
+                    .child(div().h(u(8.)))
+                    .child(
+                        screen_button("gate-checkout", "Choose a Plan", true).on_click(
+                            cx.listener(|ws, _, _, cx| {
+                                ws.account_action(crate::settings_pane::AccountAction::Checkout, cx)
+                            }),
+                        ),
+                    )
+                    .child(
+                        screen_button("gate-refresh", "I've Paid, Check Again", false)
+                            .on_click(cx.listener(|ws, _, _, cx| ws.refresh_account(cx))),
+                    )
+                    .child(
+                        screen_button("gate-out", "Sign Out", false).on_click(cx.listener(
+                            |ws, _, _, cx| {
+                                ws.account_action(crate::settings_pane::AccountAction::SignOut, cx)
+                            },
+                        )),
+                    );
+            }
+            Some(_) => {
+                // Signed in and paid, but not checked for a week: offline.
+                col = col
+                    .child(title("Can't reach Deck"))
+                    .child(words(
+                        "Deck needs to check your plan once a week, and couldn't. Check your connection and try again."
+                            .into(),
+                    ))
+                    .child(div().h(u(8.)))
+                    .child(
+                        screen_button("gate-retry", "Try Again", true)
+                            .on_click(cx.listener(|ws, _, _, cx| ws.refresh_account(cx))),
+                    );
+            }
+            None => {
+                col = col
+                    .child(title("Sign in to Deck"))
+                    .child(words(
+                        "Terminals, a browser and your coding agents in one window. Sign in to start."
+                            .into(),
+                    ))
+                    .child(div().h(u(8.)))
+                    .child(
+                        screen_button(
+                            "gate-sign-in",
+                            if self.signing_in {
+                                "Open the Sign-in Page Again"
+                            } else {
+                                "Continue with Google"
+                            },
+                            true,
+                        )
+                        .on_click(cx.listener(|ws, _, _, cx| ws.sign_in(cx))),
+                    )
+                    .child(
+                        div()
+                            .text_size(u(12.))
+                            .text_color(rgb(theme::dim()))
+                            .child(if self.signing_in {
+                                "Waiting for your browser…"
+                            } else {
+                                "Opens your browser; you come back here when you're done."
+                            }),
+                    );
+            }
+        }
+        col = col.children(note.map(|n| {
+            div()
+                .pt(u(6.))
+                .text_size(u(12.))
+                .text_color(rgb(theme::DANGER))
+                .child(n)
+        }));
+        self.screen(col)
+    }
+
+    /// A full window with `content` in the middle, under a strip that still
+    /// moves the window.
+    fn screen(&self, content: gpui::Div) -> AnyElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(theme::pane()))
+            .font_family(theme::UI)
+            .child(div().flex_none().h(px(theme::TITLEBAR_PX)).on_mouse_down(
+                MouseButton::Left,
+                |ev, window, _| {
+                    if ev.click_count == 2 {
+                        window.titlebar_double_click();
+                    }
+                },
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .pb(u(60.))
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    // -- lock -----------------------------------------------------------------------
+
+    fn lock(&mut self, cx: &mut Context<Self>) {
+        self.locked = true;
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn unlock(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            if crate::lock::authenticate("unlock Deck").await {
+                let _ = this.update(cx, |ws, cx| {
+                    ws.locked = false;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn lock_screen(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let col = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(u(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(u(64.))
+                    .mb(u(8.))
+                    .rounded_full()
+                    .bg(rgb(theme::surface()))
+                    .child(icon(Icon::Lock, 28., theme::text())),
+            )
+            .child(
+                div()
+                    .text_size(u(22.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme::text()))
+                    .child("Deck is locked"),
+            )
+            .child(
+                div()
+                    .text_size(u(13.))
+                    .text_color(rgb(theme::text_2()))
+                    .child("Your terminals and agents keep running."),
+            )
+            .child(div().h(u(8.)))
+            .child(
+                screen_button("unlock", "Unlock", true)
+                    .on_click(cx.listener(|ws, _, _, cx| ws.unlock(cx))),
+            )
+            .child(
+                div()
+                    .text_size(u(12.))
+                    .text_color(rgb(theme::dim()))
+                    .child("With Touch ID or your Mac's password"),
+            );
+        self.screen(col)
+    }
+
+    // -- the avatar menu --------------------------------------------------------
+
+    fn avatar_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let account = crate::account::current();
+        let disc = div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(u(24.))
+            .rounded_full();
+        let disc = match &account {
+            Some(a) => disc
+                .bg(rgb(theme::accent()))
+                .text_size(u(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(0xffffff))
+                .child(a.initial()),
+            None => disc
+                .bg(rgb(theme::surface()))
+                .child(icon(Icon::User, 13., theme::text_2())),
+        };
+        div()
+            .id("account")
+            .ml(u(6.))
+            .rounded_full()
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.85))
+            .child(disc)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, ev: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    ws.open_account_menu(ev.position, window, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn open_account_menu(
+        &mut self,
+        mut at: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::menu::{Entry, Item};
+        let ws = cx.entity().downgrade();
+        let account = crate::account::current();
+        let mut entries: Vec<Entry> = Vec::new();
+        let who = match &account {
+            Some(a) => a.display_name().to_string(),
+            None if crate::account::required() => "Sign In…".to_string(),
+            None => "Account".to_string(),
+        };
+        let w = ws.clone();
+        let signed_out = account.is_none() && crate::account::required();
+        entries.push(
+            Item::new(who, move |window, cx| {
+                let _ = w.update(cx, |ws, cx| {
+                    if signed_out {
+                        ws.sign_in(cx);
+                    } else {
+                        ws.open_settings_at(crate::settings_pane::Page::General, window, cx);
+                    }
+                });
+            })
+            .icon(Icon::User)
+            .into(),
+        );
+        if let Some(n) = account.as_ref().and_then(|a| a.trial_days_left()) {
+            let left = match n {
+                0 => "Free trial ended · Choose a Plan".to_string(),
+                1 => "Free trial: last day · Choose a Plan".to_string(),
+                n => format!("Free trial: {n} days left · Choose a Plan"),
+            };
+            let w = ws.clone();
+            entries.push(
+                Item::new(left, move |_, cx| {
+                    let _ = w.update(cx, |ws, cx| {
+                        ws.account_action(crate::settings_pane::AccountAction::Checkout, cx)
+                    });
+                })
+                .into(),
+            );
+        }
+        entries.push(Entry::Separator);
+        entries.push(
+            Item::new("Settings", |window, cx| {
+                window.dispatch_action(Box::new(OpenSettings), cx)
+            })
+            .icon(Icon::Settings)
+            .shortcut(hint("settings", &self.settings.keys))
+            .into(),
+        );
+        let w = ws.clone();
+        entries.push(
+            Item::new("Theme", move |window, cx| {
+                let _ = w.update(cx, |ws, cx| {
+                    ws.open_settings_at(crate::settings_pane::Page::Appearance, window, cx)
+                });
+            })
+            .icon(Icon::Theme)
+            .into(),
+        );
+        entries.push(Entry::Separator);
+        entries.push(
+            Item::new("Lock", move |_, cx| {
+                let _ = ws.update(cx, |ws, cx| ws.lock(cx));
+            })
+            .icon(Icon::Lock)
+            .shortcut(hint("lock", &self.settings.keys))
+            .danger()
+            .into(),
+        );
+        // Under the avatar, its right edge on the window's.
+        let width = window.viewport_size().width;
+        at.x = (width - px(crate::menu::MIN_W * self.settings.zoom + 12.)).max(px(0.));
+        at.y = px(theme::TITLEBAR_PX * self.settings.zoom);
+        let restore = window.focused(cx);
+        self.menu = Some(crate::menu::open(
+            entries,
+            at,
+            restore,
+            window,
+            cx,
+            |ws: &mut Self, _, _| ws.menu = None,
+        ));
+        cx.notify();
+    }
+
+    fn open_settings_at(
+        &mut self,
+        page: crate::settings_pane::Page,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(window, cx);
+        if let Some(s) = self.panes.values().find_map(|p| match &p.kind {
+            PaneKind::Settings(s) => Some(s.clone()),
+            _ => None,
+        }) {
+            s.update(cx, |s, cx| s.show(page, cx));
+        }
+    }
+
+    // -- updates --------------------------------------------------------------
+
+    fn update_action(&mut self, a: crate::settings_pane::UpdateAction, cx: &mut Context<Self>) {
+        use crate::settings_pane::UpdateAction as A;
+        use crate::updates::State;
+        match a {
+            A::Check => self.check_updates(true, cx),
+            A::Download => {
+                let State::Available(r) = crate::updates::state() else {
+                    return;
+                };
+                crate::updates::set(State::Downloading(r.clone()));
+                self.refresh_settings_panes(cx);
+                cx.spawn(async move |this, cx| {
+                    let got = crate::updates::download(&r).await;
+                    crate::updates::set(match got {
+                        Ok(path) => State::Ready(r, path),
+                        Err(e) => State::Failed(e),
+                    });
+                    let _ = this.update(cx, |ws, cx| ws.refresh_settings_panes(cx));
+                })
+                .detach();
+            }
+            A::Restart => {
+                let State::Ready(_, path) = crate::updates::state() else {
+                    return;
+                };
+                match crate::updates::install_on_quit(&path) {
+                    Ok(()) => cx.quit(),
+                    Err(e) => self.flash(format!("Could not update: {e}"), cx),
+                }
+            }
+            A::Notes => match crate::updates::state() {
+                State::Available(r) | State::Downloading(r) | State::Ready(r, _) => {
+                    cx.open_url(&r.notes_url)
+                }
+                _ => {}
+            },
+        }
+    }
+
+    fn check_updates(&mut self, by_hand: bool, cx: &mut Context<Self>) {
+        use crate::updates::State;
+        if matches!(
+            crate::updates::state(),
+            State::Checking | State::Downloading(_) | State::Ready(..)
+        ) {
+            return;
+        }
+        crate::updates::set(State::Checking);
+        self.refresh_settings_panes(cx);
+        cx.spawn(async move |this, cx| {
+            let r = crate::updates::check().await;
+            crate::updates::set(match r {
+                Ok(Some(rel)) => State::Available(rel),
+                Ok(None) => State::UpToDate,
+                // A failed check nobody asked for stays quiet.
+                Err(e) if by_hand => State::Failed(e),
+                Err(_) => State::Idle,
+            });
+            let _ = this.update(cx, |ws, cx| ws.refresh_settings_panes(cx));
+        })
+        .detach();
+    }
+
+    /// When Settings allows it: a check a minute after launch, then daily.
+    fn start_update_checks(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let mut wait = Duration::from_secs(60);
+            loop {
+                cx.background_executor().timer(wait).await;
+                wait = Duration::from_secs(24 * 3600);
+                let alive = this.update(cx, |ws, cx| {
+                    if ws.settings.check_updates {
+                        ws.check_updates(false, cx);
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// In the title bar while there is news: an update to get, coming, or
+    /// ready for a restart.
+    fn update_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::settings_pane::UpdateAction as A;
+        use crate::updates::State;
+        let (label, action, busy): (&str, Option<A>, bool) = match crate::updates::state() {
+            State::Available(_) => ("Update available", Some(A::Download), false),
+            State::Downloading(_) => ("Downloading update", None, true),
+            State::Ready(..) => ("Restart to update", Some(A::Restart), false),
+            _ => return None,
+        };
+        Some(
+            div()
+                .id("update-pill")
+                .flex()
+                .items_center()
+                .gap(u(6.))
+                .h(u(24.))
+                .ml(u(6.))
+                .px(u(10.))
+                .rounded(u(7.))
+                .border_1()
+                .border_color(rgba(theme::alpha(theme::text(), 0x26)))
+                .text_size(u(12.))
+                .text_color(rgb(theme::text()))
+                .when(busy, |d| {
+                    d.child(crate::icon::spinner("update-spin", 12., theme::text_2()))
+                })
+                .when(!busy, |d| {
+                    d.child(icon(Icon::ArrowUp, 12., theme::text_2()))
+                })
+                .child(label)
+                .when_some(action, |d, a| {
+                    d.cursor_pointer()
+                        .hover(|s| s.bg(rgb(theme::surface())))
+                        .on_click(cx.listener(move |ws, _, _, cx| ws.update_action(a, cx)))
+                })
+                .into_any_element(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5687,24 +6880,4 @@ mod tests {
         assert_eq!(host("https://example.com/a?b"), "example.com");
         assert_eq!(host("http://localhost:5173/"), "localhost:5173");
     }
-}
-
-/// The saved snippets as palette rows.
-fn snippet_items() -> Vec<Item> {
-    crate::snippets::load()
-        .into_iter()
-        .filter(|s| !s.body.trim().is_empty())
-        .map(|s| Item {
-            kind: Kind::Snippet,
-            detail: crate::snippets::preview(&s.body).into(),
-            title: if s.name.trim().is_empty() {
-                crate::snippets::preview(&s.body).into()
-            } else {
-                s.name.into()
-            },
-            icon: Icon::Snippet,
-            hint: None,
-            pick: crate::palette::Pick::Snippet(s.body),
-        })
-        .collect()
 }

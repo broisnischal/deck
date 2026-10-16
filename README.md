@@ -34,6 +34,8 @@ Agents can drive Deck too. From any chat or terminal they can open terminals, st
 - **Prompt rewriting.** A quick Claude run (Haiku by default) turns what you typed or dictated into a clear, complete prompt, using the thread's task and the agent's last reply to work out what "it" and "that" mean. ⏎ rewrites and sends, ⌃O rewrites into the box without sending, ⌃Z brings back your own words. Short replies, `/` commands and `!` commands go as typed. In Settings you can have it show the rewrite first, pick the model, or turn it off.
 - **Turns that fail come back by themselves.** On an API or network error Deck says "continue" after 5s, 10s, 20s… up to five minutes, eight tries; a usage limit waits until it resets; a login or billing problem is shown to you instead. Claude Code stuck in its own retry wait in a terminal gets the same nudge.
 - **Attach anything.** Paste a screenshot, drop files in, or `@` a file from the project.
+- **Undo a turn.** Every message you send in a git project saves the files as they were, out of your branch's way. Right-click your message to go back to before it, files and chat, or to edit it and go on from there.
+- **Select and copy** any part of a conversation, across replies, lists, tables and code.
 - **Threads last.** Transcripts, drafts and attachments survive a restart, and Claude resumes its own session.
 
 ### Tasks: agents on their own branch
@@ -42,6 +44,7 @@ Agents can drive Deck too. From any chat or terminal they can open terminals, st
 - **Run several at once.** Each task has its own folder and branch, so agents never step on each other or on the checkout you're working in.
 - **Agents can hand out tasks too.** An agent working on a big job can split it into sub-tasks, each with its own agent on its own branch. Deck tells it when each one finishes, so it can review the changes and merge them. Ask the control chat to "split this into tasks" and watch them run in parallel.
 - **Watch them in the sidebar.** Each task shows what its agent is doing right now, or how many files and lines it has changed.
+- **Preview it running.** Preview starts the task's dev server from its own checkout on a port of its own and opens the page beside the review.
 - **Review, then decide.** The review shows every change file by file. Then:
   - **Merge** squashes it into your branch as one commit.
   - **Open PR** pushes the branch and opens a pull request.
@@ -71,13 +74,16 @@ Agents can drive Deck too. From any chat or terminal they can open terminals, st
 ### A workspace that stays out of the way
 
 - **⌘K command palette:** jump to any tab, action, snippet, file or recent page from one box.
-- **Snippets** for the messages you send again and again ("review my changes", "run the tests and fix what fails"). ⌘; lists them, and the one you pick goes into the chat composer or the terminal you are in, ready to add to and send. Save as Snippet keeps what you've typed, or a terminal selection; `{clipboard}` in a snippet puts in what you copied. Edit them in Settings › Snippets.
+- **Snippets** for the messages you send again and again (type `;review` and a space in a chat to put one in; a project can share its own in `.deck/snippets.json`) ("review my changes", "run the tests and fix what fails"). ⌘; lists them, and the one you pick goes into the chat composer or the terminal you are in, ready to add to and send. Save as Snippet keeps what you've typed, or a terminal selection; `{clipboard}` in a snippet puts in what you copied. Edit them in Settings › Snippets.
 - **⌘N new tab page:** a terminal, a browser, or any agent, as a chat or in its own terminal.
 - **Splits** you can drag to resize, with the focused pane clearly marked.
 - **An inspector** for the focused pane: its processes, listening ports, project files and git status.
 - **Comes back as you left it.** Tabs, splits and focus are restored after a restart, and agents in terminals resume their conversation.
 - **Themes for the whole window:** System, Black, Graphite, Midnight and Light.
-- **Settings** laid out like System Settings, applied as you change them.
+- **Settings** you can search, applied as you change them.
+- **Your default terminal,** if you like: shell scripts, `.command` files and `ssh:` links open in Deck.
+- **Lock** (⇧⌘L) hides everything until Touch ID or your password; your terminals and agents keep running.
+- **Updates** arrive by themselves and install on restart.
 - **Right-click menus** everywhere, and one zoom (⌘+ / ⌘−) for everything.
 
 ## Getting started
@@ -92,6 +98,8 @@ scripts/install.sh
 
 This installs **Deck.app** into `/Applications` and the `deck` command into `~/.local/bin`. Open Deck from Launchpad or Spotlight.
 
+To sell Deck, build it against an account server so it asks people to sign in and subscribe: `backend/` has one, with its own README.
+
 Deck works with whichever agent CLIs you already have on your `PATH`: `claude`, `codex`, `gemini`, `grok`, `opencode`, `cursor-agent`, `amp`, `aider`. Run `deck doctor` to see which ones it found.
 
 > For notifications from Claude Code running in a terminal, set `"preferredNotifChannel": "iterm2"` in `~/.claude/settings.json`. Deck understands that notification style.
@@ -102,6 +110,7 @@ Deck works with whichever agent CLIs you already have on your `PATH`: `claude`, 
 | --- | --- |
 | ⌘K | Command palette |
 | ⌘; | Insert a snippet |
+| ⇧⌘L | Lock Deck |
 | ⌘N | New tab page |
 | ⌘T | New terminal |
 | ⇧⌘N | New chat |
@@ -138,6 +147,19 @@ deck task merge --task add-a-dark-mode               # squash it into your branc
 ```
 
 Output is JSON. Run `deck` with no arguments for everything it can do.
+
+Agents in Deck's chats also get all of this as tools of their own through MCP (`deck mcp`), including a look at the window itself.
+
+## Releasing
+
+```sh
+scripts/release.sh             # dist/Deck-<version>.dmg and .zip, for Apple silicon and Intel
+scripts/release.sh --publish   # and put them on GitHub as release v<version>
+```
+
+The disk image is what the website's download button gives people. The zip is what the in-app updater swaps in. Both find the newest release on their own, through the backend's `/v1/releases/latest` (and `https://deck.stroke.click/download/mac` always downloads the newest disk image).
+
+Other Macs only open Deck when it is signed with a Developer ID certificate and notarized by Apple. That takes the Apple Developer Program and a one-time setup, described at the top of `scripts/release.sh`. Until it's done the script still builds, signs ad hoc for your own Mac, and refuses to publish. Raise `version` in `Cargo.toml` for each release.
 
 ## License
 

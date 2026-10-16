@@ -19,6 +19,8 @@ pub enum ReviewEvent {
     Discard,
     /// A terminal in the task's worktree, beside the review.
     Terminal,
+    /// The task's app, run from its worktree, open beside the review.
+    Preview,
 }
 
 /// Lines drawn per file before the rest is summed up; a lockfile churn
@@ -301,6 +303,11 @@ impl Render for ReviewPane {
             .flex_wrap()
             .items_center()
             .gap(u(8.))
+            .child(
+                self.button("preview", "Preview", Icon::Globe, false, cx, |_, cx| {
+                    cx.emit(ReviewEvent::Preview)
+                }),
+            )
             .child(self.button(
                 "terminal",
                 "Terminal",

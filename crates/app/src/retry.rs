@@ -93,9 +93,15 @@ const TRANSIENT: &[&str] = &[
     "rate_limit",
 ];
 
-/// Decide about a failed turn from what it said. `clock` is the local time
-/// now as (hour, minute, second), for a limit that resets at "3pm".
-pub fn classify(text: &str, now_epoch: u64, clock: (u32, u32, u32)) -> Verdict {
+/// Decide about a failed turn from the API's HTTP status when the agent
+/// reported one, else from what it said. `clock` is the local time now as
+/// (hour, minute, second), for a limit that resets at "3pm".
+pub fn classify(
+    status: Option<u16>,
+    text: &str,
+    now_epoch: u64,
+    clock: (u32, u32, u32),
+) -> Verdict {
     let lower = text.to_lowercase();
     if lower.contains("limit")
         && (lower.contains("usage") || lower.contains("reached") || lower.contains("resets"))
@@ -119,6 +125,11 @@ pub fn classify(text: &str, now_epoch: u64, clock: (u32, u32, u32)) -> Verdict {
             };
         }
     }
+    // A usage limit also answers 429, so it is read from the text above;
+    // past that the status says it exactly.
+    if let Some(v) = status.and_then(by_status) {
+        return v;
+    }
     for (needle, why) in BLOCKED {
         if lower.contains(needle) {
             return Verdict::Blocked((*why).into());
@@ -138,6 +149,26 @@ pub fn classify(text: &str, now_epoch: u64, clock: (u32, u32, u32)) -> Verdict {
         };
     }
     Verdict::Blocked(clip(text.trim(), 80))
+}
+
+/// What an HTTP status means for a retry, for the ones that settle it.
+fn by_status(status: u16) -> Option<Verdict> {
+    let retry = |reason: &str| Verdict::Retry {
+        wait: None,
+        reason: reason.into(),
+    };
+    Some(match status {
+        429 => retry("rate limited"),
+        529 => retry("API overloaded"),
+        408 | 500 | 502 | 503 | 504 => retry("API or network error"),
+        401 => Verdict::Blocked("login required: run /login".into()),
+        402 => Verdict::Blocked("billing problem".into()),
+        403 => Verdict::Blocked("the API refused: permission".into()),
+        404 => Verdict::Blocked("model not found".into()),
+        413 => Verdict::Blocked("the conversation is too long for the model: run /compact".into()),
+        400 => Verdict::Blocked("the API rejected the request".into()),
+        _ => return None,
+    })
 }
 
 /// "resets 3pm", "resets 11:30 am": the wait until that time next comes.
@@ -284,7 +315,7 @@ mod tests {
     #[test]
     fn errors_sort_into_retry_and_yours() {
         let at = (14, 0, 0);
-        let r = |t| classify(t, 1_000, at);
+        let r = |t| classify(None, t, 1_000, at);
         assert!(matches!(
             r("API Error: 529 {\"type\":\"overloaded_error\"}"),
             Verdict::Retry { wait: None, .. }
@@ -318,6 +349,30 @@ mod tests {
         assert!(matches!(
             r("usage limit reached, resets 11:30 am"),
             Verdict::Retry { wait: Some(w), .. } if w > Duration::from_secs(20 * 3600)
+        ));
+    }
+
+    #[test]
+    fn the_status_decides_when_there_is_one() {
+        let at = (14, 0, 0);
+        // Words that would read as transient, but the status says login.
+        assert!(matches!(
+            classify(Some(401), "connection reset", 1_000, at),
+            Verdict::Blocked(_)
+        ));
+        assert!(matches!(
+            classify(Some(529), "something odd", 1_000, at),
+            Verdict::Retry { wait: None, .. }
+        ));
+        // A usage limit comes as 429 too, and still waits for its reset.
+        assert!(matches!(
+            classify(Some(429), "Claude AI usage limit reached|1600", 1_000, at),
+            Verdict::Retry { wait: Some(_), .. }
+        ));
+        // A status it has no rule for falls back to the words.
+        assert!(matches!(
+            classify(Some(418), "Request timed out", 1_000, at),
+            Verdict::Retry { .. }
         ));
     }
 

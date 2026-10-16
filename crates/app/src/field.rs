@@ -148,6 +148,31 @@ impl Field {
         }
     }
 
+    pub fn selected_text(&self) -> Option<&str> {
+        self.buf.selected_text()
+    }
+
+    /// The text from the start up to the caret.
+    pub fn before_caret(&self) -> &str {
+        &self.buf.text()[..self.buf.cursor()]
+    }
+
+    /// Replace the `len` bytes just before the caret with `text`, as one
+    /// undo step (a `;keyword ` expanding: ⌘Z brings the keyword back).
+    pub fn replace_before_caret(&mut self, len: usize, text: &str, cx: &mut Context<Self>) {
+        let end = self.buf.cursor();
+        let Some(start) = end.checked_sub(len) else {
+            return;
+        };
+        let text = text.to_string();
+        self.edit(Run::Other, cx, |b| {
+            b.place(start, false);
+            b.place(end, true);
+            b.insert(&text);
+        });
+        self.marked = None;
+    }
+
     /// Put `text` in at the caret, over any selection. One undo step.
     pub fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = if self.multiline {

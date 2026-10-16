@@ -160,6 +160,9 @@ impl Transcript {
     pub fn apply(&mut self, agent: &AgentId, event: &AgentEvent, now: i64) -> Applied {
         match event {
             AgentEvent::Started { .. } => Applied::IGNORED,
+            // The chat reads it to decide on a retry; the transcript keeps
+            // the error from the turn's own text.
+            AgentEvent::TurnFailed { .. } => Applied::IGNORED,
 
             AgentEvent::Text { delta } => self.push_delta(agent, now, delta, false),
             AgentEvent::Reasoning { delta } => self.push_delta(agent, now, delta, true),
@@ -170,6 +173,12 @@ impl Transcript {
                 input,
                 title,
             } => {
+                // A call shown before its input finished: fill it in.
+                if let Some((idx, t)) = self.find_tool_mut(id) {
+                    t.input = input.clone();
+                    t.title = title.clone();
+                    return Applied::at(AppliedKind::BlockChanged, idx);
+                }
                 let idx = self.assistant_tail_index(agent, now);
                 let msg = &mut self.messages[idx];
                 if let Some(b) = msg.blocks.last_mut() {
@@ -446,6 +455,34 @@ mod tests {
                 assert!(!t.is_open());
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_repeated_tool_call_fills_in_the_same_card() {
+        let mut t = Transcript::default();
+        let call = |input: Value| AgentEvent::ToolCall {
+            id: ToolId::new("w"),
+            name: "Write".into(),
+            input,
+            title: "/a.py".into(),
+        };
+        t.apply(
+            &agent(),
+            &call(serde_json::json!({"file_path": "/a.py"})),
+            0,
+        );
+        let applied = t.apply(
+            &agent(),
+            &call(serde_json::json!({"file_path": "/a.py", "content": "x"})),
+            0,
+        );
+        assert_eq!(applied.kind, AppliedKind::BlockChanged);
+        assert_eq!(applied.message, Some(0));
+        assert_eq!(t.messages.len(), 1);
+        match t.messages[0].blocks.as_slice() {
+            [Block::Tool(tool)] => assert_eq!(tool.input["content"], "x"),
+            other => panic!("expected one card, got {other:?}"),
         }
     }
 
