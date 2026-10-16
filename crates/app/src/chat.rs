@@ -14,6 +14,7 @@ use crate::markdown::{self, MdBlock, Spans};
 use crate::menu::{self, Entry, Item};
 use crate::pasteboard::{self, Pasted};
 use crate::select;
+use crate::settings::Access;
 use crate::theme::{self, u};
 use crate::threads;
 use agent_core::{
@@ -25,9 +26,9 @@ use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
     canvas, div, img, list, px, relative, rgb, rgba, Animation, AnimationExt, AnyElement, Context,
-    ElementId, Entity, EventEmitter, ExternalPaths, FontStyle, FontWeight, InteractiveText,
-    ListAlignment, ListState, SharedString, StrikethroughStyle, StyledImage, StyledText,
-    Subscription, Task, TextRun, UnderlineStyle, Window,
+    ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, FontStyle, FontWeight,
+    InteractiveText, KeyDownEvent, ListAlignment, ListState, SharedString, StrikethroughStyle,
+    StyledText, Subscription, Task, TextRun, UnderlineStyle, Window,
 };
 use session::{Conn, DriverEvent};
 use std::cell::{Cell, RefCell};
@@ -119,6 +120,14 @@ pub enum ChatEvent {
     OpenUrl(String),
     /// "Open in editor" on a changed file: its path, with its changes shown.
     OpenFile(PathBuf),
+}
+
+/// An attached image's square thumbnail: being made, made, or not
+/// possible (then the image shows as a named chip, like any file).
+enum Thumb {
+    Making,
+    Ready(PathBuf),
+    Failed,
 }
 
 /// A message on its way out: typed text plus what was attached.
@@ -317,6 +326,13 @@ pub struct ChatPane {
     _retry: Option<Task<()>>,
     /// Files and images going out with the next message.
     attachments: Vec<PathBuf>,
+    /// Square thumbnails of attached images, by the image's path.
+    thumbs: HashMap<PathBuf, Thumb>,
+    /// An attachment open over the thread.
+    preview: Option<crate::preview::Preview>,
+    preview_focus: FocusHandle,
+    /// The access menu is open above its chip, with this row highlighted.
+    access_menu: Option<usize>,
     /// Files under `cwd` for `@`, listed on first use and again when stale.
     files: Option<Arc<Vec<String>>>,
     files_at: Option<Instant>,
@@ -330,6 +346,9 @@ pub struct ChatPane {
     archived: bool,
     /// The agent's own session id, so a later launch can resume it.
     native_id: Option<String>,
+    /// The model the agent said it runs, from its latest start (`model` is
+    /// the one this thread asked for, `None` for the agent's default).
+    ran_model: Option<String>,
     /// A turn sent into a resumed session; if the resume fails it is sent
     /// again into a fresh one that gets the thread replayed.
     resuming: Option<UserTurn>,
@@ -350,7 +369,7 @@ fn now() -> i64 {
 
 const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
 
-fn is_image(p: &std::path::Path) -> bool {
+pub fn is_image(p: &std::path::Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
@@ -370,6 +389,15 @@ fn mime_for(p: &std::path::Path) -> &'static str {
         Some("pdf") => "application/pdf",
         _ if p.is_dir() => "inode/directory",
         _ => "application/octet-stream",
+    }
+}
+
+/// Each access mode's mark, on its chip and in its menu.
+fn access_icon(a: Access) -> Icon {
+    match a {
+        Access::Ask => Icon::Shield,
+        Access::Edits => Icon::Pencil,
+        Access::Full => Icon::Bolt,
     }
 }
 
@@ -481,6 +509,10 @@ impl ChatPane {
             retries: 0,
             _retry: None,
             attachments: Vec::new(),
+            thumbs: HashMap::new(),
+            preview: None,
+            preview_focus: cx.focus_handle(),
+            access_menu: None,
             files: None,
             files_at: None,
             listing: false,
@@ -490,6 +522,7 @@ impl ChatPane {
             control: false,
             archived: false,
             native_id: None,
+            ran_model: None,
             resuming: None,
             _save: None,
             _pump: None,
@@ -518,6 +551,8 @@ impl ChatPane {
         c.title = saved.title.into();
         c.mode = if saved.full_access {
             PermissionMode::Yolo
+        } else if saved.ask_first {
+            PermissionMode::Ask
         } else {
             PermissionMode::Edit
         };
@@ -563,6 +598,7 @@ impl ChatPane {
             cwd: self.cwd.clone(),
             full_access: self.mode == PermissionMode::Yolo,
             model: self.model.as_ref().map(|m| m.to_string()),
+            ask_first: self.mode == PermissionMode::Ask,
             title: self.title.to_string(),
             transcript: self.transcript.clone(),
             draft: f.text().to_string(),
@@ -644,6 +680,17 @@ impl ChatPane {
         matches!(self.status, ChatStatus::Working | ChatStatus::Waiting)
     }
 
+    /// Tokens, cost and how full the context is, as the agent reported them.
+    pub fn usage(&self) -> &agent_core::Usage {
+        &self.transcript.usage
+    }
+
+    /// The model the agent runs: as it said at its latest start, else the
+    /// one this thread asked for.
+    pub fn ran_model(&self) -> Option<&str> {
+        self.ran_model.as_deref().or(self.model.as_deref())
+    }
+
     /// How long the current turn has been running.
     pub fn working_for(&self) -> Option<Duration> {
         self.turn_started.map(|t| t.elapsed())
@@ -653,6 +700,10 @@ impl ChatPane {
     /// words if a rewrite already stands in for them; then send it, or leave
     /// it in the box to look at.
     pub fn rewrite(&mut self, send: bool, cx: &mut Context<Self>) {
+        // Off in Settings is off for ⌃O as well as ⏎.
+        if crate::refine::mode() == crate::refine::Mode::Off {
+            return;
+        }
         let from = self.composer.read(cx).text().to_string();
         if from.trim().is_empty() || self.refining.is_some() {
             return;
@@ -696,6 +747,12 @@ impl ChatPane {
             return;
         }
         self.refining = None;
+        // Switched off while it ran: the words in the box stay yours, and
+        // nothing is sent until you press ⏎ again.
+        if crate::refine::mode() == crate::refine::Mode::Off {
+            cx.notify();
+            return;
+        }
         match out {
             Err(e) => {
                 self.as_typed = true;
@@ -1059,17 +1116,21 @@ impl ChatPane {
             self.composer.update(cx, |f, cx| f.set_text("", cx));
             return;
         }
-        if self.refining.is_some() {
-            return;
-        }
         let mode = crate::refine::mode();
-        if mode != crate::refine::Mode::Off
-            && self.mine.is_none()
-            && !self.as_typed
-            && crate::refine::needed(&text)
-        {
-            self.rewrite(mode == crate::refine::Mode::Auto, cx);
-            return;
+        if self.refining.is_some() {
+            if mode != crate::refine::Mode::Off {
+                return;
+            }
+            // Switched off while a rewrite ran: it is dropped, and what you
+            // typed goes as it is.
+            self.refining = None;
+            self._refine = None;
+        }
+        if self.mine.is_none() && !self.as_typed {
+            if let Some(send) = crate::refine::on_enter(mode, &text) {
+                self.rewrite(send, cx);
+                return;
+            }
         }
         // You are sending something yourself: any retry deck had lined up
         // gives way to it.
@@ -1251,6 +1312,63 @@ impl ChatPane {
         cx.notify();
     }
 
+    /// Start square thumbnails for the images in `paths` that have none.
+    fn want_thumbs(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        for path in paths {
+            if !is_image(&path) || self.thumbs.contains_key(&path) {
+                continue;
+            }
+            self.thumbs.insert(path.clone(), Thumb::Making);
+            cx.spawn(async move |this, cx| {
+                let src = path.clone();
+                let made = cx
+                    .background_executor()
+                    .spawn(async move { crate::thumb::make(&src) })
+                    .await;
+                let _ = this.update(cx, |c, cx| {
+                    let thumb = match made {
+                        Ok(t) => Thumb::Ready(t),
+                        Err(e) => {
+                            tracing::debug!("no thumbnail for {}: {e}", path.display());
+                            Thumb::Failed
+                        }
+                    };
+                    c.thumbs.insert(path, thumb);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Show `path` inside deck, over the thread.
+    fn open_preview(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview = Some(crate::preview::Preview::loading(path.clone()));
+        window.focus(&self.preview_focus);
+        cx.spawn(async move |this, cx| {
+            let src = path.clone();
+            let body = cx
+                .background_executor()
+                .spawn(async move { crate::preview::load(&src) })
+                .await;
+            let _ = this.update(cx, |c, cx| {
+                if let Some(p) = c.preview.as_mut().filter(|p| p.path == path) {
+                    p.body = body;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn close_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview.take().is_some() {
+            window.focus(&self.composer.read(cx).focus);
+            cx.notify();
+        }
+    }
+
     // -- @ mentions -------------------------------------------------------------
 
     fn update_mention(&mut self, cx: &mut Context<Self>) {
@@ -1357,11 +1475,23 @@ impl ChatPane {
     fn sync_popup(&mut self, cx: &mut Context<Self>) {
         let mention = self.mention.as_ref().is_some_and(|m| !m.matches.is_empty());
         let empty = self.composer.read(cx).text().trim().is_empty();
-        let open = mention || (!self.asks.is_empty() && empty);
+        let open = mention || self.access_menu.is_some() || (!self.asks.is_empty() && empty);
         self.composer.update(cx, |f, _| f.popup = open);
     }
 
     fn popup_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        if let Some(lit) = self.access_menu {
+            let n = Access::ALL.len();
+            match key {
+                "up" => self.access_menu = Some((lit + n - 1) % n),
+                "down" | "tab" => self.access_menu = Some((lit + 1) % n),
+                "enter" => self.set_access(Access::ALL[lit], cx),
+                "escape" => self.close_access_menu(cx),
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         if self.mention.as_ref().is_some_and(|m| !m.matches.is_empty()) {
             self.mention_key(key, cx);
             return;
@@ -1584,15 +1714,7 @@ impl ChatPane {
                             )
                         }),
                 )
-                .when_some(key, |d, k| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(k),
-                    )
-                })
+                .when_some(key, |d, k| d.child(crate::kbd::key(k)))
                 .on_click(cx.listener(move |c, _, _, cx| c.choose(i, cx)))
         };
         let card = match ask {
@@ -1640,7 +1762,7 @@ impl ChatPane {
                     div()
                         .text_size(u(11.))
                         .text_color(rgb(theme::dim()))
-                        .child("Or type what to do instead and press ⏎"),
+                        .child(crate::kbd::hints("Or type what to do instead and press ⏎")),
                 )
             }
             Ask::Question {
@@ -1700,12 +1822,9 @@ impl ChatPane {
                         Some("⏎"),
                     ));
                 }
-                card.child(
-                    div()
-                        .text_size(u(11.))
-                        .text_color(rgb(theme::dim()))
-                        .child("↑↓ choose · ⏎ answer · or type your own answer · esc skip"),
-                )
+                card.child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(
+                    crate::kbd::hints("↑↓ choose · ⏎ answer · or type your own answer · esc skip"),
+                ))
             }
         };
         Some(card.into_any_element())
@@ -1721,6 +1840,7 @@ impl ChatPane {
         // The old agent's session id and model mean nothing to the new one.
         self.native_id = None;
         self.model = None;
+        self.ran_model = None;
         self.picking_model = false;
         // A fresh backend that is handed our transcript, so the new agent
         // picks up the thread; the handoff row says how faithfully.
@@ -1780,21 +1900,120 @@ impl ChatPane {
         self.start_carrying(&prior, cx);
     }
 
-    fn toggle_mode(&mut self, cx: &mut Context<Self>) {
-        // Ask before edits → auto-accept edits → full access → ask…
-        self.mode = match self.mode {
-            PermissionMode::Ask | PermissionMode::Auto => PermissionMode::Edit,
-            PermissionMode::Edit => PermissionMode::Yolo,
-            PermissionMode::Yolo => PermissionMode::Ask,
+    /// Open the access menu on the current mode, or shut it.
+    fn toggle_access_menu(&mut self, cx: &mut Context<Self>) {
+        // One popup above the composer at a time.
+        self.switching = false;
+        self.picking_model = false;
+        self.access_menu = match self.access_menu {
+            Some(_) => None,
+            None => Access::ALL
+                .iter()
+                .position(|a| *a == Access::of(self.mode))
+                .or(Some(0)),
         };
-        // The mode is a launch flag: restart with it, resuming the agent's own
-        // session when it can so nothing is replayed.
-        if self.conn.is_some() {
-            let carry = self.transcript.clone();
-            self.start_carrying(&carry, cx);
-        }
-        self.schedule_save(cx);
+        self.sync_popup(cx);
         cx.notify();
+    }
+
+    fn close_access_menu(&mut self, cx: &mut Context<Self>) {
+        if self.access_menu.take().is_some() {
+            self.sync_popup(cx);
+            cx.notify();
+        }
+    }
+
+    /// Picked from the menu. Choosing a mode used to mean clicking through
+    /// the others, with a restart of the agent at each.
+    fn set_access(&mut self, access: Access, cx: &mut Context<Self>) {
+        self.access_menu = None;
+        self.sync_popup(cx);
+        let mode = access.mode();
+        if mode != self.mode {
+            self.mode = mode;
+            // The mode is a launch flag: restart with it, resuming the
+            // agent's own session when it can so nothing is replayed.
+            if self.conn.is_some() {
+                let carry = self.transcript.clone();
+                self.start_carrying(&carry, cx);
+            }
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
+    /// The three modes above the chip, each with what it allows.
+    fn render_access_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let lit = self.access_menu?;
+        let current = Access::of(self.mode);
+        let mut menu = div()
+            .id("access-menu")
+            .absolute()
+            .left_0()
+            .bottom(relative(1.))
+            .mb(u(6.))
+            .w(u(300.))
+            .p(u(4.))
+            .flex()
+            .flex_col()
+            .gap(u(2.))
+            .rounded(u(12.))
+            .bg(rgb(theme::raised()))
+            .border_1()
+            .border_color(rgba(theme::hairline()))
+            .shadow_lg()
+            .occlude()
+            .cursor_pointer();
+        for (i, a) in Access::ALL.iter().copied().enumerate() {
+            let on = a == current;
+            menu = menu.child(
+                div()
+                    .id(ElementId::NamedInteger("access".into(), i as u64))
+                    .flex()
+                    .items_center()
+                    .gap(u(10.))
+                    .px(u(10.))
+                    .py(u(7.))
+                    .rounded(u(8.))
+                    .when(i == lit, |d| d.bg(rgb(theme::surface())))
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .child(icon(
+                        access_icon(a),
+                        14.,
+                        if on { theme::text() } else { theme::text_2() },
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(u(13.))
+                                    .line_height(u(18.))
+                                    .text_color(rgb(theme::text()))
+                                    .child(a.name()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(u(11.))
+                                    .line_height(u(15.))
+                                    .text_color(rgb(theme::dim()))
+                                    .child(a.detail()),
+                            ),
+                    )
+                    .when(on, |d| d.child(icon(Icon::Check, 13., theme::text())))
+                    // On press, not click: the menu hangs outside the chip's
+                    // bounds, so the press already closed it (as a press
+                    // outside), and by release this row would be gone.
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |c, _, _, cx| c.set_access(a, cx)),
+                    ),
+            );
+        }
+        Some(menu.into_any_element())
     }
 
     fn apply(&mut self, sid: SessionId, batch: Vec<DriverEvent>, cx: &mut Context<Self>) {
@@ -1810,10 +2029,13 @@ impl ChatPane {
                 DriverEvent::Agent(ev) => {
                     match &ev {
                         AgentEvent::Started {
-                            native_session_id: Some(id),
-                            ..
+                            native_session_id,
+                            model,
                         } => {
-                            self.native_id = Some(id.clone());
+                            if let Some(id) = native_session_id {
+                                self.native_id = Some(id.clone());
+                            }
+                            self.ran_model = model.as_ref().map(|m| m.to_string());
                         }
                         AgentEvent::Fatal { message, .. } => {
                             failed_resume |= self.resuming.is_some();
@@ -3016,9 +3238,9 @@ impl ChatPane {
         Some(card.into_any_element())
     }
 
-    /// Attached files as a row: images as thumbnails, everything else as a
-    /// named chip. In the composer each has a × to take it off; in a sent
-    /// message a click opens it.
+    /// Attached files as a row: images as square thumbnails, everything
+    /// else as a named chip. A click opens one in deck; in the composer each
+    /// also has a × to take it off.
     fn render_attachments(
         &self,
         key: &str,
@@ -3026,82 +3248,235 @@ impl ChatPane {
         removable: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Images that came some way other than the composer (a restored
+        // thread, a message sent from the CLI) get their thumbnails here.
+        let missing: Vec<PathBuf> = files
+            .iter()
+            .filter(|p| is_image(p) && !self.thumbs.contains_key(*p))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = this.update(cx, |c, cx| c.want_thumbs(missing, cx));
+            });
+        }
         let mut row = div()
             .flex()
             .flex_wrap()
-            .gap(u(6.))
+            // Room for the × that sits on each thumbnail's corner.
+            .gap(u(if removable { 10. } else { 6. }))
             .when(!removable, |d| d.justify_end());
         for (i, path) in files.iter().enumerate() {
             let id = ElementId::Name(format!("att-{key}-{i}").into());
-            let group = SharedString::from(format!("att-{key}-{i}"));
-            let p = path.clone();
-            let tile = if is_image(path) {
-                let size = if removable { 56. } else { 140. };
-                div().size(u(size)).child(
-                    img(path.clone())
-                        .size_full()
-                        .rounded(u(10.))
-                        .object_fit(gpui::ObjectFit::Cover),
-                )
-            } else {
-                let dir = path.is_dir();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(u(6.))
-                    .h(u(32.))
-                    .pl(u(9.))
-                    .pr(u(if removable { 26. } else { 11. }))
-                    .max_w(u(260.))
-                    .text_size(u(12.))
-                    .text_color(rgb(theme::text_2()))
-                    .child(icon(
-                        if dir { Icon::Folder } else { Icon::File },
-                        13.,
-                        theme::dim(),
-                    ))
-                    .child(div().min_w_0().truncate().child(file_name(path)))
+            // `None`: a file chip. `Some(None)`: a thumbnail on its way.
+            let thumb = match (is_image(path), self.thumbs.get(path)) {
+                (false, _) | (true, Some(Thumb::Failed)) => None,
+                (true, Some(Thumb::Ready(t))) => Some(Some(t.clone())),
+                (true, _) => Some(None),
             };
+            let picture = thumb.is_some();
+            let tile = match thumb {
+                // Square, so it fills the tile exactly and the tile's own
+                // corners round it; the border sits outside it, hence 9.
+                Some(thumb) => div()
+                    .size(u(if removable { 56. } else { 140. }))
+                    .children(thumb.map(|t| img(t).size_full().rounded(u(9.)))),
+                None => {
+                    let dir = path.is_dir();
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(u(7.))
+                        .h(u(32.))
+                        .pl(u(10.))
+                        .pr(u(if removable { 4. } else { 12. }))
+                        .max_w(u(260.))
+                        .text_size(u(12.))
+                        .text_color(rgb(theme::text_2()))
+                        .child(icon(
+                            if dir { Icon::Folder } else { Icon::File },
+                            13.,
+                            theme::dim(),
+                        ))
+                        .child(div().min_w_0().truncate().child(file_name(path)))
+                }
+            };
+            let p = path.clone();
             let tile = tile
                 .id(id)
                 .relative()
-                .group(group.clone())
+                .flex_none()
                 .rounded(u(10.))
                 .bg(rgb(theme::surface()))
                 .border_1()
                 .border_color(rgba(theme::input_edge()))
-                .when(!removable, |d| {
-                    d.cursor_pointer()
-                        .hover(|s| s.border_color(rgba(theme::alpha(theme::text(), 0x40))))
-                        .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&p)))
-                });
+                .cursor_pointer()
+                .hover(|s| s.border_color(rgba(theme::alpha(theme::text(), 0x40))))
+                .on_click(
+                    cx.listener(move |c, _, window, cx| c.open_preview(p.clone(), window, cx)),
+                );
             let tile = if removable {
                 let p = path.clone();
-                tile.child(
-                    div()
-                        .id(ElementId::Name(format!("detach-{key}-{i}").into()))
+                let remove = div()
+                    .id(ElementId::Name(format!("detach-{key}-{i}").into()))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |c, _, _, cx| {
+                        // Not also a click on the tile, which would open it.
+                        cx.stop_propagation();
+                        c.detach(&p, cx)
+                    }));
+                tile.child(if picture {
+                    // On the corner, off the picture: inverted like the send
+                    // button, so it reads on any image and in every theme
+                    // (it was the theme's text on fixed black, about 1.2:1
+                    // in Light). The ring is the composer's colour, cut
+                    // out of the thumbnail's corner.
+                    remove
                         .absolute()
-                        .top(u(4.))
-                        .right(u(4.))
-                        .size(u(18.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(rgba(0x000000c0))
-                        .border_1()
-                        .border_color(rgba(theme::input_edge()))
-                        .cursor_pointer()
+                        .top(u(-7.))
+                        .right(u(-7.))
+                        .size(u(20.))
+                        .bg(rgb(theme::text()))
+                        .border_2()
+                        .border_color(rgb(theme::raised()))
+                        .hover(|s| s.opacity(0.85))
+                        .child(icon(Icon::Close, 9., theme::pane()))
+                } else {
+                    remove
+                        .size(u(22.))
                         .hover(|s| s.bg(rgb(theme::surface_hover())))
-                        .child(icon(Icon::Close, 10., theme::text()))
-                        .on_click(cx.listener(move |c, _, _, cx| c.detach(&p, cx))),
-                )
+                        .child(icon(Icon::Close, 10., theme::text_2()))
+                })
             } else {
                 tile
             };
             row = row.child(tile);
         }
         row.into_any_element()
+    }
+
+    /// An attachment opened over the thread. Esc, space, × or a click
+    /// outside it closes it.
+    fn render_preview(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::preview::{self, Body};
+        let p = self.preview.as_ref()?;
+        let (open, reveal) = (p.path.clone(), p.path.clone());
+        let glyph = if matches!(p.body, Body::Folder { .. }) {
+            Icon::Folder
+        } else {
+            Icon::File
+        };
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(u(8.))
+            .h(u(52.))
+            .pl(u(16.))
+            .pr(u(10.))
+            .border_b_1()
+            .border_color(rgba(theme::hairline()))
+            .child(icon(glyph, 15., theme::text_2()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .pl(u(2.))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(u(13.))
+                            .line_height(u(18.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(theme::text()))
+                            .child(file_name(&p.path)),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(u(11.))
+                            .line_height(u(15.))
+                            .text_color(rgb(theme::dim()))
+                            .child(preview::detail(p)),
+                    ),
+            )
+            .child(
+                preview::action("preview-open", "Open")
+                    .on_click(cx.listener(move |_, _, _, cx| cx.open_with_system(&open))),
+            )
+            .child(
+                preview::action("preview-reveal", "Show in Finder")
+                    .on_click(cx.listener(move |_, _, _, cx| cx.reveal_path(&reveal))),
+            )
+            .child(
+                div()
+                    .id("preview-close")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .size(u(28.))
+                    .rounded(u(7.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(theme::surface())))
+                    .child(icon(Icon::Close, 13., theme::text_2()))
+                    .on_click(cx.listener(|c, _, window, cx| c.close_preview(window, cx))),
+            );
+        Some(
+            div()
+                .id("preview")
+                .track_focus(&self.preview_focus)
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(u(24.))
+                .bg(rgba(if theme::is_dark() {
+                    0x00000059
+                } else {
+                    0x00000026
+                }))
+                // The thread under it gets neither the wheel nor the hover.
+                .occlude()
+                .on_key_down(cx.listener(|c, ev: &KeyDownEvent, window, cx| {
+                    if matches!(ev.keystroke.key.as_str(), "escape" | "space") {
+                        c.close_preview(window, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|c, _, window, cx| c.close_preview(window, cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .max_w(u(1000.))
+                        .rounded(u(14.))
+                        .bg(rgb(theme::pane()))
+                        .border_1()
+                        .border_color(rgba(theme::alpha(theme::text(), 0x1f)))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(header)
+                        .child(div().flex_1().min_h_0().child(preview::body(p))),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Files matching what follows `@`, above the composer. ↑↓ choose,
@@ -3225,6 +3600,7 @@ impl ChatPane {
                     .on_click(cx.listener(|c, _, _, cx| {
                         c.switching = !c.switching;
                         c.picking_model = false;
+                        c.close_access_menu(cx);
                         cx.notify();
                     })),
             )
@@ -3247,29 +3623,37 @@ impl ChatPane {
                         .on_click(cx.listener(|c, _, _, cx| {
                             c.picking_model = !c.picking_model;
                             c.switching = false;
+                            c.close_access_menu(cx);
                             cx.notify();
                         })),
                 )
             })
             .child({
-                // Every mode a quiet chip with its own mark; Full access is
-                // told apart by an outline and full-strength text, not by a
-                // fill that would outshout the message being written.
-                let (label, glyph, loud) = match self.mode {
-                    PermissionMode::Yolo => ("Full access", Icon::Bolt, true),
-                    PermissionMode::Edit => ("Accept edits", Icon::Pencil, false),
-                    _ => ("Ask first", Icon::Shield, false),
-                };
-                chip("mode")
-                    .text_color(rgb(if loud { theme::text() } else { theme::text_2() }))
-                    .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
-                    .child(icon(
-                        glyph,
-                        13.,
-                        if loud { theme::accent() } else { theme::text_2() },
-                    ))
-                    .child(label)
-                    .on_click(cx.listener(|c, _, _, cx| c.toggle_mode(cx)))
+                // A chip like the agent's beside it, a menu like it too: a
+                // click used to move silently to the next mode, restarting
+                // the agent at each step. Full access keeps full-strength
+                // text and the accent mark; the menu says what each mode
+                // allows.
+                let access = Access::of(self.mode);
+                let loud = access == Access::Full;
+                let tint = if loud { theme::text() } else { theme::text_2() };
+                let mark = if loud { theme::accent() } else { theme::text_2() };
+                div()
+                    .relative()
+                    .on_mouse_down_out(cx.listener(|c, _, _, cx| c.close_access_menu(cx)))
+                    .child(
+                        chip("mode")
+                            .text_color(rgb(tint))
+                            .when(self.access_menu.is_some(), |d| {
+                                d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
+                            })
+                            .hover(|s| s.bg(rgb(theme::surface())).text_color(rgb(theme::text())))
+                            .child(icon(access_icon(access), 13., mark))
+                            .child(access.name())
+                            .child(icon(Icon::ChevronDown, 11., theme::dim()))
+                            .on_click(cx.listener(|c, _, _, cx| c.toggle_access_menu(cx))),
+                    )
+                    .children(self.render_access_menu(cx))
             })
             .child(div().flex_1())
             .when_some(
@@ -3519,7 +3903,8 @@ impl ChatPane {
                         window.focus(&focus)
                     })
                     .when(!self.attachments.is_empty(), |d| {
-                        d.child(div().pt(u(2.)).px(u(2.)).child(self.render_attachments(
+                        // Room above for the × on each thumbnail's corner.
+                        d.child(div().pt(u(6.)).px(u(2.)).child(self.render_attachments(
                             "draft",
                             &self.attachments,
                             true,
@@ -3539,7 +3924,7 @@ impl ChatPane {
                     .child(if self.refining.is_some() {
                         crate::icon::shimmer("refining", hint)
                     } else {
-                        hint.into_any_element()
+                        crate::kbd::hints(&hint).justify_center().into_any_element()
                     }),
             )
             .into_any_element()
@@ -4467,7 +4852,7 @@ fn relative_to(title: &str, cwd: &std::path::Path) -> String {
 }
 
 /// 1234 → "1.2k", 1500000 → "1.5M".
-fn compact_count(n: u64) -> String {
+pub fn compact_count(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
         1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3).replace(".0k", "k"),
@@ -4497,11 +4882,21 @@ fn text_runs(spans: &Spans, color: u32, weight: FontWeight) -> Vec<TextRun> {
         font: base(st),
         color: rgb(if st.link || st.code {
             theme::text()
+        } else if st.kbd {
+            theme::text_2()
         } else {
             color
         })
         .into(),
-        background_color: st.code.then(|| rgb(theme::surface()).into()),
+        // Keys in the keycap's tint (see `kbd`): square, since a text run
+        // can't round its corners.
+        background_color: if st.code {
+            Some(rgb(theme::surface()).into())
+        } else if st.kbd {
+            Some(rgba(theme::tint()).into())
+        } else {
+            None
+        },
         underline: st.link.then(|| UnderlineStyle {
             thickness: px(1.),
             color: Some(rgb(theme::dim()).into()),
@@ -5118,6 +5513,7 @@ impl Render for ChatPane {
             window.request_animation_frame();
         }
         div()
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -5176,6 +5572,7 @@ impl Render for ChatPane {
                         .child(Self::column(self.render_composer(window, cx))),
                 )
             })
+            .children(self.render_preview(cx))
     }
 }
 

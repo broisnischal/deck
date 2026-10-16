@@ -532,12 +532,17 @@ pub(crate) fn opencode_usage(part: &Value) -> Option<Usage> {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
+    let (input, output) = (n("input"), n("output"));
+    let (read, write) = (cn("read"), cn("write"));
     Some(Usage {
-        input: n("input"),
-        output: n("output"),
-        cache_read: cn("read"),
-        cache_write: cn("write"),
+        input,
+        output,
+        cache_read: read,
+        cache_write: write,
         cost_usd: part.get("cost").and_then(Value::as_f64),
+        // Each step sends the whole thread again.
+        context: input + read + write + output + n("reasoning"),
+        ..Default::default()
     })
 }
 
@@ -789,6 +794,7 @@ impl Decode for CodexDecoder {
                         cache_read: cached,
                         cache_write: n("cache_write_input_tokens"),
                         cost_usd: None,
+                        ..Default::default()
                     }));
                 }
             }
@@ -926,6 +932,7 @@ impl Decode for GeminiDecoder {
                             cache_read: cached,
                             cache_write: 0,
                             cost_usd: None,
+                            ..Default::default()
                         }));
                     }
                 }
@@ -1013,6 +1020,7 @@ impl Decode for GrokDecoder {
                         cache_read: n("cache_read_input_tokens"),
                         cache_write: 0,
                         cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+                        ..Default::default()
                     }));
                 }
                 self.turn.stop = Some(match s("stopReason") {
@@ -1267,6 +1275,7 @@ mod tests {
         match fin.first() {
             Some(AgentEvent::Usage(u)) => {
                 assert_eq!((u.input, u.output), (12828, 2));
+                assert_eq!(u.context, 12843);
                 assert_eq!(u.cost_usd, Some(0.0));
             }
             other => panic!("expected usage, got {other:?}"),

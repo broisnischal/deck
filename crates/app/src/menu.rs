@@ -312,13 +312,16 @@ impl Render for ContextMenu {
                         })
                         .child(div().flex_1().whitespace_nowrap().child(item.label.clone()))
                         .when_some(item.shortcut.clone(), |d, keys| {
-                            d.child(
+                            // A chord as a keycap; a word ("chat", "not
+                            // installed") as the quiet text it is.
+                            d.child(div().pl(u(20.)).child(if crate::kbd::is_chord(&keys) {
+                                crate::kbd::key(keys)
+                            } else {
                                 div()
-                                    .pl(u(20.))
                                     .text_size(u(12.))
                                     .text_color(rgb(theme::dim()))
-                                    .child(keys),
-                            )
+                                    .child(keys)
+                            }))
                         })
                         .when(!item.disabled, |d| {
                             d.cursor_pointer()

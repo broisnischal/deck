@@ -574,4 +574,39 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
     }
+
+    #[test]
+    fn usage_sums_counts_and_keeps_the_newest_readings() {
+        let mut t = Transcript::default();
+        let turn = |input, context, window| {
+            AgentEvent::Usage(Usage {
+                input,
+                output: 10,
+                cost_usd: Some(0.5),
+                context,
+                context_window: window,
+                ..Default::default()
+            })
+        };
+        t.apply(&agent(), &turn(100, 40_000, Some(200_000)), 0);
+        t.apply(&agent(), &turn(50, 0, None), 0);
+        t.apply(&agent(), &turn(0, 30_000, None), 0);
+        assert_eq!((t.usage.input, t.usage.output), (150, 30));
+        assert_eq!(t.usage.cost_usd, Some(1.5));
+        // Compaction shrinks the context; the window outlives a turn that
+        // did not restate it.
+        assert_eq!(t.usage.context, 30_000);
+        assert_eq!(t.usage.context_window, Some(200_000));
+        assert_eq!(t.usage.context_used(), Some(0.15));
+    }
+
+    #[test]
+    fn usage_from_before_readings_still_loads() {
+        let u: Usage = serde_json::from_str(
+            r#"{"input":1,"output":2,"cache_read":3,"cache_write":4,"cost_usd":null}"#,
+        )
+        .unwrap();
+        assert_eq!(u.tokens(), 10);
+        assert_eq!((u.context, u.context_window), (0, None));
+    }
 }

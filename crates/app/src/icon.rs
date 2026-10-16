@@ -73,6 +73,7 @@ icons! {
     User => "user.svg",
     Lock => "lock.svg",
     Theme => "theme.svg",
+    Gauge => "gauge.svg",
     Claude => "agent-claude.svg",
     Codex => "agent-codex.svg",
     Gemini => "agent-gemini.svg",

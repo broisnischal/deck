@@ -19,6 +19,9 @@ pub struct Saved {
     pub full_access: bool,
     /// The model this thread asked for; `None` is the agent's default.
     pub model: Option<String>,
+    /// Ask first. Older files have only `full_access`, so this stays apart
+    /// from it rather than replacing it.
+    pub ask_first: bool,
     pub title: String,
     pub transcript: Transcript,
     pub draft: String,

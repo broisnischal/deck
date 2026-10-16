@@ -1147,6 +1147,34 @@ fn cost(model: &str, t: &Tokens) -> Option<f64> {
     Some(scale * dollars / 1e6)
 }
 
+/// `claude-opus-4-1-20250805` as "Opus 4.1", `claude-sonnet-4-5[1m]` as
+/// "Sonnet 4.5 (1M)"; anything else as it came.
+pub fn model_name(id: &str) -> String {
+    let (id, long) = match id.strip_suffix("[1m]") {
+        Some(base) => (base, true),
+        None => (id, false),
+    };
+    let Some(rest) = id.strip_prefix("claude-") else {
+        return id.to_string();
+    };
+    let mut parts = rest.split('-');
+    let Some(family) = parts.next().filter(|f| !f.is_empty()) else {
+        return id.to_string();
+    };
+    // A trailing date is a snapshot, not part of the name.
+    let version: Vec<&str> = parts
+        .filter(|p| !(p.len() == 8 && p.bytes().all(|b| b.is_ascii_digit())))
+        .collect();
+    let mut name = family[..1].to_uppercase() + &family[1..];
+    if !version.is_empty() {
+        name = format!("{name} {}", version.join("."));
+    }
+    if long {
+        name.push_str(" (1M)");
+    }
+    name
+}
+
 // ---------------------------------------------------------------------------
 // Time
 
@@ -1223,6 +1251,15 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_names_read_like_the_product() {
+        assert_eq!(model_name("claude-opus-4-1-20250805"), "Opus 4.1");
+        assert_eq!(model_name("claude-haiku-5-5"), "Haiku 5.5");
+        assert_eq!(model_name("claude-sonnet-4-5[1m]"), "Sonnet 4.5 (1M)");
+        assert_eq!(model_name("gpt-5-codex"), "gpt-5-codex");
+        assert_eq!(model_name("claude-"), "claude-");
+    }
 
     fn temp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("deck-usage-{}-{name}", std::process::id()));

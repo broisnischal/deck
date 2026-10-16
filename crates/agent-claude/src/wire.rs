@@ -5,6 +5,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -49,6 +50,9 @@ pub struct MessageLine {
     /// (`--replay-user-messages`).
     #[serde(default, rename = "isReplay")]
     pub is_replay: bool,
+    /// Set on a sub-agent's messages, whose context is its own.
+    #[serde(default)]
+    pub parent_tool_use_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,11 +145,22 @@ pub struct ResultLine {
     /// The HTTP status of the API call that failed the turn, when one did.
     #[serde(default)]
     pub api_error_status: Option<u16>,
+    /// Per model, since this process started.
+    #[serde(default, rename = "modelUsage")]
+    pub model_usage: HashMap<String, ModelUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelUsage {
+    #[serde(default, rename = "contextWindow")]
+    pub context_window: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct StreamEventLine {
     pub event: RawEvent,
+    #[serde(default)]
+    pub parent_tool_use_id: Option<String>,
 }
 
 /// Raw Anthropic Messages-API streaming events, as forwarded by the CLI.
@@ -208,6 +223,15 @@ impl WireUsage {
             cache_read: self.cache_read_input_tokens,
             cache_write: self.cache_creation_input_tokens,
             cost_usd,
+            ..Default::default()
         }
+    }
+
+    /// What the context held at this call: the whole prompt, cached or
+    /// not, and the reply. `None` when only output was reported.
+    pub fn context(&self) -> Option<u64> {
+        let prompt =
+            self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens;
+        (prompt > 0).then_some(prompt + self.output_tokens)
     }
 }

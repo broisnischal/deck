@@ -279,12 +279,9 @@ impl Render for LauncherPane {
                     .when(!agents.is_empty(), |d| {
                         d.child(div().child(label("Agents")).child(team))
                     })
-                    .child(
-                        div()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child("↵ open · 1–9 pick · ⌥↵ agent in a terminal · esc close"),
-                    ),
+                    .child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(
+                        crate::kbd::hints("↵ open · 1–9 pick · ⌥↵ agent in a terminal · esc close"),
+                    )),
             )
     }
 }
