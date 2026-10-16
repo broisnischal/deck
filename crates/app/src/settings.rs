@@ -39,7 +39,10 @@ pub struct Settings {
     pub notify_attention: bool,
     /// A notification when an agent finishes a long piece of work.
     pub notify_done: bool,
-    /// Rewrite chat messages into clear prompts before they are sent.
+    /// Rewrite chat messages into clear prompts before they are sent. Off,
+    /// nothing rewrites: not ⏎, not ⌃O.
+    pub refine_on: bool,
+    /// What ⏎ does while rewriting is on: rewrite and send, or show first.
     pub refine: crate::refine::Mode,
     /// The model that rewrites them, by Claude Code's alias.
     pub refine_model: String,
@@ -63,6 +66,7 @@ impl Default for Settings {
             default_agent: None,
             notify_attention: true,
             notify_done: true,
+            refine_on: true,
             refine: crate::refine::Mode::default(),
             refine_model: "haiku".into(),
             auto_retry: true,
@@ -323,6 +327,16 @@ impl Access {
 }
 
 impl Settings {
+    /// What chats rewrite with: ⏎'s choice while the switch is on, else
+    /// nothing at all.
+    pub fn refine_mode(&self) -> crate::refine::Mode {
+        if self.refine_on {
+            self.refine
+        } else {
+            crate::refine::Mode::Off
+        }
+    }
+
     pub fn terminal_font(&self) -> f32 {
         self.font_px * self.zoom
     }
@@ -401,6 +415,8 @@ struct Stored {
     #[serde(deserialize_with = "lenient")]
     notify_done: Option<bool>,
     #[serde(deserialize_with = "lenient")]
+    refine_on: Option<bool>,
+    #[serde(deserialize_with = "lenient")]
     refine: Option<crate::refine::Mode>,
     #[serde(deserialize_with = "lenient")]
     refine_model: Option<String>,
@@ -434,6 +450,15 @@ fn from_stored(s: Stored) -> Settings {
         (None, z) => (base, zoom_range(z.unwrap_or(DEFAULT_ZOOM))),
     };
     let d = Settings::default();
+    // Before the switch, "Off" was one of ⏎'s choices: it reads as the
+    // switch off, and ⏎ goes back to its default for when it is turned on.
+    let refine = s.refine.unwrap_or(d.refine);
+    let refine_on = s.refine_on.unwrap_or(refine != crate::refine::Mode::Off);
+    let refine = if refine == crate::refine::Mode::Off {
+        d.refine
+    } else {
+        refine
+    };
     Settings {
         theme: s.theme.unwrap_or(d.theme),
         font_px,
@@ -454,7 +479,8 @@ fn from_stored(s: Stored) -> Settings {
         access: s.access.unwrap_or(d.access),
         notify_attention: s.notify_attention.unwrap_or(d.notify_attention),
         notify_done: s.notify_done.unwrap_or(d.notify_done),
-        refine: s.refine.unwrap_or(d.refine),
+        refine_on,
+        refine,
         refine_model: s
             .refine_model
             .filter(|m| !m.trim().is_empty())
@@ -538,14 +564,42 @@ mod tests {
             access: Access::Full,
             notify_attention: false,
             notify_done: true,
+            refine_on: false,
             refine: crate::refine::Mode::Review,
             refine_model: "sonnet".into(),
             auto_retry: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(parse(&json), s);
+        // Off, and ⏎'s choice kept for when it comes back on.
+        assert_eq!(parse(&json).refine_mode(), crate::refine::Mode::Off);
+        let back_on = Settings {
+            refine_on: true,
+            ..parse(&json)
+        };
+        assert_eq!(back_on.refine_mode(), crate::refine::Mode::Review);
         assert!(json.contains(r#""scheme":"catppuccin-mocha""#));
         assert!(json.contains(r#""theme":"graphite""#));
+    }
+
+    #[test]
+    fn rewriting_reads_from_files_before_and_after_the_switch() {
+        use crate::refine::Mode;
+        let d = parse("{}");
+        assert!(d.refine_on);
+        assert_eq!(d.refine_mode(), Mode::Auto);
+        // "Off" was a choice of ⏎ before the switch.
+        let old_off = parse(r#"{"refine": "off"}"#);
+        assert!(!old_off.refine_on);
+        assert_eq!(old_off.refine, Mode::Auto);
+        assert_eq!(old_off.refine_mode(), Mode::Off);
+        let old_review = parse(r#"{"refine": "review"}"#);
+        assert!(old_review.refine_on);
+        assert_eq!(old_review.refine_mode(), Mode::Review);
+        let off = parse(r#"{"refine_on": false, "refine": "review"}"#);
+        assert_eq!((off.refine_mode(), off.refine), (Mode::Off, Mode::Review));
+        // A bad value is the default, on.
+        assert!(parse(r#"{"refine_on": "nope"}"#).refine_on);
     }
 
     #[test]

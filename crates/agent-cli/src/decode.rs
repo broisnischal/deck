@@ -164,12 +164,17 @@ impl OpenCodeDecoder {
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0)
                         };
+                        let (input, output) = (n("input"), n("output"));
+                        let (read, write) = (cn("read"), cn("write"));
                         out.push(AgentEvent::Usage(Usage {
-                            input: n("input"),
-                            output: n("output"),
-                            cache_read: cn("read"),
-                            cache_write: cn("write"),
+                            input,
+                            output,
+                            cache_read: read,
+                            cache_write: write,
                             cost_usd: part.get("cost").and_then(Value::as_f64),
+                            // Each step sends the whole thread again.
+                            context: input + read + write + output + n("reasoning"),
+                            ..Default::default()
                         }));
                     }
                 }
@@ -329,6 +334,7 @@ mod tests {
         match fin.first() {
             Some(AgentEvent::Usage(u)) => {
                 assert_eq!((u.input, u.output), (12828, 2));
+                assert_eq!(u.context, 12843);
                 assert_eq!(u.cost_usd, Some(0.0));
             }
             other => panic!("expected usage, got {other:?}"),

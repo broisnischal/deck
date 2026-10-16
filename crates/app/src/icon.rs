@@ -69,6 +69,7 @@ icons! {
     Shield => "shield.svg",
     Settings => "settings.svg",
     Snippet => "snippet.svg",
+    Gauge => "gauge.svg",
     Claude => "agent-claude.svg",
     Codex => "agent-codex.svg",
     Gemini => "agent-gemini.svg",

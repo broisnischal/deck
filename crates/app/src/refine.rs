@@ -20,11 +20,14 @@ pub enum Mode {
     Auto,
     /// Enter puts the rewrite in the box; Enter again sends it.
     Review,
+    /// Nothing rewrites, not Enter and not ⌃O: the switch in Settings
+    /// turned off, or a file from before the switch that chose "Off".
     Off,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 3] = [Mode::Auto, Mode::Review, Mode::Off];
+    /// What Enter does while rewriting is on.
+    pub const CHOICES: [Mode; 2] = [Mode::Auto, Mode::Review];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -78,6 +81,12 @@ pub struct Context {
     pub folder: String,
     pub task: String,
     pub last_reply: String,
+}
+
+/// Whether Enter rewrites `text` before it goes, and if so whether the
+/// rewrite then sends itself.
+pub fn on_enter(mode: Mode, text: &str) -> Option<bool> {
+    (mode != Mode::Off && needed(text)).then_some(mode == Mode::Auto)
 }
 
 /// Whether a message is worth rewriting: not a slash command or a shell
@@ -244,6 +253,17 @@ mod tests {
         assert!(!needed("@src/a.rs fix it"));
         assert!(needed("can you make the sidebar rows line up better"));
         assert!(needed("fix\nthis"));
+    }
+
+    #[test]
+    fn off_rewrites_nothing_on_enter() {
+        let long = "can you make the sidebar rows line up better";
+        assert_eq!(on_enter(Mode::Auto, long), Some(true));
+        assert_eq!(on_enter(Mode::Review, long), Some(false));
+        assert_eq!(on_enter(Mode::Off, long), None);
+        assert_eq!(on_enter(Mode::Off, "fix\nthis"), None);
+        // Short replies go as typed whatever the mode.
+        assert_eq!(on_enter(Mode::Auto, "yes do it"), None);
     }
 
     #[test]

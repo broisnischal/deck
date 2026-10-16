@@ -14,6 +14,7 @@ mod history;
 mod icon;
 mod inspect;
 mod inspector;
+mod kbd;
 mod launcher;
 mod markdown;
 mod menu;
@@ -35,6 +36,7 @@ mod textbuf;
 mod theme;
 mod threads;
 mod thumb;
+mod usage;
 mod workspace;
 
 use gpui::prelude::*;

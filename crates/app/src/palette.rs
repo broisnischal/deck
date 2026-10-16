@@ -471,19 +471,7 @@ impl Render for Palette {
                             )
                         },
                     )
-                    .children(hint.map(|h| {
-                        div()
-                            .flex_none()
-                            .px(u(6.))
-                            .h(u(20.))
-                            .flex()
-                            .items_center()
-                            .rounded(u(5.))
-                            .bg(rgba(theme::tint()))
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::text_2()))
-                            .child(h)
-                    }))
+                    .children(hint.map(crate::kbd::key))
                     .on_click(cx.listener(move |p, _, _, cx| p.run_at(row, cx))),
             );
         }
@@ -553,32 +541,8 @@ impl Render for Palette {
                     .border_color(rgba(theme::hairline()))
                     .text_size(u(11.))
                     .text_color(rgb(theme::dim()))
-                    .child(key_hint("↑↓", "choose"))
-                    .child(key_hint("⏎", "open"))
-                    .child(key_hint("esc", "close")),
+                    .child(crate::kbd::hints("↑↓ choose · ⏎ open · esc close").gap_x(u(18.))),
             )
             .into_any_element()
     }
-}
-
-/// A keycap and what it does, for the footer.
-fn key_hint(key: &'static str, does: &'static str) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(u(6.))
-        .child(
-            div()
-                .px(u(5.))
-                .h(u(18.))
-                .min_w(u(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(u(4.))
-                .bg(rgba(theme::tint()))
-                .text_color(rgb(theme::text_2()))
-                .child(key),
-        )
-        .child(does)
 }

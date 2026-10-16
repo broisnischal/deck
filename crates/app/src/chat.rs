@@ -304,6 +304,8 @@ pub struct ChatPane {
     archived: bool,
     /// The agent's own session id, so a later launch can resume it.
     native_id: Option<String>,
+    /// The model the agent said it runs, from its latest start.
+    model: Option<String>,
     /// A turn sent into a resumed session; if the resume fails it is sent
     /// again into a fresh one that gets the thread replayed.
     resuming: Option<UserTurn>,
@@ -461,6 +463,7 @@ impl ChatPane {
             control: false,
             archived: false,
             native_id: None,
+            model: None,
             resuming: None,
             _save: None,
             _pump: None,
@@ -605,6 +608,16 @@ impl ChatPane {
         matches!(self.status, ChatStatus::Working | ChatStatus::Waiting)
     }
 
+    /// Tokens, cost and context so far, and the plan's allowance as the
+    /// agent last reported it.
+    pub fn usage(&self) -> &agent_core::Usage {
+        &self.transcript.usage
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
     /// How long the current turn has been running.
     pub fn working_for(&self) -> Option<Duration> {
         self.turn_started.map(|t| t.elapsed())
@@ -614,6 +627,10 @@ impl ChatPane {
     /// words if a rewrite already stands in for them; then send it, or leave
     /// it in the box to look at.
     pub fn rewrite(&mut self, send: bool, cx: &mut Context<Self>) {
+        // Off in Settings is off for ⌃O as well as ⏎.
+        if crate::refine::mode() == crate::refine::Mode::Off {
+            return;
+        }
         let from = self.composer.read(cx).text().to_string();
         if from.trim().is_empty() || self.refining.is_some() {
             return;
@@ -657,6 +674,12 @@ impl ChatPane {
             return;
         }
         self.refining = None;
+        // Switched off while it ran: the words in the box stay yours, and
+        // nothing is sent until you press ⏎ again.
+        if crate::refine::mode() == crate::refine::Mode::Off {
+            cx.notify();
+            return;
+        }
         match out {
             Err(e) => {
                 self.as_typed = true;
@@ -1013,17 +1036,21 @@ impl ChatPane {
             self.composer.update(cx, |f, cx| f.set_text("", cx));
             return;
         }
-        if self.refining.is_some() {
-            return;
-        }
         let mode = crate::refine::mode();
-        if mode != crate::refine::Mode::Off
-            && self.mine.is_none()
-            && !self.as_typed
-            && crate::refine::needed(&text)
-        {
-            self.rewrite(mode == crate::refine::Mode::Auto, cx);
-            return;
+        if self.refining.is_some() {
+            if mode != crate::refine::Mode::Off {
+                return;
+            }
+            // Switched off while a rewrite ran: it is dropped, and what you
+            // typed goes as it is.
+            self.refining = None;
+            self._refine = None;
+        }
+        if self.mine.is_none() && !self.as_typed {
+            if let Some(send) = crate::refine::on_enter(mode, &text) {
+                self.rewrite(send, cx);
+                return;
+            }
         }
         // You are sending something yourself: any retry deck had lined up
         // gives way to it.
@@ -1606,15 +1633,7 @@ impl ChatPane {
                             )
                         }),
                 )
-                .when_some(key, |d, k| {
-                    d.child(
-                        div()
-                            .flex_none()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child(k),
-                    )
-                })
+                .when_some(key, |d, k| d.child(crate::kbd::key(k)))
                 .on_click(cx.listener(move |c, _, _, cx| c.choose(i, cx)))
         };
         let card = match ask {
@@ -1662,7 +1681,7 @@ impl ChatPane {
                     div()
                         .text_size(u(11.))
                         .text_color(rgb(theme::dim()))
-                        .child("Or type what to do instead and press ⏎"),
+                        .child(crate::kbd::hints("Or type what to do instead and press ⏎")),
                 )
             }
             Ask::Question {
@@ -1722,12 +1741,9 @@ impl ChatPane {
                         Some("⏎"),
                     ));
                 }
-                card.child(
-                    div()
-                        .text_size(u(11.))
-                        .text_color(rgb(theme::dim()))
-                        .child("↑↓ choose · ⏎ answer · or type your own answer · esc skip"),
-                )
+                card.child(div().text_size(u(11.)).text_color(rgb(theme::dim())).child(
+                    crate::kbd::hints("↑↓ choose · ⏎ answer · or type your own answer · esc skip"),
+                ))
             }
         };
         Some(card.into_any_element())
@@ -1886,10 +1902,13 @@ impl ChatPane {
                 DriverEvent::Agent(ev) => {
                     match &ev {
                         AgentEvent::Started {
-                            native_session_id: Some(id),
-                            ..
+                            native_session_id,
+                            model,
                         } => {
-                            self.native_id = Some(id.clone());
+                            if let Some(id) = native_session_id {
+                                self.native_id = Some(id.clone());
+                            }
+                            self.model = model.as_ref().map(|m| m.to_string());
                         }
                         AgentEvent::Fatal { message, .. } => {
                             failed_resume |= self.resuming.is_some();
@@ -3524,7 +3543,7 @@ impl ChatPane {
                     .child(if self.refining.is_some() {
                         crate::icon::shimmer("refining", hint)
                     } else {
-                        hint.into_any_element()
+                        crate::kbd::hints(&hint).justify_center().into_any_element()
                     }),
             )
             .into_any_element()
@@ -4025,7 +4044,7 @@ fn relative_to(title: &str, cwd: &std::path::Path) -> String {
 }
 
 /// 1234 → "1.2k", 1500000 → "1.5M".
-fn compact_count(n: u64) -> String {
+pub fn compact_count(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
         1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3).replace(".0k", "k"),
@@ -4055,11 +4074,21 @@ fn text_runs(spans: &Spans, color: u32, weight: FontWeight) -> Vec<TextRun> {
         font: base(st),
         color: rgb(if st.link || st.code {
             theme::text()
+        } else if st.kbd {
+            theme::text_2()
         } else {
             color
         })
         .into(),
-        background_color: st.code.then(|| rgb(theme::surface()).into()),
+        // Keys in the keycap's tint (see `kbd`): square, since a text run
+        // can't round its corners.
+        background_color: if st.code {
+            Some(rgb(theme::surface()).into())
+        } else if st.kbd {
+            Some(rgba(theme::tint()).into())
+        } else {
+            None
+        },
         underline: st.link.then(|| UnderlineStyle {
             thickness: px(1.),
             color: Some(rgb(theme::dim()).into()),

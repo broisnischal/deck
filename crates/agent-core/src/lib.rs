@@ -17,7 +17,8 @@ pub use adapter::{
 };
 pub use error::AgentError;
 pub use event::{
-    Action, AgentEvent, Decision, Question, QuestionOption, StopReason, ToolOutput, Usage,
+    Action, AgentEvent, Allowance, Decision, Limits, Question, QuestionOption, StopReason,
+    ToolOutput, Usage,
 };
 pub use ids::{AgentId, MessageId, RequestId, SessionId, ToolId};
 pub use transcript::{

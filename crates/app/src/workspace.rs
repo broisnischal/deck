@@ -14,6 +14,7 @@ use crate::review::{ReviewEvent, ReviewPane};
 use crate::settings_pane::{SettingsEvent, SettingsPane};
 use crate::terminal::{TerminalEvent, TerminalPane};
 use crate::theme::{self, u};
+use crate::usage;
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
@@ -501,6 +502,8 @@ pub struct Workspace {
     cwd: PathBuf,
     installed: Vec<&'static Agent>,
     picker: bool,
+    /// The usage card is open above its row at the foot of the sidebar.
+    usage_open: bool,
     sidebar: bool,
     pub inspector: Inspector,
     refreshing: bool,
@@ -585,6 +588,7 @@ impl Workspace {
                 .filter(|a| term::which(a.cmd).is_some())
                 .collect(),
             picker: false,
+            usage_open: false,
             sidebar: true,
             inspector: Inspector {
                 // A narrow (tiled) window cannot afford a third column.
@@ -597,7 +601,7 @@ impl Workspace {
             settings: {
                 let s = crate::settings::load();
                 crate::browser::set_search_engine(s.search);
-                crate::refine::set(s.refine, &s.refine_model);
+                crate::refine::set(s.refine_mode(), &s.refine_model);
                 crate::retry::set_enabled(s.auto_retry);
                 wear(s.theme, window);
                 s
@@ -1395,7 +1399,7 @@ impl Workspace {
         }
     }
 
-    fn focus_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tab_of(id) else {
             return;
         };
@@ -2029,7 +2033,7 @@ impl Workspace {
         let zoomed = next.zoom != self.settings.zoom;
         let themed = next.theme != self.settings.theme;
         crate::browser::set_search_engine(next.search);
-        crate::refine::set(next.refine, &next.refine_model);
+        crate::refine::set(next.refine_mode(), &next.refine_model);
         crate::retry::set_enabled(next.auto_retry);
         if themed {
             wear(next.theme, window);
@@ -4222,12 +4226,7 @@ impl Workspace {
                     .hover(|s| s.bg(rgb(theme::surface())))
                     .child(lead(icon(Icon::Plus, 14., theme::text())))
                     .child(div().flex_1().child("New chat"))
-                    .child(
-                        div()
-                            .text_size(u(11.))
-                            .text_color(rgb(theme::dim()))
-                            .child("⇧⌘N"),
-                    )
+                    .child(crate::kbd::key("⇧⌘N"))
                     .on_click(cx.listener(|ws, _, window, cx| {
                         let what = Open::Chat {
                             agent: None,
@@ -4313,6 +4312,11 @@ impl Workspace {
             }
         }
 
+        let spend = self.usage_threads(cx);
+        let glance = usage::current(&spend).and_then(usage::glance);
+        let card = self.usage_open.then(|| usage::card(&spend, cx));
+        let open = self.usage_open;
+
         div()
             .flex()
             .flex_col()
@@ -4349,6 +4353,51 @@ impl Workspace {
                     .flex_none()
                     .px(u(theme::GUTTER))
                     .pb(u(theme::GUTTER))
+                    .children(card)
+                    .child(
+                        // Shut, the row still says how full the thread's
+                        // context is (or what it cost, if that is all the
+                        // agent tells).
+                        div()
+                            .id("open-usage")
+                            .flex()
+                            .items_center()
+                            .gap(u(10.))
+                            .h(u(32.))
+                            .px(u(theme::ROW_PAD))
+                            .rounded(u(theme::ROW_RADIUS))
+                            .text_size(u(13.))
+                            .text_color(rgb(theme::text_2()))
+                            .cursor_pointer()
+                            .when(open, |d| {
+                                d.bg(rgb(theme::surface())).text_color(rgb(theme::text()))
+                            })
+                            .when(!open, |d| {
+                                d.hover(|s| {
+                                    s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text()))
+                                })
+                            })
+                            .child(icon(Icon::Gauge, 15., theme::text_2()))
+                            .child(div().flex_1().child("Usage"))
+                            .children(glance.map(|(frac, label)| {
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap(u(6.))
+                                    .children(frac.map(|f| div().w(u(28.)).child(usage::meter(f))))
+                                    .child(
+                                        div()
+                                            .text_size(u(11.))
+                                            .text_color(rgb(theme::dim()))
+                                            .child(label),
+                                    )
+                            }))
+                            .on_click(cx.listener(|ws, _, _, cx| {
+                                ws.usage_open = !ws.usage_open;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
                             .id("open-settings")
@@ -4364,18 +4413,40 @@ impl Workspace {
                             .hover(|s| s.bg(rgb(theme::row_hover())).text_color(rgb(theme::text())))
                             .child(icon(Icon::Settings, 15., theme::text_2()))
                             .child(div().flex_1().child("Settings"))
-                            .child(
-                                div()
-                                    .text_size(u(11.))
-                                    .text_color(rgb(theme::dim()))
-                                    .child("⌘,"),
-                            )
+                            .child(crate::kbd::key("⌘,"))
                             .on_click(
                                 cx.listener(|ws, _, window, cx| ws.open_settings(window, cx)),
                             ),
                     ),
             )
             .into_any_element()
+    }
+
+    /// Every chat's tokens, cost and context, the latest first.
+    fn usage_threads(&self, cx: &App) -> Vec<usage::Thread> {
+        let focused = self.focused();
+        let mut out: Vec<usage::Thread> = self
+            .panes
+            .iter()
+            .filter_map(|(&id, p)| match &p.kind {
+                PaneKind::Chat(c) => {
+                    let c = c.read(cx);
+                    Some(usage::Thread {
+                        pane: id,
+                        title: self.pane_title(id, cx),
+                        mark: Icon::agent(c.agent.as_str()),
+                        agent: c.agent_name(),
+                        model: c.model().map(str::to_string),
+                        usage: *c.usage(),
+                        focused: focused == Some(id),
+                        active: c.last_activity,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        out.sort_by_key(|t| std::cmp::Reverse(t.active));
+        out
     }
 
     /// When the pane last did something, for ordering and "5m ago".

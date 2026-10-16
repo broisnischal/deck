@@ -1214,14 +1214,23 @@ impl SettingsPane {
                         .into(),
                 ),
             ),
-            group(
-                Some("Prompt rewriting"),
-                vec![
-                    row(
+            group(Some("Prompt rewriting"), {
+                let mut rows = vec![row(
+                    "Rewrite prompts",
+                    self.toggle(
+                        "refine-on",
+                        self.settings.refine_on,
+                        |s, on| s.refine_on = on,
+                        cx,
+                    ),
+                )];
+                // When and with what only mean something while it is on.
+                if self.settings.refine_on {
+                    rows.push(row(
                         "When you press ⏎",
                         self.segmented(
                             "refine",
-                            &crate::refine::Mode::ALL
+                            &crate::refine::Mode::CHOICES
                                 .iter()
                                 .map(|m| (*m, m.name()))
                                 .collect::<Vec<_>>(),
@@ -1229,8 +1238,8 @@ impl SettingsPane {
                             |s, m| s.refine = m,
                             cx,
                         ),
-                    ),
-                    row(
+                    ));
+                    rows.push(row(
                         "Model",
                         self.segmented(
                             "refine-model",
@@ -1243,13 +1252,16 @@ impl SettingsPane {
                             |s, m| s.refine_model = m.to_string(),
                             cx,
                         ),
-                    ),
-                ],
-                Some(
-                    "A quick Claude run turns what you typed or dictated into a clear, complete prompt, using the thread's task and the agent's last reply to work out what \"it\" and \"that\" mean. ⌃O rewrites into the box without sending, ⌃Z brings back your words. Short replies, / commands and ! commands go as typed."
-                        .into(),
-                ),
-            ),
+                    ));
+                }
+                rows
+            }, Some(if self.settings.refine_on {
+                "A quick Claude run turns what you typed or dictated into a clear, complete prompt, using the thread's task and the agent's last reply to work out what \"it\" and \"that\" mean. ⌃O rewrites into the box without sending, ⌃Z brings back your words. Short replies, / commands and ! commands go as typed."
+                    .into()
+            } else {
+                "Messages go to the agent as you typed them. ⏎ sends, and ⌃O does nothing."
+                    .into()
+            })),
             group(
                 Some("Recovery"),
                 vec![row(

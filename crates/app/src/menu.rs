@@ -300,13 +300,7 @@ impl Render for ContextMenu {
                         })
                         .child(div().flex_1().whitespace_nowrap().child(item.label.clone()))
                         .when_some(item.shortcut, |d, keys| {
-                            d.child(
-                                div()
-                                    .pl(u(20.))
-                                    .text_size(u(12.))
-                                    .text_color(rgb(theme::dim()))
-                                    .child(keys),
-                            )
+                            d.child(div().pl(u(20.)).child(crate::kbd::key(keys)))
                         })
                         .when(!item.disabled, |d| {
                             d.cursor_pointer()

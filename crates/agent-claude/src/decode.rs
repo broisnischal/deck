@@ -3,8 +3,10 @@
 //! Kept pure and stateful-but-synchronous so it is exhaustively testable
 //! without spawning a process. All the protocol risk lives here.
 
-use crate::wire::{self, BlockDelta, ContentBlock, ContentField, Line, RawEvent};
-use agent_core::{Action, AgentEvent, Decision, RequestId, StopReason, ToolId, ToolOutput};
+use crate::wire::{self, BlockDelta, ContentBlock, ContentField, Line, RawEvent, WireUsage};
+use agent_core::{
+    Action, AgentEvent, Allowance, Decision, Limits, RequestId, StopReason, ToolId, ToolOutput,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -33,6 +35,9 @@ pub struct Decoder {
     asks: HashMap<String, RequestId>,
     /// Requests decoded since the last `take_asks`, for the session to answer.
     new_asks: Vec<(RequestId, PendingAsk)>,
+    /// `total_cost_usd` as of the last result: the CLI keeps a running total
+    /// for the process, and a turn's cost is what it grew by.
+    cost_seen: f64,
 }
 
 /// What answering a permission request needs: the CLI's request id, the
@@ -66,6 +71,7 @@ impl Decoder {
             streamed_content: false,
             asks: HashMap::new(),
             new_asks: Vec::new(),
+            cost_seen: 0.,
         }
     }
 
@@ -206,10 +212,20 @@ impl Decoder {
             }
 
             Line::StreamEvent(se) => {
+                // A message's last word on its tokens. Only a reading of the
+                // context: the turn's total comes with its result.
+                if let RawEvent::MessageDelta { usage: Some(u) } = &se.event {
+                    if se.parent_tool_use_id.is_none() {
+                        out.extend(context_reading(u));
+                    }
+                }
                 self.decode_raw(se.event, &mut out);
             }
 
             Line::Assistant(m) => {
+                if m.parent_tool_use_id.is_none() {
+                    out.extend(m.message.usage.as_ref().and_then(context_reading));
+                }
                 if let ContentField::Blocks(blocks) = m.message.content {
                     for b in blocks {
                         match b {
@@ -283,13 +299,31 @@ impl Decoder {
             }
 
             Line::Result(r) => {
-                if let Some(u) = &r.usage {
-                    out.push(AgentEvent::Usage(u.to_core(r.total_cost_usd)));
-                } else if let Some(cost) = r.total_cost_usd {
-                    out.push(AgentEvent::Usage(agent_core::Usage {
-                        cost_usd: Some(cost),
-                        ..Default::default()
-                    }));
+                let cost = r.total_cost_usd.map(|total| {
+                    // Lower than before: a new running total began.
+                    let turn = if total >= self.cost_seen {
+                        total - self.cost_seen
+                    } else {
+                        total
+                    };
+                    self.cost_seen = total;
+                    turn
+                });
+                let window = r
+                    .model_usage
+                    .values()
+                    .filter_map(|m| m.context_window)
+                    .max();
+                if r.usage.is_some() || cost.is_some() || window.is_some() {
+                    let mut u = r.usage.as_ref().map_or_else(
+                        || agent_core::Usage {
+                            cost_usd: cost,
+                            ..Default::default()
+                        },
+                        |u| u.to_core(cost),
+                    );
+                    u.context_window = window;
+                    out.push(AgentEvent::Usage(u));
                 }
                 let stop = match r.subtype.as_deref() {
                     Some("error_max_turns") => StopReason::MaxTurns,
@@ -303,6 +337,25 @@ impl Decoder {
                 // results can straddle the boundary.
                 self.partial_tools.clear();
                 self.streamed_content = false;
+            }
+
+            Line::RateLimitEvent(r) => {
+                let window = |k: &str| {
+                    r.rate_limit_info.windows.get(k).map(|w| Allowance {
+                        used: w.utilization.clamp(0., 1.),
+                        resets_at: w.resets_at,
+                    })
+                };
+                let limits = Limits {
+                    session: window("five_hour"),
+                    week: window("seven_day"),
+                };
+                if limits.session.is_some() || limits.week.is_some() {
+                    out.push(AgentEvent::Usage(agent_core::Usage {
+                        limits: Some(limits),
+                        ..Default::default()
+                    }));
+                }
             }
 
             Line::Unknown => {}
@@ -368,15 +421,23 @@ impl Decoder {
                 }
             }
 
-            RawEvent::MessageDelta { usage } => {
-                if let Some(u) = usage {
-                    out.push(AgentEvent::Usage(u.to_core(None)));
-                }
-            }
+            // Read for the context above; counting it here as well would
+            // count every turn twice.
+            RawEvent::MessageDelta { .. } => {}
 
             RawEvent::Unknown => {}
         }
     }
+}
+
+/// The context's size at one call, and nothing else.
+fn context_reading(u: &WireUsage) -> Option<AgentEvent> {
+    u.context().map(|context| {
+        AgentEvent::Usage(agent_core::Usage {
+            context,
+            ..Default::default()
+        })
+    })
 }
 
 fn tool_call_event(id: &str, name: &str, input: Value) -> AgentEvent {
@@ -680,6 +741,83 @@ mod tests {
                 stop: StopReason::EndTurn
             }
         ));
+    }
+
+    /// Every usage event in `lines`, folded as a transcript would.
+    fn folded(d: &mut Decoder, lines: &[&str]) -> agent_core::Usage {
+        let mut total = agent_core::Usage::default();
+        for l in lines {
+            for ev in d.decode_line(l) {
+                if let AgentEvent::Usage(u) = ev {
+                    total.accumulate(&u);
+                }
+            }
+        }
+        total
+    }
+
+    // Shapes from Claude Code 2.1.301, trimmed.
+    const ASSISTANT: &str = r#"{"type":"assistant","message":{"content":[],"usage":{"input_tokens":2,"cache_creation_input_tokens":17068,"cache_read_input_tokens":11494,"output_tokens":4}},"parent_tool_use_id":null}"#;
+    const DELTA: &str = r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"input_tokens":2,"cache_creation_input_tokens":17068,"cache_read_input_tokens":11494,"output_tokens":9}},"parent_tool_use_id":null}"#;
+    const RESULT_1: &str = r#"{"type":"result","subtype":"success","total_cost_usd":0.0052,"usage":{"input_tokens":2,"output_tokens":9,"cache_read_input_tokens":11494,"cache_creation_input_tokens":17068},"modelUsage":{"claude-haiku-5-5":{"inputTokens":2,"costUSD":0.0052,"contextWindow":1000000,"maxOutputTokens":128000}}}"#;
+    const RESULT_2: &str = r#"{"type":"result","subtype":"success","total_cost_usd":0.0081,"usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":14865,"cache_creation_input_tokens":13997},"modelUsage":{"claude-haiku-5-5":{"contextWindow":1000000}}}"#;
+
+    #[test]
+    fn a_turn_counts_once_and_reads_the_context() {
+        let mut d = Decoder::new();
+        let u = folded(&mut d, &[ASSISTANT, DELTA, RESULT_1]);
+        // The message's own usage lines are readings; the result is the count.
+        assert_eq!(
+            (u.input, u.output, u.cache_read, u.cache_write),
+            (2, 9, 11494, 17068)
+        );
+        assert_eq!(u.context, 2 + 17068 + 11494 + 9);
+        assert_eq!(u.context_window, Some(1_000_000));
+        assert_eq!(u.cost_usd, Some(0.0052));
+    }
+
+    #[test]
+    fn cost_is_what_the_running_total_grew_by() {
+        let mut d = Decoder::new();
+        let u = folded(&mut d, &[RESULT_1, RESULT_2]);
+        assert!(
+            (u.cost_usd.unwrap() - 0.0081).abs() < 1e-9,
+            "{:?}",
+            u.cost_usd
+        );
+        assert_eq!(u.output, 12);
+    }
+
+    #[test]
+    fn a_sub_agents_context_is_not_the_threads() {
+        let mut d = Decoder::new();
+        let sub = ASSISTANT.replace(
+            r#""parent_tool_use_id":null"#,
+            r#""parent_tool_use_id":"toolu_1""#,
+        );
+        let u = folded(&mut d, &[&sub]);
+        assert_eq!(u.context, 0);
+    }
+
+    #[test]
+    fn rate_limit_event_reports_the_plan_windows() {
+        let mut d = Decoder::new();
+        let u = folded(
+            &mut d,
+            &[
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1792135800,"rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"utilization":0.11,"resetsAt":1792135800},"seven_day":{"utilization":0.41,"resetsAt":1792591200}}}}"#,
+            ],
+        );
+        let l = u.limits.expect("limits");
+        assert_eq!(
+            l.session,
+            Some(Allowance {
+                used: 0.11,
+                resets_at: 1792135800
+            })
+        );
+        assert_eq!(l.week.map(|w| w.used), Some(0.41));
+        assert_eq!(u.tokens(), 0);
     }
 
     #[test]
