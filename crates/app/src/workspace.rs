@@ -826,6 +826,9 @@ pub struct Workspace {
     named: HashMap<String, PaneId>,
     /// Dev servers under our terminals, for the status bar: (port, process).
     bar_ports: Vec<(u16, String)>,
+    /// Whether each listening (port, process) answers HTTP: only web
+    /// servers belong in the status bar. `None` while being asked.
+    port_web: HashMap<(u16, String), Option<bool>>,
     /// The focused pane's project and its git branch, for the status bar.
     bar_git: Option<(String, Option<String>)>,
     /// Claude Code conversations' first asks by session id, read once: a
@@ -943,6 +946,7 @@ impl Workspace {
             scroll_keys: HashMap::new(),
             named: HashMap::new(),
             bar_ports: Vec::new(),
+            port_web: HashMap::new(),
             bar_git: None,
             conv_titles: HashMap::new(),
             usage: UsageView::default(),
@@ -2538,6 +2542,34 @@ impl Workspace {
             .map(|p| (p.port, p.process))
             .collect();
         servers.dedup_by_key(|(port, _)| *port);
+        // Ask the ones not asked yet, off the main thread; show only those
+        // that speak HTTP (a daemon or language server does not).
+        let ask: Vec<(u16, String)> = servers.iter().filter(|k| !self.port_web.contains_key(*k)).cloned().collect();
+        if !ask.is_empty() {
+            for k in &ask {
+                self.port_web.insert(k.clone(), None);
+            }
+            let probe = cx.background_executor().spawn(async move {
+                ask.into_iter().map(|k| {
+                    let web = speaks_http(k.0);
+                    (k, web)
+                }).collect::<Vec<_>>()
+            });
+            cx.spawn(async move |this, cx| {
+                let found = probe.await;
+                let _ = this.update(cx, |ws, cx| {
+                    for (k, web) in found {
+                        ws.port_web.insert(k, Some(web));
+                    }
+                    ws.refresh_servers(cx);
+                });
+            })
+            .detach();
+        }
+        if self.port_web.len() > 256 {
+            self.port_web.retain(|k, _| servers.contains(k));
+        }
+        servers.retain(|k| self.port_web.get(k) == Some(&Some(true)));
         if self.bar_ports != servers {
             self.bar_ports = servers.clone();
             cx.notify();
@@ -2860,7 +2892,9 @@ impl Workspace {
     /// The focused pane's project and branch, read from `.git` itself so it
     /// costs no process.
     fn refresh_bar_git(&mut self, cx: &mut Context<Self>) {
-        let git = self.focused_cwd(cx).map(|cwd| {
+        // A pane with no folder (Settings, a page) keeps the last project.
+        let Some(cwd) = self.focused_cwd(cx) else { return };
+        let git = Some(cwd).map(|cwd| {
             let root = inspect::project_root(&cwd);
             let name = root
                 .file_name()
@@ -6949,7 +6983,22 @@ impl Workspace {
                 match self.panes.get(&id).map(|p| &p.kind) {
                     Some(PaneKind::Terminal(t)) => {
                         let name = names.get(&id).copied();
+                        // An agent has its own row in the sidebar.
+                        if name.is_none() && self.places.get(&id).is_some_and(|p| p.agent.is_some()) {
+                            continue;
+                        }
                         let job = t.read(cx).job();
+                        // Editors, pagers and other full-screen programs are
+                        // where you are, not something running for you.
+                        let program = job
+                            .as_ref()
+                            .and_then(|b| b.command.as_deref())
+                            .and_then(|c| c.split_whitespace().find(|w| !w.contains('=') && *w != "sudo"))
+                            .map(|w| w.rsplit('/').next().unwrap_or(w).to_string())
+                            .unwrap_or_default();
+                        if name.is_none() && (AGENTS.iter().any(|a| a.cmd == program) || interactive(&program)) {
+                            continue;
+                        }
                         let running = job.as_ref().is_some_and(|b| b.running());
                         let failed = job.as_ref().is_some_and(|b| !b.running() && b.exit.is_some_and(|c| c != 0));
                         // Idle shells stay out; named panes and anything
@@ -7302,10 +7351,47 @@ fn tokens(n: u64) -> String {
     }
 }
 
-/// Whether a listening socket under one of our terminals is a dev server
-/// worth offering: not an app a terminal happened to start (Chrome's
-/// debugging port, an editor's helper), nor a port the system handed out at
-/// random, unless a known server runtime holds it.
+/// Programs you work inside rather than wait on.
+fn interactive(program: &str) -> bool {
+    matches!(
+        program,
+        "vim" | "nvim" | "vi" | "nano" | "emacs" | "hx" | "helix" | "micro" | "less" | "more" | "man" | "top" | "htop"
+            | "btop" | "ssh" | "mosh" | "tmux" | "zellij" | "screen" | "lazygit" | "tig" | "fzf" | "watch" | "zsh"
+            | "bash" | "fish" | "python" | "python3" | "node" | "irb" | "psql" | "mysql" | "sqlite3" | "redis-cli"
+    )
+}
+
+/// Whether something on localhost:`port` answers like a web server, asked
+/// with a plain request and a short wait.
+fn speaks_http(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
+        // Some servers listen on ::1 only.
+        let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+        let Ok(mut s) = std::net::TcpStream::connect_timeout(&v6, Duration::from_millis(250)) else {
+            return false;
+        };
+        return ask_http(&mut s);
+    };
+    ask_http(&mut s)
+}
+
+/// A plain HEAD request; the answer starts "HTTP/" from a web server.
+fn ask_http(s: &mut std::net::TcpStream) -> bool {
+    use std::io::{Read, Write};
+    let _ = s.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = s.set_write_timeout(Some(Duration::from_millis(250)));
+    if s.write_all(b"HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 8];
+    matches!(s.read(&mut buf), Ok(n) if n >= 5 && &buf[..5] == b"HTTP/")
+}
+
+/// Whether a listening socket under one of our terminals could be a dev
+/// server: not an app a terminal happened to start (Chrome's debugging
+/// port, an editor's helper), nor a port the system handed out at random.
+/// It still has to answer HTTP (`speaks_http`) to be shown.
 fn dev_server(port: u16, process: &str) -> bool {
     let p = process.to_lowercase();
     const APPS: &[&str] = &[
@@ -7315,12 +7401,9 @@ fn dev_server(port: u16, process: &str) -> bool {
     if APPS.iter().any(|a| p.contains(a)) {
         return false;
     }
-    const RUNTIMES: &[&str] = &[
-        "node", "bun", "deno", "python", "ruby", "php", "java", "go", "dotnet", "beam", "vite", "next", "nuxt", "astro",
-        "wrangler", "workerd", "esbuild", "uvicorn", "gunicorn", "rails", "puma", "hugo", "zola", "caddy", "nginx",
-        "httpd", "trunk", "cargo",
-    ];
-    port < 49152 || RUNTIMES.iter().any(|r| p.starts_with(r))
+    // The system hands out 49152 and up at random; a dev server picks a
+    // port people type. Those still have to answer HTTP to be shown.
+    port < 49152
 }
 
 /// The port of a local address (`http://localhost:3000/x` → 3000).
@@ -8847,13 +8930,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_ports_that_answer_http_are_web_servers() {
+        use std::io::{Read, Write};
+        let web = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (wp, op) = (web.local_addr().unwrap().port(), other.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            if let Ok((mut c, _)) = web.accept() {
+                let mut b = [0u8; 64];
+                let _ = c.read(&mut b);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\n\r\n");
+            }
+        });
+        std::thread::spawn(move || {
+            if let Ok((mut c, _)) = other.accept() {
+                let _ = c.write_all(b"\x00\x01binary");
+            }
+        });
+        assert!(speaks_http(wp));
+        assert!(!speaks_http(op));
+    }
+
+    #[test]
     fn status_bar_lists_dev_servers_only() {
         assert!(dev_server(5173, "node"));
         assert!(dev_server(8000, "python3.12"));
         assert!(!dev_server(49755, "Google Chrome"));
         assert!(!dev_server(9222, "Google Chrome Helper"));
         assert!(!dev_server(61234, "someapp"));
-        assert!(dev_server(61234, "bun"));
+        assert!(!dev_server(52974, "java"));
+        assert!(dev_server(17565, "java"), "not ephemeral; the HTTP check decides");
+        assert!(interactive("nvim") && interactive("htop") && !interactive("npm"));
     }
 
     #[test]

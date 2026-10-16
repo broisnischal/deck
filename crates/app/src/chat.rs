@@ -4043,7 +4043,9 @@ impl ChatPane {
         }
         let dt = now.duration_since(*at).as_secs_f32().min(0.1);
         let behind = total - *shown;
-        let pace = (behind * 4.).max(90.);
+        // Catches up within about an eighth of a second of what arrived:
+        // smooth through bursts without trailing the stream.
+        let pace = (behind * 8.).max(240.);
         *shown = (*shown + pace * dt).min(total);
         *at = now;
         self.revealing.set(true);

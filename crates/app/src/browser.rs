@@ -15,7 +15,7 @@ use crate::icon::{icon, spinner, Icon};
 use crate::settings::Search;
 use crate::theme::{self, u};
 use crate::workspace::icon_button;
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use gpui::prelude::*;
 use gpui::{
@@ -31,11 +31,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wry::dpi::{LogicalPosition, LogicalSize};
 
+mod popup;
+
 pub enum BrowserEvent {
     /// The page has the keyboard now.
     Focused,
-    /// The page asked for a new window (target=_blank, window.open), or a
-    /// link was ⌘-clicked.
+    /// The page asked for a new window it does not script (target=_blank,
+    /// a plain window.open), or a link was ⌘-clicked.
     OpenTab(String),
     /// The title, address or icon changed: things the sidebar shows.
     Retitled,
@@ -540,6 +542,70 @@ fn log_entry(v: &Value) -> Option<Value> {
     Some(Value::Object(out))
 }
 
+/// Answers a page asking for a new window. A script that wants a window
+/// of its own or starts a sign-in gets a popup linked to it (see
+/// `popup::wants`); anything else, a link with a target too, opens as a
+/// Deck tab, which the page cannot reach. The editor's are all tabs.
+fn new_window(
+    tx: UnboundedSender<Msg>,
+    is_editor: bool,
+) -> impl Fn(String, wry::NewWindowFeatures) -> wry::NewWindowResponse + 'static {
+    move |url, features| {
+        if !is_editor && popup::wants(&url, popup::asked(&features)) {
+            let (page, nav) = (tx.clone(), tx.clone());
+            let opened = popup::open(
+                &url,
+                features,
+                |b| popup_page(b, page),
+                move |u| {
+                    let e = serde_json::json!({ "t": "nav", "url": u, "popup": true });
+                    let _ = nav.unbounded_send(Msg::Log(vec![e]));
+                },
+                add_page_dialogs,
+            );
+            if let Some(answer) = opened {
+                return answer;
+            }
+        }
+        let _ = tx.unbounded_send(Msg::NewWindow(url));
+        wry::NewWindowResponse::Deny
+    }
+}
+
+/// A popup's page, set up as a pane's is. What it logs goes to the pane
+/// that opened it, marked `popup`, and so do its downloads and ⌘-clicks;
+/// what the page script says of focus, moves and icons is its own.
+fn popup_page(b: wry::WebViewBuilder<'_>, tx: UnboundedSender<Msg>) -> wry::WebViewBuilder<'_> {
+    let (tx_ipc, tx_dl, tx_done, tx_new) = (tx.clone(), tx.clone(), tx.clone(), tx);
+    b.with_user_agent(USER_AGENT)
+        .with_devtools(true)
+        .with_accept_first_mouse(true)
+        .with_permission_handler(|_| wry::PermissionResponse::Default)
+        .with_initialization_script(PAGE_SCRIPT)
+        .with_initialization_script(RECORDER_SCRIPT)
+        .with_navigation_handler(|to| !crate::code::is_editor_url(&to))
+        .with_ipc_handler(move |req| match parse_ipc(req.body()) {
+            Some(Msg::Log(mut entries)) => {
+                for e in &mut entries {
+                    e["popup"] = true.into();
+                }
+                let _ = tx_ipc.unbounded_send(Msg::Log(entries));
+            }
+            Some(tab @ Msg::LinkTab(_)) => {
+                let _ = tx_ipc.unbounded_send(tab);
+            }
+            _ => {}
+        })
+        .with_new_window_req_handler(new_window(tx_new, false))
+        .with_download_started_handler(move |_, path| {
+            let _ = tx_dl.unbounded_send(Msg::DownloadStarted(path.clone()));
+            true
+        })
+        .with_download_completed_handler(move |_, path, ok| {
+            let _ = tx_done.unbounded_send(Msg::DownloadDone(path, ok));
+        })
+}
+
 /// What `browser.logs` reads: entries after `since` of one `kind`, the
 /// last `limit` of them.
 pub struct LogQuery {
@@ -799,10 +865,7 @@ impl BrowserPane {
                 let committed = matches!(ev, wry::PageLoadEvent::Started);
                 let _ = tx_load.unbounded_send(Msg::Load(url, committed));
             })
-            .with_new_window_req_handler(move |url, _| {
-                let _ = tx_new.unbounded_send(Msg::NewWindow(url));
-                wry::NewWindowResponse::Deny
-            })
+            .with_new_window_req_handler(new_window(tx_new, is_editor))
             // Into ~/Downloads, numbered rather than overwriting.
             .with_download_started_handler(move |_, path| {
                 let _ = tx_dl.unbounded_send(Msg::DownloadStarted(path.clone()));
@@ -2304,6 +2367,7 @@ fn add_page_dialogs(webview: &wry::WebView) {
             add(ui, sel!(webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:),
                 std::mem::transmute::<PromptFn, Imp>(js_prompt), c"v@:@@@@@?");
         });
+        popup::teach(ui);
         // SAFETY: the same delegate, which wry keeps alive.
         let _: () = unsafe { msg_send![&*wk, setUIDelegate: &**ui] };
     }
@@ -2627,11 +2691,13 @@ impl Drop for Host {
 }
 
 impl Drop for BrowserPane {
-    /// An inspector in a window of its own would outlive the pane.
+    /// An inspector in a window of its own would outlive the pane, and so
+    /// would the popups its page opened.
     fn drop(&mut self) {
         if self.webview.is_devtools_open() {
             self.webview.close_devtools();
         }
+        popup::close_all(self.webview_ptr());
     }
 }
 
